@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/user/go-apt-mirror/internal/storage"
+	"github.com/yolkispalkis/go-apt-mirror/internal/storage"
 )
 
 // ServerConfig holds the configuration for the APT mirror server
