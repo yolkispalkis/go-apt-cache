@@ -20,7 +20,7 @@ A lightweight APT mirror server written in Go that uses a local cache for effici
 
 1. Clone this repository:
    ```
-   git clone https://github.com/yourusername/go-apt-mirror.git
+   git clone https://github.com/yolkispalkis/go-apt-mirror.git
    cd go-apt-mirror
    ```
 
