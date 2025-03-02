@@ -1,0 +1,38 @@
+{
+  "server": {
+    "listenAddress": ":8080",
+    "logRequests": true,
+    "timeout": 30
+  },
+  "cache": {
+    "directory": "./cache",
+    "maxSize": 1024,
+    "sizeUnit": "MB",
+    "enabled": true,
+    "lru": true,
+    "cleanOnStart": false
+  },
+  "repositories": [
+    {
+      "origin": "archive.ubuntu.com",
+      "path": "/ubuntu",
+      "enabled": true
+    },
+    {
+      "origin": "deb.debian.org",
+      "path": "/debian",
+      "enabled": true
+    },
+    {
+      "origin": "security.ubuntu.com",
+      "path": "/ubuntu-security",
+      "enabled": true
+    },
+    {
+      "origin": "ppa.launchpadcontent.net",
+      "path": "/ppa",
+      "enabled": false
+    }
+  ],
+  "version": "1.0.0"
+} 

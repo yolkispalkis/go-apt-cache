@@ -1,0 +1,23 @@
+{
+  "server": {
+    "listenAddress": ":8080",
+    "logRequests": true,
+    "timeout": 60
+  },
+  "cache": {
+    "directory": "./cache",
+    "maxSize": 10240,
+    "sizeUnit": "MB",
+    "enabled": true,
+    "lru": true,
+    "cleanOnStart": false
+  },
+  "repositories": [
+    {
+      "origin": "archive.ubuntu.com",
+      "path": "/",
+      "enabled": true
+    }
+  ],
+  "version": "1.0.0"
+} 
