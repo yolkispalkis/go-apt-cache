@@ -390,13 +390,8 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
-
-		// Skip validation if this is a true cache miss (file doesn't exist in cache)
-		if config.LogRequests {
-			log.Printf("True cache miss, fetching from origin: %s", originURL)
-		}
 	} else if config.LogRequests {
-		log.Printf("Cache miss, fetching from origin: %s", originURL)
+		log.Printf("True cache miss, fetching from origin: %s", originURL)
 	}
 
 	// Create request to origin server
