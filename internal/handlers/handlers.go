@@ -109,7 +109,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		ifModifiedSince := r.Header.Get("If-Modified-Since")
 		if useIfModifiedSince && ifModifiedSince != "" {
 			if config.LogRequests {
-				log.Printf("Checking if modified for path: %s", r.URL.Path)
+				log.Printf("Checking if modified: %s", r.URL.Path)
 			}
 
 			ifModifiedSinceTime, err := time.Parse(http.TimeFormat, ifModifiedSince)
@@ -130,12 +130,12 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				if !lastModifiedTime.After(ifModifiedSinceTime) {
 					// Resource not modified
 					if config.LogRequests {
-						log.Printf("Resource not modified for path: %s", r.URL.Path)
+						log.Printf("Resource not modified: %s", r.URL.Path)
 					}
 					w.WriteHeader(http.StatusNotModified)
 					return true
 				} else if config.LogRequests {
-					log.Printf("Resource modified for path: %s", r.URL.Path)
+					log.Printf("Resource modified: %s", r.URL.Path)
 				}
 			} else if config.LogRequests {
 				log.Printf("Failed to parse If-Modified-Since header: %s, error: %v", ifModifiedSince, err)
@@ -151,7 +151,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 
 			if isValid {
 				if config.LogRequests {
-					log.Printf("Using cached validation result from %s for path: %s",
+					log.Printf("Using cached validation result from %s: %s",
 						lastValidated.Format(time.RFC3339), r.URL.Path)
 				}
 				// Skip validation with upstream as we have a recent valid result
@@ -167,13 +167,13 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				if lastModifiedStr != "" {
 					req.Header.Set("If-Modified-Since", lastModifiedStr)
 					if config.LogRequests {
-						log.Printf("Validating cached file with upstream for path: %s", r.URL.Path)
+						log.Printf("Validating cached file with upstream: %s", r.URL.Path)
 					}
 				} else {
 					formattedTime := lastModified.Format(http.TimeFormat)
 					req.Header.Set("If-Modified-Since", formattedTime)
 					if config.LogRequests {
-						log.Printf("Validating cached file with upstream for path: %s", r.URL.Path)
+						log.Printf("Validating cached file with upstream: %s", r.URL.Path)
 					}
 				}
 
@@ -189,17 +189,17 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 					if resp.StatusCode == http.StatusNotModified {
 						// Our cache is still valid, use it
 						if config.LogRequests {
-							log.Printf("Upstream confirms cache is still valid for: %s", r.URL.Path)
+							log.Printf("Upstream confirms cache is still valid: %s", r.URL.Path)
 						}
 
 						// Store validation result in validation cache
 						config.ValidationCache.Put(validationKey, time.Now())
 						if config.LogRequests {
-							log.Printf("Stored validation result in cache for: %s", r.URL.Path)
+							log.Printf("Stored validation result in cache: %s", r.URL.Path)
 						}
 					} else if resp.StatusCode == http.StatusOK {
 						// Upstream has a newer version, fetch it
-						log.Printf("Upstream has newer version for: %s", r.URL.Path)
+						log.Printf("Upstream has newer version: %s", r.URL.Path)
 
 						// Acquire lock for this resource to prevent multiple concurrent fetches
 						acquired, ch := acquireLock(r.URL.Path)
@@ -383,7 +383,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 
 		if isValid {
 			if config.LogRequests {
-				log.Printf("Using cached validation result from %s for path: %s",
+				log.Printf("Using cached validation result from %s: %s",
 					lastValidated.Format(time.RFC3339), path)
 			}
 			// Return 304 Not Modified based on cached validation
@@ -411,7 +411,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		if ifModifiedSince := r.Header.Get("If-Modified-Since"); ifModifiedSince != "" {
 			req.Header.Set("If-Modified-Since", ifModifiedSince)
 			if config.LogRequests {
-				log.Printf("Validating cache to origin for path: %s", path)
+				log.Printf("Validating cache to origin: %s", path)
 			}
 		}
 	}
@@ -430,7 +430,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	if resp.StatusCode == http.StatusNotModified {
 		// Resource not modified
 		if config.LogRequests {
-			log.Printf("Origin reports resource not modified for path: %s", path)
+			log.Printf("Origin reports resource not modified: %s", path)
 		}
 
 		// Store validation result in validation cache
@@ -540,7 +540,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 
 			if isValid {
 				if config.LogRequests {
-					log.Printf("Using cached validation result from %s for path: %s",
+					log.Printf("Using cached validation result from %s: %s",
 						lastValidated.Format(time.RFC3339), r.URL.Path)
 				}
 				// We have a valid cached validation result
