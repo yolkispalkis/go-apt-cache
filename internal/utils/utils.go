@@ -180,8 +180,6 @@ type FileType int
 const (
 	// TypeFrequentlyChanging represents files that change frequently (e.g., metadata)
 	TypeFrequentlyChanging FileType = iota
-	// TypeCriticalMetadata represents essential repository metadata files
-	TypeCriticalMetadata
 	// TypeRarelyChanging represents package files that rarely change
 	TypeRarelyChanging
 )
@@ -201,25 +199,37 @@ type ContentTypeMapping struct {
 // Common file patterns in Debian repositories
 var (
 	filePatterns = []FilePattern{
-		// Critical metadata files (highest priority)
-		{Pattern: "InRelease", Type: TypeCriticalMetadata},
-		{Pattern: "Release.gpg", Type: TypeCriticalMetadata},
-		{Pattern: "/Release", Type: TypeCriticalMetadata},
-		{Pattern: "ls-lR.gz", Type: TypeCriticalMetadata},
-
-		// Frequently changing files
+		// Frequently changing files and critical metadata
+		{Pattern: "InRelease", Type: TypeFrequentlyChanging},
+		{Pattern: "Release.gpg", Type: TypeFrequentlyChanging},
+		{Pattern: "/Release", Type: TypeFrequentlyChanging},
+		{Pattern: "ls-lR.gz", Type: TypeFrequentlyChanging},
+		{Pattern: "by-hash", Type: TypeFrequentlyChanging},
+		{Pattern: "Translation-", Type: TypeFrequentlyChanging},
+		{Pattern: "Components-", Type: TypeFrequentlyChanging},
 		{Pattern: "Packages", Type: TypeFrequentlyChanging},
 		{Pattern: "Packages.gz", Type: TypeFrequentlyChanging},
 		{Pattern: "Packages.xz", Type: TypeFrequentlyChanging},
+		{Pattern: "Packages.bz2", Type: TypeFrequentlyChanging},
 		{Pattern: "Sources", Type: TypeFrequentlyChanging},
 		{Pattern: "Sources.gz", Type: TypeFrequentlyChanging},
 		{Pattern: "Sources.xz", Type: TypeFrequentlyChanging},
+		{Pattern: "Sources.bz2", Type: TypeFrequentlyChanging},
 		{Pattern: "Contents-", Type: TypeFrequentlyChanging},
 		{Pattern: "Index", Type: TypeFrequentlyChanging},
+		{Pattern: "i18n", Type: TypeFrequentlyChanging},
+		{Pattern: "dep11", Type: TypeFrequentlyChanging},
+		{Pattern: "icons-", Type: TypeFrequentlyChanging},
 
 		// Rarely changing files (lowest priority)
 		{Pattern: ".deb", Type: TypeRarelyChanging},
 		{Pattern: ".udeb", Type: TypeRarelyChanging},
+		{Pattern: ".dsc", Type: TypeRarelyChanging},
+		{Pattern: ".tar.gz", Type: TypeRarelyChanging},
+		{Pattern: ".tar.xz", Type: TypeRarelyChanging},
+		{Pattern: ".tar.bz2", Type: TypeRarelyChanging},
+		{Pattern: ".diff.gz", Type: TypeRarelyChanging},
+		{Pattern: ".changes", Type: TypeRarelyChanging},
 	}
 
 	// contentTypes maps file extensions to their MIME types
@@ -234,6 +244,17 @@ var (
 		{Extensions: []string{".xml"}, MIMEType: "application/xml"},
 		{Extensions: []string{".txt", ".list"}, MIMEType: "text/plain"},
 		{Extensions: []string{".html", ".htm"}, MIMEType: "text/html"},
+		{Extensions: []string{".dsc"}, MIMEType: "text/x-dsc"},
+		{Extensions: []string{".changes"}, MIMEType: "text/x-changes"},
+		{Extensions: []string{".diff"}, MIMEType: "text/x-diff"},
+		{Extensions: []string{".patch"}, MIMEType: "text/x-patch"},
+		{Extensions: []string{".tar"}, MIMEType: "application/x-tar"},
+		{Extensions: []string{".yaml", ".yml"}, MIMEType: "application/yaml"},
+		{Extensions: []string{".sig"}, MIMEType: "application/pgp-signature"},
+		{Extensions: []string{".deb.asc", ".udeb.asc"}, MIMEType: "application/pgp-signature"},
+		{Extensions: []string{".tar.asc", ".tar.gz.asc", ".tar.xz.asc"}, MIMEType: "application/pgp-signature"},
+		{Extensions: []string{".deb.sig", ".udeb.sig"}, MIMEType: "application/pgp-signature"},
+		{Extensions: []string{".tar.sig", ".tar.gz.sig", ".tar.xz.sig"}, MIMEType: "application/pgp-signature"},
 	}
 )
 
