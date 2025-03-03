@@ -474,6 +474,14 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		log.Printf("Stored in cache: %s (%d bytes)", path, len(body))
 	}
 
+	// Set content type if not already set in response headers
+	if resp.Header.Get("Content-Type") == "" {
+		contentType := utils.GetContentType(path)
+		if contentType != "" {
+			resp.Header.Set("Content-Type", contentType)
+		}
+	}
+
 	// Store headers in header cache
 	err = config.HeaderCache.PutHeaders(path, resp.Header)
 	if err != nil {
@@ -485,14 +493,6 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
-		}
-	}
-
-	// Set content type if not already set
-	if w.Header().Get("Content-Type") == "" {
-		contentType := utils.GetContentType(path)
-		if contentType != "" {
-			w.Header().Set("Content-Type", contentType)
 		}
 	}
 
