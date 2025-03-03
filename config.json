@@ -15,7 +15,7 @@
   },
   "repositories": [
     {
-      "origin": "archive.ubuntu.com",
+      "url": "http://archive.ubuntu.com/ubuntu",
       "path": "/ubuntu",
       "enabled": true
     }

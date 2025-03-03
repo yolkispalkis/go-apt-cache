@@ -128,18 +128,18 @@ func (ss *ServerSetup) CreateServer() *http.Server {
 func (ss *ServerSetup) registerRepositoryHandlers(mux *http.ServeMux) {
 	for _, repo := range ss.Config.Repositories {
 		if !repo.Enabled {
-			log.Printf("Skipping disabled repository: %s", repo.Origin)
+			log.Printf("Skipping disabled repository: %s", repo.URL)
 			continue
 		}
 
-		origin := utils.NormalizeOriginURL(repo.Origin)
+		originURL := utils.NormalizeOriginURL(repo.URL)
 		basePath := utils.NormalizeBasePath(repo.Path)
 
-		log.Printf("Setting up mirror for %s at path %s", origin, basePath)
+		log.Printf("Setting up mirror for %s at path %s", originURL, basePath)
 
 		// Create handler config
 		handlerConfig := handlers.ServerConfig{
-			OriginServer:    origin,
+			OriginServer:    originURL,
 			Cache:           ss.Cache,
 			HeaderCache:     ss.HeaderCache,
 			ValidationCache: ss.ValidationCache,
@@ -281,7 +281,7 @@ func (cm *ConfigManager) applyCommandLineFlags(cfg *config.Config) {
 		// Check if repository already exists
 		found := false
 		for _, repo := range cfg.Repositories {
-			if repo.Origin == originServer {
+			if repo.URL == originServer {
 				found = true
 				break
 			}
@@ -289,7 +289,7 @@ func (cm *ConfigManager) applyCommandLineFlags(cfg *config.Config) {
 
 		if !found {
 			cfg.Repositories = append(cfg.Repositories, config.Repository{
-				Origin:  originServer,
+				URL:     originServer,
 				Path:    "/",
 				Enabled: true,
 			})

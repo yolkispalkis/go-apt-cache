@@ -11,7 +11,7 @@ import (
 
 // Repository represents a single APT repository configuration
 type Repository struct {
-	Origin  string `json:"origin"`  // Origin server hostname
+	URL     string `json:"url"`     // Full repository URL
 	Path    string `json:"path"`    // Path prefix for the repository
 	Enabled bool   `json:"enabled"` // Whether this repository is enabled
 }
@@ -61,7 +61,7 @@ func DefaultConfig() Config {
 		},
 		Repositories: []Repository{
 			{
-				Origin:  "archive.ubuntu.com",
+				URL:     "http://archive.ubuntu.com/ubuntu",
 				Path:    "/",
 				Enabled: true,
 			},

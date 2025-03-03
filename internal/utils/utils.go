@@ -161,12 +161,17 @@ func NormalizeBasePath(basePath string) string {
 	return basePath
 }
 
-// NormalizeOriginURL ensures an origin URL has the correct protocol
-func NormalizeOriginURL(origin string) string {
-	if !strings.HasPrefix(origin, "http://") && !strings.HasPrefix(origin, "https://") {
-		return "http://" + origin
+// NormalizeOriginURL ensures a URL has the correct protocol and no trailing slash
+func NormalizeOriginURL(url string) string {
+	// Add protocol if missing
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		url = "http://" + url
 	}
-	return origin
+
+	// Remove trailing slash if present
+	url = strings.TrimSuffix(url, "/")
+
+	return url
 }
 
 // FilePatternType represents different types of file patterns

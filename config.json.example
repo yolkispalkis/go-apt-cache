@@ -15,24 +15,19 @@
   },
   "repositories": [
     {
-      "origin": "archive.ubuntu.com",
+      "url": "http://archive.ubuntu.com/ubuntu",
       "path": "/ubuntu",
       "enabled": true
     },
     {
-      "origin": "deb.debian.org",
+      "url": "http://deb.debian.org/debian",
       "path": "/debian",
       "enabled": true
     },
     {
-      "origin": "security.ubuntu.com",
+      "url": "http://security.ubuntu.com/ubuntu-security",
       "path": "/ubuntu-security",
       "enabled": true
-    },
-    {
-      "origin": "ppa.launchpadcontent.net",
-      "path": "/ppa",
-      "enabled": false
     }
   ],
   "version": "1.0.0"
