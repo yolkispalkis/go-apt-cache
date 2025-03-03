@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -282,7 +281,7 @@ func setBasicHeaders(w http.ResponseWriter, r *http.Request, cachedHeaders http.
 		}
 		// If Content-Type is not in cached headers, determine it from file extension
 		if contentType == "" {
-			contentType = getContentType(r.URL.Path)
+			contentType = utils.GetContentType(r.URL.Path)
 		}
 		w.Header().Set("Content-Type", contentType)
 	}
@@ -422,7 +421,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 
 	// Set content type if not already set
 	if w.Header().Get("Content-Type") == "" {
-		contentType := getContentType(path)
+		contentType := utils.GetContentType(path)
 		if contentType != "" {
 			w.Header().Set("Content-Type", contentType)
 		}
@@ -436,117 +435,21 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 }
 
 // shouldUseIfModifiedSince determines if a file should use If-Modified-Since logic
-// based on its path. This is used to optimize cache validation for different types of files.
 func shouldUseIfModifiedSince(path string) bool {
-	// Files in dists/ directory are frequently changing (Release files, etc.)
-	if strings.Contains(path, "/dists/") {
-		return true
-	}
-
-	// Files in pool/ directory typically don't change, only new ones are added
-	if strings.Contains(path, "/pool/") {
-		return false
-	}
-
-	// Check for specific file patterns that frequently change
-	frequentlyChangingPatterns := []string{
-		"Release",
-		"Release.gpg",
-		"InRelease",
-		"Packages",
-		"Packages.gz",
-		"Packages.xz",
-		"Sources",
-		"Sources.gz",
-		"Sources.xz",
-		"Contents-",
-		"Index",
-	}
-
-	for _, pattern := range frequentlyChangingPatterns {
-		if strings.Contains(path, pattern) {
-			return true
-		}
-	}
-
-	// Default to not using If-Modified-Since for other files
-	return false
+	// Use the file pattern type to determine if we should use If-Modified-Since
+	patternType := utils.GetFilePatternType(path)
+	return patternType == utils.FrequentlyChanging || patternType == utils.CriticalMetadata
 }
 
 // shouldValidateWithOrigin determines if we should check with the origin server
-// to validate if our cached copy is still valid. This is used to reduce load on
-// origin servers for files that rarely change.
+// to validate if our cached copy is still valid
 func shouldValidateWithOrigin(path string) bool {
-	// Always validate Release files and other critical metadata
-	criticalPatterns := []string{
-		"Release",
-		"Release.gpg",
-		"InRelease",
-	}
-
-	for _, pattern := range criticalPatterns {
-		if strings.Contains(path, pattern) {
-			return true
-		}
-	}
-
-	// For other files in dists/, validate less frequently
-	if strings.Contains(path, "/dists/") {
-		// Only validate if the file is likely to change
-		changingPatterns := []string{
-			"Packages",
-			"Sources",
-			"Contents",
-		}
-
-		for _, pattern := range changingPatterns {
-			if strings.Contains(path, pattern) {
-				return true
-			}
-		}
-	}
-
-	// Don't validate pool/ files with origin as they rarely change
-	if strings.Contains(path, "/pool/") {
-		return false
-	}
-
-	// Default to not validating with origin
-	return false
+	// Only validate critical metadata files with origin
+	return utils.GetFilePatternType(path) == utils.CriticalMetadata
 }
 
-// HandleRelease handles requests for release files
-// These are cached in storage and use If-Modified-Since when checking with upstream
-func HandleRelease(config ServerConfig) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if config.LogRequests {
-			log.Printf("Release request: %s", r.URL.Path)
-		}
-
-		if !validateRequest(w, r) {
-			return
-		}
-
-		// Try to get from cache first
-		content, contentLength, lastModified, err := config.Cache.Get(r.URL.Path)
-		if err == nil {
-			// Cache hit
-			if config.LogRequests {
-				log.Printf("Cache hit for: %s", r.URL.Path)
-			}
-			// Always use If-Modified-Since for Release files
-			if handleCacheHit(w, r, config, content, contentLength, lastModified, true) {
-				return
-			}
-		}
-
-		// Cache miss
-		handleCacheMiss(w, r, config, true)
-	}
-}
-
-// HandleCacheableRequest handles requests for cacheable files
-func HandleCacheableRequest(config ServerConfig) http.HandlerFunc {
+// HandleRequest is a common handler for all types of requests
+func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if config.LogRequests {
 			log.Printf("Request: %s", r.URL.Path)
@@ -555,9 +458,6 @@ func HandleCacheableRequest(config ServerConfig) http.HandlerFunc {
 		if !validateRequest(w, r) {
 			return
 		}
-
-		// Determine if this file should use If-Modified-Since
-		useIfModifiedSince := shouldUseIfModifiedSince(r.URL.Path)
 
 		// Try to get from cache first
 		content, contentLength, lastModified, err := config.Cache.Get(r.URL.Path)
@@ -576,31 +476,17 @@ func HandleCacheableRequest(config ServerConfig) http.HandlerFunc {
 	}
 }
 
-// getContentType determines the content type based on file extension
-func getContentType(path string) string {
-	ext := filepath.Ext(path)
-	switch strings.ToLower(ext) {
-	case ".gz", ".gzip":
-		return "application/gzip"
-	case ".bz2":
-		return "application/x-bzip2"
-	case ".xz":
-		return "application/x-xz"
-	case ".deb":
-		return "application/vnd.debian.binary-package"
-	case ".asc":
-		return "application/pgp-signature"
-	case ".json":
-		return "application/json"
-	case ".txt":
-		return "text/plain"
-	case ".html", ".htm":
-		return "text/html"
-	case ".xml":
-		return "application/xml"
-	case ".gpg":
-		return "application/pgp-encrypted"
-	default:
-		return "application/octet-stream"
+// HandleRelease handles requests for release files
+// These are cached in storage and use If-Modified-Since when checking with upstream
+func HandleRelease(config ServerConfig) http.HandlerFunc {
+	return HandleRequest(config, true)
+}
+
+// HandleCacheableRequest handles requests for cacheable files
+func HandleCacheableRequest(config ServerConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Determine if this file should use If-Modified-Since based on its path
+		useIfModifiedSince := shouldUseIfModifiedSince(r.URL.Path)
+		HandleRequest(config, useIfModifiedSince)(w, r)
 	}
 }

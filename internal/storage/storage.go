@@ -27,6 +27,12 @@ type Cache interface {
 	Put(key string, content io.Reader, contentLength int64, lastModified time.Time) error
 }
 
+// LRUStatsProvider defines the interface for getting LRU cache statistics
+type LRUStatsProvider interface {
+	// GetCacheStats returns the current cache statistics
+	GetCacheStats() (itemCount int, currentSize int64, maxSize int64)
+}
+
 // HeaderCache defines the interface for caching HTTP headers
 type HeaderCache interface {
 	// GetHeaders retrieves headers for a key

@@ -168,3 +168,111 @@ func NormalizeOriginURL(origin string) string {
 	}
 	return origin
 }
+
+// FilePatternType represents different types of file patterns
+type FilePatternType int
+
+const (
+	// FrequentlyChanging represents files that change frequently
+	FrequentlyChanging FilePatternType = iota
+	// CriticalMetadata represents critical metadata files
+	CriticalMetadata
+	// RarelyChanging represents files that rarely change
+	RarelyChanging
+)
+
+// FilePatterns contains predefined patterns for different file types
+var FilePatterns = struct {
+	FrequentlyChanging []string
+	CriticalMetadata   []string
+	RarelyChanging     []string
+}{
+	FrequentlyChanging: []string{
+		"Release",
+		"Release.gpg",
+		"InRelease",
+		"Packages",
+		"Packages.gz",
+		"Packages.xz",
+		"Sources",
+		"Sources.gz",
+		"Sources.xz",
+		"Contents-",
+		"Index",
+	},
+	CriticalMetadata: []string{
+		"Release",
+		"Release.gpg",
+		"InRelease",
+	},
+	RarelyChanging: []string{
+		".deb",
+		".udeb",
+	},
+}
+
+// MatchesFilePattern checks if a path matches any of the given patterns
+func MatchesFilePattern(path string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if strings.Contains(path, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// GetFilePatternType determines the type of file based on its path
+func GetFilePatternType(path string) FilePatternType {
+	// Critical metadata files
+	if MatchesFilePattern(path, FilePatterns.CriticalMetadata) {
+		return CriticalMetadata
+	}
+
+	// Check for directory patterns
+	if strings.Contains(path, "/dists/") {
+		// Files in dists/ are generally frequently changing
+		return FrequentlyChanging
+	}
+
+	if strings.Contains(path, "/pool/") {
+		// Files in pool/ are generally rarely changing
+		return RarelyChanging
+	}
+
+	// Check for frequently changing patterns
+	if MatchesFilePattern(path, FilePatterns.FrequentlyChanging) {
+		return FrequentlyChanging
+	}
+
+	// Default to rarely changing
+	return RarelyChanging
+}
+
+// GetContentType determines the content type based on file extension
+func GetContentType(path string) string {
+	ext := filepath.Ext(path)
+	switch strings.ToLower(ext) {
+	case ".gz", ".gzip":
+		return "application/gzip"
+	case ".bz2":
+		return "application/x-bzip2"
+	case ".xz":
+		return "application/x-xz"
+	case ".deb":
+		return "application/vnd.debian.binary-package"
+	case ".asc":
+		return "application/pgp-signature"
+	case ".json":
+		return "application/json"
+	case ".txt":
+		return "text/plain"
+	case ".html", ".htm":
+		return "text/html"
+	case ".xml":
+		return "application/xml"
+	case ".gpg":
+		return "application/pgp-encrypted"
+	default:
+		return "application/octet-stream"
+	}
+}
