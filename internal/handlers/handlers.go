@@ -559,11 +559,6 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			if handleCacheHit(w, r, config, content, contentLength, lastModified, useIfModifiedSince) {
 				return
 			}
-		} else {
-			// Cache miss - file not in cache
-			if config.LogRequests {
-				log.Printf("Cache miss for: %s", r.URL.Path)
-			}
 		}
 
 		// Cache miss or validation needed
