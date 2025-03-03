@@ -22,6 +22,7 @@ type ServerConfig struct {
 	ValidationCache storage.ValidationCache
 	LogRequests     bool
 	Client          *http.Client // HTTP client for making requests to origin servers
+	LocalPath       string       // Local path prefix for URL mapping
 }
 
 // requestLock provides a mechanism to prevent concurrent requests for the same resource
@@ -98,6 +99,17 @@ func getClient(config ServerConfig) *http.Client {
 	return utils.CreateHTTPClient(60) // Default 60 second timeout
 }
 
+// getOriginPath converts local path to origin path
+func getOriginPath(config ServerConfig, localPath string) string {
+	// Remove local path prefix
+	originPath := strings.TrimPrefix(localPath, config.LocalPath)
+	// Ensure path starts with /
+	if !strings.HasPrefix(originPath, "/") {
+		originPath = "/" + originPath
+	}
+	return originPath
+}
+
 // handleCacheHit handles a cache hit, returning true if the response was handled
 func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig, content io.ReadCloser, contentLength int64, lastModified time.Time, useIfModifiedSince bool) bool {
 	defer content.Close()
@@ -159,7 +171,8 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 			}
 
 			// No valid cached validation result, check with upstream
-			originURL := fmt.Sprintf("%s%s", config.OriginServer, r.URL.Path)
+			originPath := getOriginPath(config, r.URL.Path)
+			originURL := fmt.Sprintf("%s%s", config.OriginServer, originPath)
 			req, err := http.NewRequest(http.MethodHead, originURL, nil)
 			if err == nil {
 				// Use our cached Last-Modified as If-Modified-Since when checking upstream
@@ -372,25 +385,11 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	// We've acquired the lock, make sure to release it when done
 	defer releaseLock(path)
 
-	originURL := fmt.Sprintf("%s%s", config.OriginServer, path)
+	// Convert local path to origin path
+	originPath := getOriginPath(config, path)
+	originURL := fmt.Sprintf("%s%s", config.OriginServer, originPath)
 
-	// Check if we're using If-Modified-Since header
-	ifModifiedSince := r.Header.Get("If-Modified-Since")
-	if useIfModifiedSince && ifModifiedSince != "" {
-		// Check if we have a recent validation result in the validation cache first
-		validationKey := fmt.Sprintf("validation:%s", path)
-		isValid, lastValidated := config.ValidationCache.Get(validationKey)
-
-		if isValid {
-			if config.LogRequests {
-				log.Printf("Using cached validation result from %s: %s",
-					lastValidated.Format(time.RFC3339), path)
-			}
-			// Return 304 Not Modified based on cached validation
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-	} else if config.LogRequests {
+	if config.LogRequests {
 		log.Printf("Cache miss, fetching from origin: %s", originURL)
 	}
 

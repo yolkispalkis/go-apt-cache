@@ -145,6 +145,7 @@ func (ss *ServerSetup) registerRepositoryHandlers(mux *http.ServeMux) {
 			ValidationCache: ss.ValidationCache,
 			LogRequests:     ss.Config.Server.LogRequests,
 			Client:          ss.HTTPClient,
+			LocalPath:       basePath, // Add local path for proper URL mapping
 		}
 
 		// Register handlers
