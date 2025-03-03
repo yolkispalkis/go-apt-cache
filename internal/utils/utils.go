@@ -210,6 +210,7 @@ var FilePatterns = struct {
 		"Release",
 		"Release.gpg",
 		"InRelease",
+		"ls-lR.gz",
 	},
 	RarelyChanging: []string{
 		".deb",
@@ -232,7 +233,8 @@ func GetFilePatternType(path string) FilePatternType {
 	// Critical metadata files - check this first
 	if strings.Contains(path, "InRelease") ||
 		strings.Contains(path, "Release.gpg") ||
-		strings.Contains(path, "/Release") {
+		strings.Contains(path, "/Release") ||
+		strings.Contains(path, "ls-lR.gz") {
 		return CriticalMetadata
 	}
 
