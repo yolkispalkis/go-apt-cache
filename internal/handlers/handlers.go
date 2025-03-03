@@ -167,13 +167,13 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				if lastModifiedStr != "" {
 					req.Header.Set("If-Modified-Since", lastModifiedStr)
 					if config.LogRequests {
-						log.Printf("Validating cached file with upstream using If-Modified-Since: %s for path: %s", lastModifiedStr, r.URL.Path)
+						log.Printf("Validating cached file with upstream for path: %s", r.URL.Path)
 					}
 				} else {
 					formattedTime := lastModified.Format(http.TimeFormat)
 					req.Header.Set("If-Modified-Since", formattedTime)
 					if config.LogRequests {
-						log.Printf("Validating cached file with upstream using If-Modified-Since (from file time): %s for path: %s", formattedTime, r.URL.Path)
+						log.Printf("Validating cached file with upstream for path: %s", r.URL.Path)
 					}
 				}
 
@@ -189,7 +189,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 					if resp.StatusCode == http.StatusNotModified {
 						// Our cache is still valid, use it
 						if config.LogRequests {
-							log.Printf("Upstream confirms cache is still valid (304) for: %s", r.URL.Path)
+							log.Printf("Upstream confirms cache is still valid for: %s", r.URL.Path)
 						}
 
 						// Store validation result in validation cache
@@ -199,7 +199,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 						}
 					} else if resp.StatusCode == http.StatusOK {
 						// Upstream has a newer version, fetch it
-						log.Printf("Upstream has newer version (200) for: %s", r.URL.Path)
+						log.Printf("Upstream has newer version for: %s", r.URL.Path)
 
 						// Acquire lock for this resource to prevent multiple concurrent fetches
 						acquired, ch := acquireLock(r.URL.Path)
@@ -391,7 +391,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			return
 		}
 	} else if config.LogRequests {
-		log.Printf("True cache miss, fetching from origin: %s", originURL)
+		log.Printf("Cache miss, fetching from origin: %s", originURL)
 	}
 
 	// Create request to origin server
@@ -411,7 +411,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		if ifModifiedSince := r.Header.Get("If-Modified-Since"); ifModifiedSince != "" {
 			req.Header.Set("If-Modified-Since", ifModifiedSince)
 			if config.LogRequests {
-				log.Printf("Validating cache: Forwarding If-Modified-Since: %s to origin for path: %s", ifModifiedSince, path)
+				log.Printf("Validating cache to origin for path: %s", path)
 			}
 		}
 	}
@@ -430,7 +430,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	if resp.StatusCode == http.StatusNotModified {
 		// Resource not modified
 		if config.LogRequests {
-			log.Printf("Origin reports resource not modified (304) for path: %s", path)
+			log.Printf("Origin reports resource not modified for path: %s", path)
 		}
 
 		// Store validation result in validation cache
@@ -562,7 +562,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 		} else {
 			// Cache miss - file not in cache
 			if config.LogRequests {
-				log.Printf("True cache miss for: %s", r.URL.Path)
+				log.Printf("Cache miss for: %s", r.URL.Path)
 			}
 		}
 
