@@ -10,7 +10,8 @@
     "sizeUnit": "MB",
     "enabled": true,
     "lru": true,
-    "cleanOnStart": false
+    "cleanOnStart": false,
+    "validationCacheTTL": 300
   },
   "repositories": [
     {

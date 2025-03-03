@@ -3,6 +3,7 @@ package storage
 import (
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -42,6 +43,18 @@ type HeaderCache interface {
 	PutHeaders(key string, headers http.Header) error
 }
 
+// ValidationCache defines the interface for caching validation results
+type ValidationCache interface {
+	// Get checks if a validation result is cached
+	Get(key string) (bool, time.Time)
+
+	// Put stores a validation result
+	Put(key string, lastValidated time.Time)
+
+	// SetTTL updates the TTL for cached validations
+	SetTTL(ttl time.Duration)
+}
+
 // NoopCache is a cache implementation that does nothing
 type NoopCache struct{}
 
@@ -76,4 +89,76 @@ func (c *NoopHeaderCache) GetHeaders(key string) (http.Header, error) {
 // PutHeaders does nothing
 func (c *NoopHeaderCache) PutHeaders(key string, headers http.Header) error {
 	return nil
+}
+
+// MemoryValidationCache is an in-memory implementation of ValidationCache
+type MemoryValidationCache struct {
+	mu    sync.RWMutex
+	cache map[string]time.Time
+	ttl   time.Duration
+}
+
+// NewMemoryValidationCache creates a new MemoryValidationCache
+func NewMemoryValidationCache(ttl time.Duration) *MemoryValidationCache {
+	return &MemoryValidationCache{
+		cache: make(map[string]time.Time),
+		ttl:   ttl,
+	}
+}
+
+// Get checks if a validation result is cached and still valid
+func (c *MemoryValidationCache) Get(key string) (bool, time.Time) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	lastValidated, exists := c.cache[key]
+	if !exists {
+		return false, time.Time{}
+	}
+
+	// Check if the cached validation is still valid
+	if time.Since(lastValidated) > c.ttl {
+		return false, lastValidated
+	}
+
+	return true, lastValidated
+}
+
+// Put stores a validation result
+func (c *MemoryValidationCache) Put(key string, lastValidated time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.cache[key] = lastValidated
+}
+
+// SetTTL updates the TTL for cached validations
+func (c *MemoryValidationCache) SetTTL(ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.ttl = ttl
+}
+
+// NoopValidationCache is a validation cache implementation that does nothing
+type NoopValidationCache struct{}
+
+// NewNoopValidationCache creates a new NoopValidationCache
+func NewNoopValidationCache() *NoopValidationCache {
+	return &NoopValidationCache{}
+}
+
+// Get always returns false
+func (c *NoopValidationCache) Get(key string) (bool, time.Time) {
+	return false, time.Time{}
+}
+
+// Put does nothing
+func (c *NoopValidationCache) Put(key string, lastValidated time.Time) {
+	// Do nothing
+}
+
+// SetTTL does nothing
+func (c *NoopValidationCache) SetTTL(ttl time.Duration) {
+	// Do nothing
 }

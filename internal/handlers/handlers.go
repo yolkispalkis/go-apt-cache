@@ -16,11 +16,12 @@ import (
 
 // ServerConfig holds the configuration for the APT mirror server
 type ServerConfig struct {
-	OriginServer string
-	Cache        storage.Cache
-	HeaderCache  storage.HeaderCache
-	LogRequests  bool
-	Client       *http.Client // HTTP client for making requests to origin servers
+	OriginServer    string
+	Cache           storage.Cache
+	HeaderCache     storage.HeaderCache
+	ValidationCache storage.ValidationCache
+	LogRequests     bool
+	Client          *http.Client // HTTP client for making requests to origin servers
 }
 
 // requestLock provides a mechanism to prevent concurrent requests for the same resource
@@ -151,6 +152,20 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		// Check with upstream server if our cache is still valid
 		// Only do this for frequently changing files to reduce load on origin servers
 		if useIfModifiedSince && shouldValidateWithOrigin(r.URL.Path) {
+			// First check if we have a recent validation result in the validation cache
+			validationKey := fmt.Sprintf("validation:%s", r.URL.Path)
+			isValid, lastValidated := config.ValidationCache.Get(validationKey)
+
+			if isValid {
+				if config.LogRequests {
+					log.Printf("Using cached validation result from %s for path: %s",
+						lastValidated.Format(time.RFC3339), r.URL.Path)
+				}
+				// Skip validation with upstream as we have a recent valid result
+				return true
+			}
+
+			// No valid cached validation result, check with upstream
 			originURL := fmt.Sprintf("%s%s", config.OriginServer, r.URL.Path)
 			req, err := http.NewRequest(http.MethodHead, originURL, nil)
 			if err == nil {
@@ -159,13 +174,13 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				if lastModifiedStr != "" {
 					req.Header.Set("If-Modified-Since", lastModifiedStr)
 					if config.LogRequests {
-						log.Printf("Checking with upstream using If-Modified-Since: %s for path: %s", lastModifiedStr, r.URL.Path)
+						log.Printf("Validating cached file with upstream using If-Modified-Since: %s for path: %s", lastModifiedStr, r.URL.Path)
 					}
 				} else {
 					formattedTime := lastModified.Format(http.TimeFormat)
 					req.Header.Set("If-Modified-Since", formattedTime)
 					if config.LogRequests {
-						log.Printf("Checking with upstream using If-Modified-Since (from file time): %s for path: %s", formattedTime, r.URL.Path)
+						log.Printf("Validating cached file with upstream using If-Modified-Since (from file time): %s for path: %s", formattedTime, r.URL.Path)
 					}
 				}
 
@@ -182,6 +197,12 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 						// Our cache is still valid, use it
 						if config.LogRequests {
 							log.Printf("Upstream confirms cache is still valid (304) for: %s", r.URL.Path)
+						}
+
+						// Store validation result in validation cache
+						config.ValidationCache.Put(validationKey, time.Now())
+						if config.LogRequests {
+							log.Printf("Stored validation result in cache for: %s", r.URL.Path)
 						}
 					} else if resp.StatusCode == http.StatusOK {
 						// Upstream has a newer version, fetch it
@@ -347,7 +368,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		}
 
 		// If still not in cache, acquire the lock and fetch it
-		acquired, ch = acquireLock(path)
+		acquired, _ = acquireLock(path)
 		if !acquired {
 			// This should not happen, but handle it gracefully
 			http.Error(w, "Server busy, please try again", http.StatusServiceUnavailable)
@@ -359,8 +380,31 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	defer releaseLock(path)
 
 	originURL := fmt.Sprintf("%s%s", config.OriginServer, path)
-	if config.LogRequests {
-		log.Printf("Cache miss, fetching from origin: %s", originURL)
+
+	// Check if we're using If-Modified-Since header
+	ifModifiedSince := r.Header.Get("If-Modified-Since")
+	if useIfModifiedSince && ifModifiedSince != "" {
+		// Check if we have a recent validation result in the validation cache
+		validationKey := fmt.Sprintf("validation:%s", path)
+		isValid, lastValidated := config.ValidationCache.Get(validationKey)
+
+		if isValid {
+			if config.LogRequests {
+				log.Printf("Using cached validation result from %s for path: %s",
+					lastValidated.Format(time.RFC3339), path)
+			}
+			// Return 304 Not Modified based on cached validation
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+
+		if config.LogRequests {
+			log.Printf("Validating with upstream using If-Modified-Since: %s for path: %s", ifModifiedSince, path)
+		}
+	} else {
+		if config.LogRequests {
+			log.Printf("Cache miss, fetching from origin: %s", originURL)
+		}
 	}
 
 	// Create request to origin server
@@ -380,7 +424,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		if ifModifiedSince := r.Header.Get("If-Modified-Since"); ifModifiedSince != "" {
 			req.Header.Set("If-Modified-Since", ifModifiedSince)
 			if config.LogRequests {
-				log.Printf("Cache miss: Forwarding If-Modified-Since: %s to origin for path: %s", ifModifiedSince, path)
+				log.Printf("Validating cache: Forwarding If-Modified-Since: %s to origin for path: %s", ifModifiedSince, path)
 			}
 		}
 	}
@@ -401,6 +445,14 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		if config.LogRequests {
 			log.Printf("Origin reports resource not modified (304) for path: %s", path)
 		}
+
+		// Store validation result in validation cache
+		validationKey := fmt.Sprintf("validation:%s", path)
+		config.ValidationCache.Put(validationKey, time.Now())
+		if config.LogRequests {
+			log.Printf("Stored validation result in cache for: %s", path)
+		}
+
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -500,9 +552,14 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			if handleCacheHit(w, r, config, content, contentLength, lastModified, useIfModifiedSince) {
 				return
 			}
+		} else {
+			// True cache miss - file not in cache
+			if config.LogRequests {
+				log.Printf("True cache miss for: %s", r.URL.Path)
+			}
 		}
 
-		// Cache miss
+		// Cache miss or validation needed
 		handleCacheMiss(w, r, config, useIfModifiedSince)
 	}
 }

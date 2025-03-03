@@ -26,12 +26,12 @@ type CacheInitializer struct {
 }
 
 // Initialize sets up the cache based on configuration
-func (ci *CacheInitializer) Initialize() (storage.Cache, storage.HeaderCache, error) {
+func (ci *CacheInitializer) Initialize() (storage.Cache, storage.HeaderCache, storage.ValidationCache, error) {
 	cfg := ci.Config
 
 	if !cfg.Cache.Enabled {
 		log.Println("Cache is disabled, using noop cache")
-		return storage.NewNoopCache(), storage.NewNoopHeaderCache(), nil
+		return storage.NewNoopCache(), storage.NewNoopHeaderCache(), storage.NewNoopValidationCache(), nil
 	}
 
 	cacheDir := cfg.Cache.Directory
@@ -50,7 +50,7 @@ func (ci *CacheInitializer) Initialize() (storage.Cache, storage.HeaderCache, er
 	// Ensure cache directory exists with proper error handling
 	log.Printf("Creating cache directory at %s", cacheDir)
 	if err := utils.CreateDirectory(cacheDir); err != nil {
-		return nil, nil, fmt.Errorf("failed to create cache directory: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to create cache directory: %v", err)
 	}
 
 	// Convert cache size based on unit
@@ -65,7 +65,7 @@ func (ci *CacheInitializer) Initialize() (storage.Cache, storage.HeaderCache, er
 
 	lruCache, err := storage.NewLRUCacheWithOptions(lruOptions)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to initialize LRU cache: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to initialize LRU cache: %v", err)
 	}
 
 	// Get cache stats after initialization
@@ -78,20 +78,26 @@ func (ci *CacheInitializer) Initialize() (storage.Cache, storage.HeaderCache, er
 	// Initialize header cache
 	headerCache, err := storage.NewFileHeaderCache(cacheDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to initialize header cache: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to initialize header cache: %v", err)
 	}
 	log.Printf("Using header cache at %s", cacheDir)
 
+	// Initialize validation cache
+	validationTTL := time.Duration(cfg.Cache.ValidationCacheTTL) * time.Second
+	validationCache := storage.NewMemoryValidationCache(validationTTL)
+	log.Printf("Using in-memory validation cache with TTL of %v", validationTTL)
+
 	// Return the LRUCache as a Cache interface
-	return lruCache, headerCache, nil
+	return lruCache, headerCache, validationCache, nil
 }
 
 // ServerSetup encapsulates server setup logic
 type ServerSetup struct {
-	Config      *config.Config
-	Cache       storage.Cache
-	HeaderCache storage.HeaderCache
-	HTTPClient  *http.Client
+	Config          *config.Config
+	Cache           storage.Cache
+	HeaderCache     storage.HeaderCache
+	ValidationCache storage.ValidationCache
+	HTTPClient      *http.Client
 }
 
 // CreateServer creates and configures the HTTP server
@@ -133,11 +139,12 @@ func (ss *ServerSetup) registerRepositoryHandlers(mux *http.ServeMux) {
 
 		// Create handler config
 		handlerConfig := handlers.ServerConfig{
-			OriginServer: origin,
-			Cache:        ss.Cache,
-			HeaderCache:  ss.HeaderCache,
-			LogRequests:  ss.Config.Server.LogRequests,
-			Client:       ss.HTTPClient,
+			OriginServer:    origin,
+			Cache:           ss.Cache,
+			HeaderCache:     ss.HeaderCache,
+			ValidationCache: ss.ValidationCache,
+			LogRequests:     ss.Config.Server.LogRequests,
+			Client:          ss.HTTPClient,
 		}
 
 		// Register handlers
@@ -381,7 +388,7 @@ func main() {
 
 	// Initialize cache
 	cacheInitializer := &CacheInitializer{Config: &cfg}
-	cache, headerCache, err := cacheInitializer.Initialize()
+	cache, headerCache, validationCache, err := cacheInitializer.Initialize()
 	if err != nil {
 		log.Fatalf("Failed to initialize cache: %v", err)
 	}
@@ -391,10 +398,11 @@ func main() {
 
 	// Set up HTTP server
 	serverSetup := &ServerSetup{
-		Config:      &cfg,
-		Cache:       cache,
-		HeaderCache: headerCache,
-		HTTPClient:  httpClient,
+		Config:          &cfg,
+		Cache:           cache,
+		HeaderCache:     headerCache,
+		ValidationCache: validationCache,
+		HTTPClient:      httpClient,
 	}
 	server := serverSetup.CreateServer()
 

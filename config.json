@@ -10,12 +10,13 @@
     "sizeUnit": "MB",
     "enabled": true,
     "lru": true,
-    "cleanOnStart": false
+    "cleanOnStart": false,
+    "validationCacheTTL": 300
   },
   "repositories": [
     {
       "origin": "archive.ubuntu.com",
-      "path": "/",
+      "path": "/ubuntu",
       "enabled": true
     }
   ],

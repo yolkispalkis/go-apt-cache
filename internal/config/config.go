@@ -18,12 +18,13 @@ type Repository struct {
 
 // CacheConfig represents cache configuration
 type CacheConfig struct {
-	Directory    string `json:"directory"`    // Cache directory
-	MaxSize      int64  `json:"maxSize"`      // Maximum cache size
-	SizeUnit     string `json:"sizeUnit"`     // Size unit: "bytes", "MB", or "GB"
-	Enabled      bool   `json:"enabled"`      // Whether cache is enabled
-	LRU          bool   `json:"lru"`          // Whether to use LRU eviction policy
-	CleanOnStart bool   `json:"cleanOnStart"` // Whether to clean the cache on startup
+	Directory          string `json:"directory"`          // Cache directory
+	MaxSize            int64  `json:"maxSize"`            // Maximum cache size
+	SizeUnit           string `json:"sizeUnit"`           // Size unit: "bytes", "MB", or "GB"
+	Enabled            bool   `json:"enabled"`            // Whether cache is enabled
+	LRU                bool   `json:"lru"`                // Whether to use LRU eviction policy
+	CleanOnStart       bool   `json:"cleanOnStart"`       // Whether to clean the cache on startup
+	ValidationCacheTTL int    `json:"validationCacheTTL"` // Time in seconds to cache validation results
 }
 
 // ServerConfig represents the server configuration
@@ -50,12 +51,13 @@ func DefaultConfig() Config {
 			Timeout:       30,
 		},
 		Cache: CacheConfig{
-			Directory:    "./cache",
-			MaxSize:      1024,
-			SizeUnit:     "MB",
-			Enabled:      true,
-			LRU:          true,
-			CleanOnStart: false,
+			Directory:          "./cache",
+			MaxSize:            1024,
+			SizeUnit:           "MB",
+			Enabled:            true,
+			LRU:                true,
+			CleanOnStart:       false,
+			ValidationCacheTTL: 300, // 5 minutes default
 		},
 		Repositories: []Repository{
 			{
