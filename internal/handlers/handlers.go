@@ -401,10 +401,8 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		if config.LogRequests {
 			log.Printf("Validating with upstream using If-Modified-Since: %s for path: %s", ifModifiedSince, path)
 		}
-	} else {
-		if config.LogRequests {
-			log.Printf("Cache miss, fetching from origin: %s", originURL)
-		}
+	} else if config.LogRequests {
+		log.Printf("Cache miss, fetching from origin: %s", originURL)
 	}
 
 	// Create request to origin server
@@ -527,8 +525,12 @@ func shouldUseIfModifiedSince(path string) bool {
 // shouldValidateWithOrigin determines if we should check with the origin server
 // to validate if our cached copy is still valid
 func shouldValidateWithOrigin(path string) bool {
-	// Only validate critical metadata files with origin
-	return utils.GetFilePatternType(path) == utils.CriticalMetadata
+	// Validate InRelease files and other critical metadata
+	patternType := utils.GetFilePatternType(path)
+	return patternType == utils.CriticalMetadata ||
+		strings.Contains(path, "InRelease") ||
+		strings.Contains(path, "Release") ||
+		strings.HasSuffix(path, "/")
 }
 
 // HandleRequest is a common handler for all types of requests
@@ -542,7 +544,23 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			return
 		}
 
-		// Try to get from cache first
+		// Check if we have a recent validation result in the validation cache first
+		if useIfModifiedSince {
+			validationKey := fmt.Sprintf("validation:%s", r.URL.Path)
+			isValid, lastValidated := config.ValidationCache.Get(validationKey)
+
+			if isValid {
+				if config.LogRequests {
+					log.Printf("Using cached validation result from %s for path: %s",
+						lastValidated.Format(time.RFC3339), r.URL.Path)
+				}
+				// We have a valid cached validation result
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		}
+
+		// Try to get from cache
 		content, contentLength, lastModified, err := config.Cache.Get(r.URL.Path)
 		if err == nil {
 			// Cache hit
@@ -553,9 +571,16 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 				return
 			}
 		} else {
-			// True cache miss - file not in cache
+			// Cache miss - file not in cache
 			if config.LogRequests {
-				log.Printf("True cache miss for: %s", r.URL.Path)
+				// Only log "True cache miss" for files that aren't validation-related
+				// This prevents the confusing "True cache miss" messages for InRelease files
+				// that are actually being validated with If-Modified-Since
+				if !useIfModifiedSince || r.Header.Get("If-Modified-Since") == "" {
+					log.Printf("True cache miss for: %s", r.URL.Path)
+				} else {
+					log.Printf("Cache miss with validation for: %s", r.URL.Path)
+				}
 			}
 		}
 

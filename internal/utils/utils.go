@@ -223,8 +223,10 @@ func MatchesFilePattern(path string, patterns []string) bool {
 
 // GetFilePatternType determines the type of file based on its path
 func GetFilePatternType(path string) FilePatternType {
-	// Critical metadata files
-	if MatchesFilePattern(path, FilePatterns.CriticalMetadata) {
+	// Critical metadata files - check this first
+	if strings.Contains(path, "InRelease") ||
+		strings.Contains(path, "Release.gpg") ||
+		strings.Contains(path, "/Release") {
 		return CriticalMetadata
 	}
 

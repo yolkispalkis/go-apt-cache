@@ -118,6 +118,12 @@ func (c *MemoryValidationCache) Get(key string) (bool, time.Time) {
 
 	// Check if the cached validation is still valid
 	if time.Since(lastValidated) > c.ttl {
+		// If TTL has expired, remove the entry to avoid stale validations
+		go func(k string) {
+			c.mu.Lock()
+			delete(c.cache, k)
+			c.mu.Unlock()
+		}(key)
 		return false, lastValidated
 	}
 
