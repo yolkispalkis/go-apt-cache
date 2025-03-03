@@ -33,6 +33,9 @@ var requestLock = struct {
 	inProgress map[string]chan struct{}
 }{inProgress: make(map[string]chan struct{})}
 
+// validationCacheKeyFormat is the format string for validation cache keys.
+const validationCacheKeyFormat = "validation:%s"
+
 // acquireLock tries to acquire a lock for a resource path
 // Returns true if the lock was acquired, false if it's already locked
 // If it's already locked, the caller should wait on the returned channel
@@ -72,6 +75,12 @@ func releaseLock(path string) {
 	}
 }
 
+// reacquireLock attempts to re-acquire the lock after waiting on the channel.
+func reacquireLock(path string) bool {
+	acquired, _ := acquireLock(path)
+	return acquired
+}
+
 // Common HTTP request handling functions to avoid duplication
 
 // validateRequest checks if the request method and query parameters are valid
@@ -84,7 +93,7 @@ func validateRequest(w http.ResponseWriter, r *http.Request) bool {
 
 	// Check for query parameters (not allowed)
 	if r.URL.RawQuery != "" {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+		http.Error(w, "Query parameters are not allowed", http.StatusForbidden)
 		return false
 	}
 
@@ -110,256 +119,227 @@ func getOriginPath(config ServerConfig, localPath string) string {
 	return originPath
 }
 
-// handleCacheHit handles a cache hit, returning true if the response was handled
-func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig, content io.ReadCloser, contentLength int64, lastModified time.Time, useIfModifiedSince bool) bool {
-	defer content.Close()
+// fetchFromOrigin fetches content from the origin server
+func fetchFromOrigin(config ServerConfig, r *http.Request, originURL string) (*http.Response, error) {
+	if config.LogRequests {
+		log.Printf("Fetching from origin: %s", originURL)
+	}
 
-	// Try to get cached headers
-	cachedHeaders, headerErr := config.HeaderCache.GetHeaders(r.URL.Path)
-	if headerErr == nil {
-		// Check If-Modified-Since header from client request
-		ifModifiedSince := r.Header.Get("If-Modified-Since")
-		if useIfModifiedSince && ifModifiedSince != "" {
-			if config.LogRequests {
-				log.Printf("Checking if modified: %s", r.URL.Path)
-			}
+	req, err := http.NewRequest(r.Method, originURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request to origin: %w", err)
+	}
 
-			ifModifiedSinceTime, err := time.Parse(http.TimeFormat, ifModifiedSince)
-			if err == nil {
-				// Get Last-Modified from cached headers or use the file's lastModified
-				lastModifiedStr := cachedHeaders.Get("Last-Modified")
-				var lastModifiedTime time.Time
+	// Copy relevant headers from the client request to the origin request
+	req.Header.Set("User-Agent", "Go-APT-Cache/1.0")
+	if ifModifiedSince := r.Header.Get("If-Modified-Since"); ifModifiedSince != "" {
+		req.Header.Set("If-Modified-Since", ifModifiedSince)
+	}
 
-				if lastModifiedStr != "" {
-					lastModifiedTime, err = time.Parse(http.TimeFormat, lastModifiedStr)
-					if err != nil {
-						lastModifiedTime = lastModified
-					}
-				} else {
-					lastModifiedTime = lastModified
-				}
+	client := getClient(config)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching from origin: %w", err)
+	}
+	// Note: Caller is responsible for closing resp.Body
 
-				if !lastModifiedTime.After(ifModifiedSinceTime) {
-					// Resource not modified
-					if config.LogRequests {
-						log.Printf("Resource not modified: %s", r.URL.Path)
-					}
-					w.WriteHeader(http.StatusNotModified)
-					return true
-				} else if config.LogRequests {
-					log.Printf("Resource modified: %s", r.URL.Path)
-				}
-			} else if config.LogRequests {
-				log.Printf("Failed to parse If-Modified-Since header: %s, error: %v", ifModifiedSince, err)
-			}
+	return resp, nil
+}
+
+// updateCache updates both the content cache and the header cache
+func updateCache(config ServerConfig, path string, body []byte, lastModified time.Time, headers http.Header) {
+	// Update content cache
+	err := config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified)
+	if err != nil {
+		log.Printf("Error storing in cache: %v", err)
+		// Continue even if caching fails
+	} else if config.LogRequests {
+		log.Printf("Stored in cache: %s (%d bytes)", path, len(body))
+	}
+
+	// Update header cache
+	err = config.HeaderCache.PutHeaders(path, headers)
+	if err != nil {
+		log.Printf("Error storing headers in cache: %v", err)
+		// Continue even if header caching fails
+	}
+}
+
+// respondWithContent sends the response to the client
+func respondWithContent(w http.ResponseWriter, r *http.Request, headers http.Header, body []byte, contentLength int64) {
+	// Set response headers from origin or cache
+	for key, values := range headers {
+		for _, value := range values {
+			w.Header().Add(key, value)
 		}
-
-		// Check with upstream server if our cache is still valid
-		// Only do this for frequently changing files to reduce load on origin servers
-		if useIfModifiedSince && shouldValidateWithOrigin(r.URL.Path) {
-			// First check if we have a recent validation result in the validation cache
-			validationKey := fmt.Sprintf("validation:%s", r.URL.Path)
-			isValid, lastValidated := config.ValidationCache.Get(validationKey)
-
-			if isValid {
-				if config.LogRequests {
-					log.Printf("Using cached validation result from %s: %s",
-						lastValidated.Format(time.RFC3339), r.URL.Path)
-				}
-				// Skip validation with upstream as we have a recent valid result
-				return true
-			}
-
-			// No valid cached validation result, check with upstream
-			originPath := getOriginPath(config, r.URL.Path)
-			originURL := fmt.Sprintf("%s%s", config.OriginServer, originPath)
-			req, err := http.NewRequest(http.MethodHead, originURL, nil)
-			if err == nil {
-				// Use our cached Last-Modified as If-Modified-Since when checking upstream
-				lastModifiedStr := cachedHeaders.Get("Last-Modified")
-				if lastModifiedStr != "" {
-					req.Header.Set("If-Modified-Since", lastModifiedStr)
-					if config.LogRequests {
-						log.Printf("Validating cached file with upstream: %s", r.URL.Path)
-					}
-				} else {
-					formattedTime := lastModified.Format(http.TimeFormat)
-					req.Header.Set("If-Modified-Since", formattedTime)
-					if config.LogRequests {
-						log.Printf("Validating cached file with upstream: %s", r.URL.Path)
-					}
-				}
-
-				// Add User-Agent header
-				req.Header.Set("User-Agent", "Go-APT-Cache/1.0")
-
-				// Check with upstream
-				client := getClient(config)
-				resp, err := client.Do(req)
-				if err == nil {
-					defer resp.Body.Close()
-
-					if resp.StatusCode == http.StatusNotModified {
-						// Our cache is still valid, use it
-						if config.LogRequests {
-							log.Printf("Upstream confirms cache is still valid: %s", r.URL.Path)
-						}
-
-						// Store validation result in validation cache
-						config.ValidationCache.Put(validationKey, time.Now())
-						if config.LogRequests {
-							log.Printf("Stored validation result in cache: %s", r.URL.Path)
-						}
-					} else if resp.StatusCode == http.StatusOK {
-						// Upstream has a newer version, fetch it
-						log.Printf("Upstream has newer version: %s", r.URL.Path)
-
-						// Acquire lock for this resource to prevent multiple concurrent fetches
-						acquired, ch := acquireLock(r.URL.Path)
-						if acquired {
-							defer releaseLock(r.URL.Path)
-						} else {
-							<-ch
-						}
-
-						content, contentLength, cachedHeaders = fetchAndUpdateCache(config, r.URL.Path, originURL, client)
-					} else {
-						log.Printf("Unexpected status from upstream: %d for %s", resp.StatusCode, r.URL.Path)
-					}
-				} else {
-					log.Printf("Error checking with upstream: %v for %s", err, r.URL.Path)
-				}
-			} else {
-				log.Printf("Error creating HEAD request: %v", err)
-			}
-		}
-
-		// Use cached headers
-		for key, values := range cachedHeaders {
-			for _, value := range values {
-				w.Header().Add(key, value)
-			}
-		}
-	} else {
-		// Fallback to basic headers if no cached headers
-		setBasicHeaders(w, r, cachedHeaders, lastModified, useIfModifiedSince)
 	}
 
 	// Always set content length
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
 
-	// If it's a HEAD request, don't send the body
-	if r.Method == http.MethodHead {
+	// Write status code and body (if not a HEAD request)
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, err := w.Write(body)
+		if err != nil {
+			log.Printf("Error writing response body: %v", err)
+		}
+	}
+}
+
+// sendNotModified sends a 304 Not Modified response.
+func sendNotModified(w http.ResponseWriter, config ServerConfig, r *http.Request) {
+	if config.LogRequests {
+		log.Printf("Resource not modified: %s", r.URL.Path)
+	}
+	w.WriteHeader(http.StatusNotModified)
+}
+
+// checkAndHandleIfModifiedSince checks the If-Modified-Since header and handles it.
+// Returns true if a response was sent (either 304 or because of an error), false otherwise.
+func checkAndHandleIfModifiedSince(w http.ResponseWriter, r *http.Request, lastModifiedStr string, lastModifiedTime time.Time, config ServerConfig) bool {
+	ifModifiedSince := r.Header.Get("If-Modified-Since")
+	if ifModifiedSince == "" {
+		return false // No If-Modified-Since header, nothing to do
+	}
+
+	ifModifiedSinceTime, err := time.Parse(http.TimeFormat, ifModifiedSince)
+	if err != nil {
+		if config.LogRequests {
+			log.Printf("Failed to parse If-Modified-Since header: %s, error: %v", ifModifiedSince, err)
+		}
+		return false // Treat as if the header wasn't sent
+	}
+
+	var lastModifiedTimeToCheck time.Time
+	if lastModifiedStr != "" {
+		lastModifiedTimeToCheck, err = time.Parse(http.TimeFormat, lastModifiedStr)
+		if err != nil {
+			// If we can't parse the header, use the file's lastModified time
+			lastModifiedTimeToCheck = lastModifiedTime
+		}
+	} else {
+		lastModifiedTimeToCheck = lastModifiedTime
+	}
+
+	if !lastModifiedTimeToCheck.After(ifModifiedSinceTime) {
+		sendNotModified(w, config, r)
+		return true // We sent a 304 response
+	}
+
+	return false
+}
+
+// validateWithOrigin checks with the origin server if the cached copy is still valid
+func validateWithOrigin(config ServerConfig, r *http.Request, cachedHeaders http.Header, lastModified time.Time) (bool, error) {
+	originPath := getOriginPath(config, r.URL.Path)
+	originURL := fmt.Sprintf("%s%s", config.OriginServer, originPath)
+	req, err := http.NewRequest(http.MethodHead, originURL, nil)
+	if err != nil {
+		return false, fmt.Errorf("error creating HEAD request for validation: %w", err)
+	}
+
+	// Use our cached Last-Modified as If-Modified-Since when checking upstream
+	lastModifiedStr := cachedHeaders.Get("Last-Modified")
+	if lastModifiedStr == "" {
+		lastModifiedStr = lastModified.Format(http.TimeFormat)
+	}
+	req.Header.Set("If-Modified-Since", lastModifiedStr)
+	req.Header.Set("User-Agent", "Go-APT-Cache/1.0")
+
+	if config.LogRequests {
+		log.Printf("Validating cached file with upstream: %s", r.URL.Path)
+	}
+
+	client := getClient(config)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("error checking with upstream: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified {
+		if config.LogRequests {
+			log.Printf("Upstream confirms cache is still valid: %s", r.URL.Path)
+		}
+		return true, nil
+	} else if resp.StatusCode != http.StatusOK {
+		log.Printf("Unexpected status from upstream during validation: %d for %s", resp.StatusCode, r.URL.Path)
+	}
+	return false, nil
+}
+
+// handleCacheHit handles a cache hit, returning true if the response was handled
+func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig, content io.ReadCloser, contentLength int64, lastModified time.Time, useIfModifiedSince bool) bool {
+	defer content.Close()
+
+	cachedHeaders, headerErr := config.HeaderCache.GetHeaders(r.URL.Path)
+	if headerErr != nil {
+		// Fallback to basic headers if no cached headers
+		log.Printf("No cached headers found for %s: %v", r.URL.Path, headerErr)
+		setBasicHeaders(w, r, nil, lastModified, useIfModifiedSince, config)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
+
+		if r.Method == http.MethodHead {
+			return true
+		}
+		_, err := io.Copy(w, content)
+		if err != nil {
+			log.Printf("Error writing response: %v", err)
+		}
 		return true
 	}
 
-	// Copy content to response writer with proper error handling
-	_, err := io.Copy(w, content)
-	if err != nil {
-		log.Printf("Error writing response: %v", err)
+	// Check If-Modified-Since
+	lastModifiedStr := cachedHeaders.Get("Last-Modified")
+	if useIfModifiedSince && checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
+		return true
 	}
 
-	return true
-}
-
-// fetchAndUpdateCache fetches content from origin and updates the cache
-func fetchAndUpdateCache(config ServerConfig, path string, originURL string, client *http.Client) (io.ReadCloser, int64, http.Header) {
-	// Fetch the full content with a GET request
-	getReq, err := http.NewRequest(http.MethodGet, originURL, nil)
-	if err != nil {
-		log.Printf("Error creating GET request: %v", err)
-		return nil, 0, nil
-	}
-
-	getReq.Header.Set("User-Agent", "Go-APT-Cache/1.0")
-	getResp, err := client.Do(getReq)
-	if err != nil {
-		log.Printf("Error fetching from origin: %v", err)
-		return nil, 0, nil
-	}
-	defer getResp.Body.Close()
-
-	// Read the entire response body
-	bodyBytes, err := io.ReadAll(getResp.Body)
-	if err != nil {
-		log.Printf("Error reading response: %v", err)
-		return nil, 0, nil
-	}
-
-	// Validate file size if Content-Length header is present
-	contentLength := getResp.ContentLength
-	actualSize := int64(len(bodyBytes))
-	if contentLength > 0 && contentLength != actualSize {
-		log.Printf("File size validation failed for %s: expected %d bytes, got %d bytes", path, contentLength, actualSize)
-		return io.NopCloser(bytes.NewReader(bodyBytes)), actualSize, getResp.Header
-	}
-
-	// Get last modified time
-	lastModifiedTime := time.Now()
-	if lastModifiedHeader := getResp.Header.Get("Last-Modified"); lastModifiedHeader != "" {
-		if parsedTime, err := time.Parse(http.TimeFormat, lastModifiedHeader); err == nil {
-			lastModifiedTime = parsedTime
-		}
-	}
-
-	// Update cache
-	cacheErr := config.Cache.Put(path, bytes.NewReader(bodyBytes), int64(len(bodyBytes)), lastModifiedTime)
-	if cacheErr != nil {
-		log.Printf("Error updating cache: %v", cacheErr)
-	} else {
-		log.Printf("Successfully updated cache: %s", path)
-	}
-
-	// Update header cache
-	headerErr := config.HeaderCache.PutHeaders(path, getResp.Header)
-	if headerErr != nil {
-		log.Printf("Error updating headers: %v", headerErr)
-	}
-
-	// Return the new content and headers
-	return io.NopCloser(bytes.NewReader(bodyBytes)), int64(len(bodyBytes)), getResp.Header
-}
-
-// setBasicHeaders sets basic headers when cached headers are not available
-func setBasicHeaders(w http.ResponseWriter, r *http.Request, cachedHeaders http.Header, lastModified time.Time, useIfModifiedSince bool) {
-	// For directory URLs, always use text/html
-	if strings.HasSuffix(r.URL.Path, "/") {
-		w.Header().Set("Content-Type", "text/html")
-	} else {
-		// Only set Content-Type if it's not in cached headers
-		contentType := ""
-		if cachedHeaders != nil {
-			contentType = cachedHeaders.Get("Content-Type")
-		}
-		if contentType == "" {
-			contentType = utils.GetContentType(r.URL.Path)
-			if contentType != "" {
-				w.Header().Set("Content-Type", contentType)
+	// Validate with origin if needed
+	if useIfModifiedSince && shouldValidateWithOrigin(r.URL.Path) {
+		validationKey := fmt.Sprintf(validationCacheKeyFormat, r.URL.Path)
+		isValid, _ := config.ValidationCache.Get(validationKey)
+		if !isValid {
+			cacheIsValid, err := validateWithOrigin(config, r, cachedHeaders, lastModified)
+			if err != nil {
+				log.Printf("Error validating with origin: %v", err)
+				// If validation fails, we still serve the cached content, but log the error
+			} else if cacheIsValid {
+				config.ValidationCache.Put(validationKey, time.Now())
+				sendNotModified(w, config, r)
+				return true
 			}
 		} else {
-			w.Header().Set("Content-Type", contentType)
-		}
-	}
-	w.Header().Set("Last-Modified", lastModified.Format(http.TimeFormat))
-
-	// Check If-Modified-Since header only if we should use it for this file type
-	if useIfModifiedSince {
-		ifModifiedSince := r.Header.Get("If-Modified-Since")
-		if ifModifiedSince != "" {
-			ifModifiedSinceTime, err := time.Parse(http.TimeFormat, ifModifiedSince)
-			if err == nil && !lastModified.After(ifModifiedSinceTime) {
-				// Resource not modified
-				w.WriteHeader(http.StatusNotModified)
+			// We have a recent valid result, no need to check with origin
+			if config.LogRequests {
+				log.Printf("Using cached validation result for: %s", r.URL.Path)
 			}
+			sendNotModified(w, config, r)
+			return true
 		}
 	}
+
+	// If we reach here, we either didn't need to validate, or validation failed (or we skipped it due to an error).
+	// In any case, we serve the cached content
+
+	// Convert io.ReadCloser to []byte
+	bodyBytes, err := io.ReadAll(content)
+	if err != nil {
+		log.Printf("Error reading cached content: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return true // Return true as we handled the error
+	}
+
+	respondWithContent(w, r, cachedHeaders, bodyBytes, int64(len(bodyBytes)))
+	return true
 }
 
 // handleCacheMiss handles a cache miss, fetching the resource from the origin server
 func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig, useIfModifiedSince bool) {
 	path := r.URL.Path
 
-	// Check if this resource is already being fetched by another request
+	// Acquire lock for this resource
 	acquired, ch := acquireLock(path)
 	if !acquired {
 		// Wait for the other request to finish fetching
@@ -377,9 +357,9 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		}
 
 		// If still not in cache, acquire the lock and fetch it
-		acquired, _ = acquireLock(path)
-		if !acquired {
+		if !reacquireLock(path) {
 			// This should not happen, but handle it gracefully
+			log.Printf("Failed to acquire lock after waiting: %s", path)
 			http.Error(w, "Server busy, please try again", http.StatusServiceUnavailable)
 			return
 		}
@@ -388,39 +368,11 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	// We've acquired the lock, make sure to release it when done
 	defer releaseLock(path)
 
-	// Convert local path to origin path
 	originPath := getOriginPath(config, path)
 	originURL := fmt.Sprintf("%s%s", config.OriginServer, originPath)
 
-	if config.LogRequests {
-		log.Printf("Cache miss, fetching from origin: %s", originURL)
-	}
-
-	// Create request to origin server
-	req, err := http.NewRequest(r.Method, originURL, nil)
-	if err != nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		log.Printf("Error creating request to origin: %v", err)
-		return
-	}
-
-	// Copy relevant headers from client request to origin request
-	// Add User-Agent header
-	req.Header.Set("User-Agent", "Go-APT-Cache/1.0")
-
-	// Add If-Modified-Since header if present in client request and we should use it
-	if useIfModifiedSince {
-		if ifModifiedSince := r.Header.Get("If-Modified-Since"); ifModifiedSince != "" {
-			req.Header.Set("If-Modified-Since", ifModifiedSince)
-			if config.LogRequests {
-				log.Printf("Validating cache to origin: %s", path)
-			}
-		}
-	}
-
-	// Make request to origin server with timeout
-	client := getClient(config)
-	resp, err := client.Do(req)
+	// Fetch from origin
+	resp, err := fetchFromOrigin(config, r, originURL)
 	if err != nil {
 		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
 		log.Printf("Error fetching from origin: %v", err)
@@ -428,28 +380,28 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	}
 	defer resp.Body.Close()
 
-	// Handle response from origin server
 	if resp.StatusCode == http.StatusNotModified {
-		// Resource not modified
+		// Resource not modified (This should only happen if If-Modified-Since was sent)
 		if config.LogRequests {
 			log.Printf("Origin reports resource not modified: %s", path)
 		}
 
 		// Store validation result in validation cache
-		validationKey := fmt.Sprintf("validation:%s", path)
+		validationKey := fmt.Sprintf(validationCacheKeyFormat, path)
 		config.ValidationCache.Put(validationKey, time.Now())
 		if config.LogRequests {
 			log.Printf("Stored validation result in cache for: %s", path)
 		}
 
-		w.WriteHeader(http.StatusNotModified)
+		sendNotModified(w, config, r)
 		return
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		// Forward error status from origin
+		log.Printf("Unexpected status code from origin: %d, URL: %s", resp.StatusCode, originURL)
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		io.Copy(w, resp.Body) // Forward the response body from the origin server
 		return
 	}
 
@@ -461,7 +413,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		return
 	}
 
-	// Store in cache
+	// Get last modified time
 	lastModifiedTime := time.Now()
 	if lastModifiedHeader := resp.Header.Get("Last-Modified"); lastModifiedHeader != "" {
 		if parsedTime, err := time.Parse(http.TimeFormat, lastModifiedHeader); err == nil {
@@ -469,32 +421,32 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		}
 	}
 
-	err = config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModifiedTime)
-	if err != nil {
-		log.Printf("Error storing in cache: %v", err)
-		// Continue even if caching fails
-	} else if config.LogRequests {
-		log.Printf("Stored in cache: %s (%d bytes)", path, len(body))
-	}
+	// Update cache
+	updateCache(config, path, body, lastModifiedTime, resp.Header)
 
-	// Store headers in header cache first
-	err = config.HeaderCache.PutHeaders(path, resp.Header)
-	if err != nil {
-		log.Printf("Error storing headers in cache: %v", err)
-		// Continue even if header caching fails
-	}
+	// Respond to the client
+	respondWithContent(w, r, resp.Header, body, int64(len(body)))
+}
 
-	// Set response headers from origin
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
+// setBasicHeaders sets basic headers when cached headers are not available
+func setBasicHeaders(w http.ResponseWriter, r *http.Request, _ http.Header, lastModified time.Time, useIfModifiedSince bool, config ServerConfig) {
+	// For directory URLs, always use text/html
+	if strings.HasSuffix(r.URL.Path, "/") {
+		w.Header().Set("Content-Type", "text/html")
+	} else {
+		// Set Content-Type, only if not already set
+		if w.Header().Get("Content-Type") == "" {
+			contentType := utils.GetContentType(r.URL.Path)
+			if contentType != "" {
+				w.Header().Set("Content-Type", contentType)
+			}
 		}
 	}
+	w.Header().Set("Last-Modified", lastModified.Format(http.TimeFormat))
 
-	// Write response
-	w.WriteHeader(resp.StatusCode)
-	if r.Method != http.MethodHead {
-		w.Write(body)
+	// Check If-Modified-Since header only if we should use it for this file type
+	if useIfModifiedSince && checkAndHandleIfModifiedSince(w, r, "", lastModified, config) {
+		return
 	}
 }
 
@@ -527,16 +479,13 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 
 		// Check if we have a recent validation result in the validation cache first
 		if useIfModifiedSince {
-			validationKey := fmt.Sprintf("validation:%s", r.URL.Path)
-			isValid, lastValidated := config.ValidationCache.Get(validationKey)
-
+			validationKey := fmt.Sprintf(validationCacheKeyFormat, r.URL.Path)
+			isValid, _ := config.ValidationCache.Get(validationKey)
 			if isValid {
 				if config.LogRequests {
-					log.Printf("Using cached validation result from %s: %s",
-						lastValidated.Format(time.RFC3339), r.URL.Path)
+					log.Printf("Using cached validation result for: %s", r.URL.Path)
 				}
-				// We have a valid cached validation result
-				w.WriteHeader(http.StatusNotModified)
+				sendNotModified(w, config, r)
 				return
 			}
 		}
