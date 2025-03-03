@@ -157,7 +157,7 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 		log.Printf("Stored in cache: %s (%d bytes)", path, len(body))
 	}
 
-	// Update header cache
+	// Store original headers from origin server in header cache
 	err = config.HeaderCache.PutHeaders(path, headers)
 	if err != nil {
 		log.Printf("Error storing headers in cache: %v", err)
@@ -174,8 +174,10 @@ func respondWithContent(w http.ResponseWriter, r *http.Request, headers http.Hea
 		}
 	}
 
-	// Always set content length
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
+	// Set content length only if not already present
+	if w.Header().Get("Content-Length") == "" {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
+	}
 
 	// Write status code and body (if not a HEAD request)
 	w.WriteHeader(http.StatusOK)
@@ -281,6 +283,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
 
 		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
 			return true
 		}
 		_, err := io.Copy(w, content)
@@ -321,7 +324,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 	}
 
 	// If we reach here, we either didn't need to validate, or validation failed (or we skipped it due to an error).
-	// In any case, we serve the cached content
+	// In any case, we serve the cached content with cached headers
 
 	// Convert io.ReadCloser to []byte
 	bodyBytes, err := io.ReadAll(content)
@@ -331,7 +334,21 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		return true // Return true as we handled the error
 	}
 
-	respondWithContent(w, r, cachedHeaders, bodyBytes, int64(len(bodyBytes)))
+	// Use cached headers exactly as they were stored
+	for key, values := range cachedHeaders {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+
+	// Write status code and body (if not a HEAD request)
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, err := w.Write(bodyBytes)
+		if err != nil {
+			log.Printf("Error writing response body: %v", err)
+		}
+	}
 	return true
 }
 
