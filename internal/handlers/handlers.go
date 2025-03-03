@@ -109,7 +109,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		ifModifiedSince := r.Header.Get("If-Modified-Since")
 		if useIfModifiedSince && ifModifiedSince != "" {
 			if config.LogRequests {
-				log.Printf("Checking If-Modified-Since: %s for path: %s", ifModifiedSince, r.URL.Path)
+				log.Printf("Checking if modified for path: %s", r.URL.Path)
 			}
 
 			ifModifiedSinceTime, err := time.Parse(http.TimeFormat, ifModifiedSince)
@@ -127,22 +127,15 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 					lastModifiedTime = lastModified
 				}
 
-				if config.LogRequests {
-					log.Printf("Comparing - Last-Modified: %s, If-Modified-Since: %s for path: %s",
-						lastModifiedTime.Format(http.TimeFormat),
-						ifModifiedSinceTime.Format(http.TimeFormat),
-						r.URL.Path)
-				}
-
 				if !lastModifiedTime.After(ifModifiedSinceTime) {
 					// Resource not modified
 					if config.LogRequests {
-						log.Printf("Resource not modified (304) - Last-Modified is not after If-Modified-Since for path: %s", r.URL.Path)
+						log.Printf("Resource not modified for path: %s", r.URL.Path)
 					}
 					w.WriteHeader(http.StatusNotModified)
 					return true
 				} else if config.LogRequests {
-					log.Printf("Resource modified - Last-Modified is after If-Modified-Since for path: %s", r.URL.Path)
+					log.Printf("Resource modified for path: %s", r.URL.Path)
 				}
 			} else if config.LogRequests {
 				log.Printf("Failed to parse If-Modified-Since header: %s, error: %v", ifModifiedSince, err)
@@ -384,7 +377,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	// Check if we're using If-Modified-Since header
 	ifModifiedSince := r.Header.Get("If-Modified-Since")
 	if useIfModifiedSince && ifModifiedSince != "" {
-		// Check if we have a recent validation result in the validation cache
+		// Check if we have a recent validation result in the validation cache first
 		validationKey := fmt.Sprintf("validation:%s", path)
 		isValid, lastValidated := config.ValidationCache.Get(validationKey)
 
@@ -398,8 +391,9 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			return
 		}
 
+		// Skip validation if this is a true cache miss (file doesn't exist in cache)
 		if config.LogRequests {
-			log.Printf("Validating with upstream using If-Modified-Since: %s for path: %s", ifModifiedSince, path)
+			log.Printf("True cache miss, fetching from origin: %s", originURL)
 		}
 	} else if config.LogRequests {
 		log.Printf("Cache miss, fetching from origin: %s", originURL)
@@ -573,14 +567,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 		} else {
 			// Cache miss - file not in cache
 			if config.LogRequests {
-				// Only log "True cache miss" for files that aren't validation-related
-				// This prevents the confusing "True cache miss" messages for InRelease files
-				// that are actually being validated with If-Modified-Since
-				if !useIfModifiedSince || r.Header.Get("If-Modified-Since") == "" {
-					log.Printf("True cache miss for: %s", r.URL.Path)
-				} else {
-					log.Printf("Cache miss with validation for: %s", r.URL.Path)
-				}
+				log.Printf("True cache miss for: %s", r.URL.Path)
 			}
 		}
 
