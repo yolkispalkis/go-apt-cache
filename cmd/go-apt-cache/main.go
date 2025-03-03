@@ -6,12 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -19,95 +17,8 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/handlers"
 	"github.com/yolkispalkis/go-apt-cache/internal/storage"
+	"github.com/yolkispalkis/go-apt-cache/internal/utils"
 )
-
-// createDirectory ensures a directory exists, handling common issues on different platforms
-func createDirectory(path string) error {
-	// First attempt to create the directory
-	if err := os.MkdirAll(path, 0755); err != nil {
-		log.Printf("Error creating directory %s: %v", path, err)
-
-		// Try the component-by-component approach for Windows
-		if runtime.GOOS == "windows" {
-			// Split the path into components
-			components := strings.Split(filepath.ToSlash(path), "/")
-			currentPath := components[0]
-
-			// On Windows, the first component might be empty for absolute paths
-			if currentPath == "" && len(components) > 1 {
-				currentPath = components[1]
-				components = components[2:]
-			} else {
-				components = components[1:]
-			}
-
-			// Add drive letter back for Windows
-			if !strings.HasSuffix(currentPath, ":") {
-				// Check if we need to add the drive letter
-				if strings.Contains(path, ":") {
-					driveLetter := strings.Split(path, ":")[0]
-					currentPath = driveLetter + ":"
-				}
-			}
-
-			// Create each directory component
-			for _, component := range components {
-				if component == "" {
-					continue
-				}
-
-				currentPath = filepath.Join(currentPath, component)
-				err = os.Mkdir(currentPath, 0755)
-				if err != nil && !os.IsExist(err) {
-					// Check if the path exists but is a file
-					info, statErr := os.Stat(currentPath)
-					if statErr == nil && !info.IsDir() {
-						// It's a file, try to remove it and create directory
-						if removeErr := os.Remove(currentPath); removeErr != nil {
-							return fmt.Errorf("failed to remove file at directory path: %w", removeErr)
-						}
-						if mkdirErr := os.Mkdir(currentPath, 0755); mkdirErr != nil {
-							return fmt.Errorf("failed to create directory after removing file: %w", mkdirErr)
-						}
-					} else {
-						return fmt.Errorf("failed to create directory component %s: %w", currentPath, err)
-					}
-				}
-			}
-
-			return nil
-		}
-
-		return err
-	}
-
-	// Verify the directory was created and is actually a directory
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Try again with a different approach
-			if err := os.MkdirAll(path, 0755); err != nil {
-				return fmt.Errorf("failed to create directory on second attempt: %w", err)
-			}
-			return nil
-		}
-		return fmt.Errorf("error checking directory: %w", err)
-	}
-
-	// If path exists but is not a directory, try to handle it
-	if !info.IsDir() {
-		log.Printf("Path exists but is not a directory: %s", path)
-		// Try to remove the file and create directory
-		if err := os.Remove(path); err != nil {
-			return fmt.Errorf("failed to remove file at directory path: %w", err)
-		}
-		if err := os.MkdirAll(path, 0755); err != nil {
-			return fmt.Errorf("failed to create directory after removing file: %w", err)
-		}
-	}
-
-	return nil
-}
 
 // initializeCache sets up the cache based on configuration
 func initializeCache(cfg *config.Config) (storage.Cache, storage.HeaderCache, error) {
@@ -131,24 +42,12 @@ func initializeCache(cfg *config.Config) (storage.Cache, storage.HeaderCache, er
 
 	// Ensure cache directory exists with proper error handling
 	log.Printf("Creating cache directory at %s", cacheDir)
-	if err := createDirectory(cacheDir); err != nil {
+	if err := utils.CreateDirectory(cacheDir); err != nil {
 		return nil, nil, fmt.Errorf("failed to create cache directory: %v", err)
 	}
 
 	// Convert cache size based on unit
-	maxSizeBytes := cfg.Cache.MaxSize
-	switch strings.ToUpper(cfg.Cache.SizeUnit) {
-	case "MB":
-		maxSizeBytes = cfg.Cache.MaxSize * 1024 * 1024
-	case "GB":
-		maxSizeBytes = cfg.Cache.MaxSize * 1024 * 1024 * 1024
-	case "TB":
-		maxSizeBytes = cfg.Cache.MaxSize * 1024 * 1024 * 1024 * 1024
-	case "BYTES", "":
-		// No conversion needed
-	default:
-		log.Printf("Warning: Unknown cache size unit '%s', using bytes", cfg.Cache.SizeUnit)
-	}
+	maxSizeBytes := utils.ConvertSizeToBytes(cfg.Cache.MaxSize, cfg.Cache.SizeUnit)
 
 	var cache storage.Cache
 	var headerCache storage.HeaderCache
@@ -197,25 +96,8 @@ func setupHTTPServer(cfg *config.Config, cache storage.Cache, headerCache storag
 			continue
 		}
 
-		origin := "http://" + repo.Origin
-		if strings.HasPrefix(repo.Origin, "http://") || strings.HasPrefix(repo.Origin, "https://") {
-			origin = repo.Origin
-		}
-
-		basePath := repo.Path
-		if basePath == "" {
-			basePath = "/"
-		}
-
-		// Ensure basePath starts with a slash
-		if !strings.HasPrefix(basePath, "/") {
-			basePath = "/" + basePath
-		}
-
-		// Ensure basePath ends with a slash
-		if !strings.HasSuffix(basePath, "/") {
-			basePath = basePath + "/"
-		}
+		origin := utils.NormalizeOriginURL(repo.Origin)
+		basePath := utils.NormalizeBasePath(repo.Path)
 
 		log.Printf("Setting up mirror for %s at path %s", origin, basePath)
 
@@ -320,6 +202,11 @@ func applyCommandLineFlags(cfg *config.Config, flags map[string]interface{}) {
 		}
 	}
 
+	// Override timeout setting
+	if timeout, ok := flags["timeout"].(int); ok && timeout > 0 {
+		cfg.Server.Timeout = timeout
+	}
+
 	// Override cache settings
 	if logRequests, ok := flags["log-requests"].(bool); ok {
 		cfg.Server.LogRequests = logRequests
@@ -361,7 +248,7 @@ func main() {
 	cacheSize := flag.Int64("cache-size", 0, "Maximum cache size (overrides config file)")
 	cacheSizeUnit := flag.String("cache-size-unit", "", "Cache size unit: bytes, MB, GB, or TB (overrides config file)")
 	cleanCache := flag.Bool("clean-cache", false, "Clean cache on startup (overrides config file)")
-	timeout := flag.Int("timeout", 60, "Timeout in seconds for HTTP requests to origin servers")
+	timeoutSeconds := flag.Int("timeout", 60, "Timeout in seconds for HTTP requests to origin servers")
 	flag.Parse()
 
 	// Create default config file if requested
@@ -398,6 +285,7 @@ func main() {
 		"cache-size":      *cacheSize,
 		"cache-size-unit": *cacheSizeUnit,
 		"clean-cache":     *cleanCache,
+		"timeout":         *timeoutSeconds,
 	}
 	applyCommandLineFlags(&cfg, flags)
 
@@ -417,26 +305,7 @@ func main() {
 	}
 
 	// Create custom HTTP client with timeout for origin server requests
-	httpClient := &http.Client{
-		Timeout: time.Duration(*timeout) * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        500, // Increased from 100
-			MaxIdleConnsPerHost: 100, // Increased from 20
-			MaxConnsPerHost:     250, // Added to limit connections per host
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  false,            // Enable compression
-			ForceAttemptHTTP2:   true,             // Try to use HTTP/2 when possible
-			TLSHandshakeTimeout: 10 * time.Second, // Added explicit TLS timeout
-			// Optimize TCP connections
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				DualStack: true,
-			}).DialContext,
-			// Enable TCP keepalives
-			DisableKeepAlives: false,
-		},
-	}
+	httpClient := utils.CreateHTTPClient(cfg.Server.Timeout)
 
 	// Set up HTTP server
 	server := setupHTTPServer(&cfg, cache, headerCache, httpClient)

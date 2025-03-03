@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/storage"
+	"github.com/yolkispalkis/go-apt-cache/internal/utils"
 )
 
 // ServerConfig holds the configuration for the APT mirror server
@@ -94,7 +95,7 @@ func getClient(config ServerConfig) *http.Client {
 	if config.Client != nil {
 		return config.Client
 	}
-	return &http.Client{Timeout: 60 * time.Second}
+	return utils.CreateHTTPClient(60) // Default 60 second timeout
 }
 
 // handleCacheHit handles a cache hit, returning true if the response was handled

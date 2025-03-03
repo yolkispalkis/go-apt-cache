@@ -10,10 +10,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yolkispalkis/go-apt-cache/internal/utils"
 )
 
 // FileOperations contains common file operations
@@ -31,7 +32,7 @@ func NewFileOperations(basePath string) *FileOperations {
 // EnsureDirectoryExists ensures a directory exists
 func (f *FileOperations) EnsureDirectoryExists(relativePath string) error {
 	dirPath := filepath.Join(f.basePath, relativePath)
-	return createDirectoryWithParents(dirPath)
+	return utils.CreateDirectory(dirPath)
 }
 
 // GetFilePath returns the full path for a file
@@ -459,67 +460,9 @@ func (c *LRUCache) Put(key string, content io.Reader, contentLength int64, lastM
 	return nil
 }
 
-// createDirectoryWithParents creates a directory and all parent directories
+// createDirectoryWithParents is now a wrapper around CreateDirectory
 func createDirectoryWithParents(dirPath string) error {
-	// First attempt to create the directory
-	if err := os.MkdirAll(dirPath, 0755); err != nil {
-		// Handle Windows-specific issues
-		if runtime.GOOS == "windows" {
-			// Try component-by-component approach
-			components := strings.Split(filepath.ToSlash(dirPath), "/")
-			currentPath := components[0]
-
-			// Handle drive letter
-			if len(components) > 1 && strings.HasSuffix(currentPath, ":") {
-				currentPath += "\\"
-				components = components[1:]
-			}
-
-			for _, component := range components {
-				if component == "" {
-					continue
-				}
-
-				currentPath = filepath.Join(currentPath, component)
-				err := os.Mkdir(currentPath, 0755)
-				if err != nil && !os.IsExist(err) {
-					// Check if path exists but is a file
-					info, statErr := os.Stat(currentPath)
-					if statErr == nil && !info.IsDir() {
-						// It's a file, try to remove it and create directory
-						if err := os.Remove(currentPath); err != nil {
-							return fmt.Errorf("failed to remove file at directory path: %w", err)
-						}
-						if err := os.Mkdir(currentPath, 0755); err != nil {
-							return fmt.Errorf("failed to create directory after removing file: %w", err)
-						}
-					} else {
-						return fmt.Errorf("failed to create directory component %s: %w", currentPath, err)
-					}
-				}
-			}
-			return nil
-		}
-		return err
-	}
-
-	// Verify the directory was created and is actually a directory
-	info, err := os.Stat(dirPath)
-	if err != nil {
-		return fmt.Errorf("error checking directory: %w", err)
-	}
-
-	if !info.IsDir() {
-		// Try to remove the file and create directory
-		if err := os.Remove(dirPath); err != nil {
-			return fmt.Errorf("failed to remove file at directory path: %w", err)
-		}
-		if err := os.MkdirAll(dirPath, 0755); err != nil {
-			return fmt.Errorf("failed to create directory after removing file: %w", err)
-		}
-	}
-
-	return nil
+	return utils.CreateDirectory(dirPath)
 }
 
 // makeRoom removes least recently used items to make room for a new item

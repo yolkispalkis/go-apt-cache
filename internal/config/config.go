@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/yolkispalkis/go-apt-cache/internal/utils"
 )
 
 // Repository represents a single APT repository configuration
@@ -111,7 +113,7 @@ func LoadConfig(path string) (Config, error) {
 func SaveConfig(config Config, path string) error {
 	// Create directory if it doesn't exist
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := utils.CreateDirectory(dir); err != nil {
 		return fmt.Errorf("error creating directory: %w", err)
 	}
 
