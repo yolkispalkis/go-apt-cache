@@ -132,14 +132,14 @@ func (ss *ServerSetup) registerRepositoryHandlers(mux *http.ServeMux) {
 			continue
 		}
 
-		originURL := utils.NormalizeOriginURL(repo.URL)
+		upstreamURL := utils.NormalizeURL(repo.URL)
 		basePath := utils.NormalizeBasePath(repo.Path)
 
-		log.Printf("Setting up mirror for %s at path %s", originURL, basePath)
+		log.Printf("Setting up mirror for %s at path %s", upstreamURL, basePath)
 
 		// Create handler config
 		handlerConfig := handlers.ServerConfig{
-			OriginServer:    originURL,
+			UpstreamURL:     upstreamURL,
 			Cache:           ss.Cache,
 			HeaderCache:     ss.HeaderCache,
 			ValidationCache: ss.ValidationCache,
@@ -202,7 +202,7 @@ func NewConfigManager() *ConfigManager {
 	// Parse command line flags
 	configFile := flag.String("config", "config.json", "Path to configuration file")
 	createConfigFlag := flag.Bool("create-config", false, "Create default configuration file if it doesn't exist")
-	originServer := flag.String("origin", "", "Origin server to mirror (e.g. archive.ubuntu.com)")
+	upstreamURL := flag.String("url", "", "Upstream server URL to mirror (e.g. archive.ubuntu.com)")
 	port := flag.Int("port", 0, "Port to listen on (overrides config file)")
 	bindAddress := flag.String("bind", "", "Address to bind to (overrides config file)")
 	logRequests := flag.Bool("log-requests", true, "Log all requests (overrides config file)")
@@ -211,12 +211,12 @@ func NewConfigManager() *ConfigManager {
 	cacheSize := flag.Int64("cache-size", 0, "Maximum cache size (overrides config file)")
 	cacheSizeUnit := flag.String("cache-size-unit", "", "Cache size unit: bytes, MB, GB, or TB (overrides config file)")
 	cleanCache := flag.Bool("clean-cache", false, "Clean cache on startup (overrides config file)")
-	timeoutSeconds := flag.Int("timeout", 60, "Timeout in seconds for HTTP requests to origin servers")
+	timeoutSeconds := flag.Int("timeout", 60, "Timeout in seconds for HTTP requests to upstream servers")
 	flag.Parse()
 
 	// Create flags map
 	flags := map[string]interface{}{
-		"origin":          *originServer,
+		"url":             *upstreamURL,
 		"port":            *port,
 		"bind":            *bindAddress,
 		"log-requests":    *logRequests,
@@ -267,7 +267,7 @@ func (cm *ConfigManager) LoadConfig() (config.Config, error) {
 	}
 
 	if len(cfg.Repositories) == 0 {
-		return cfg, fmt.Errorf("no repositories configured. Use --origin flag or add repositories to the config file")
+		return cfg, fmt.Errorf("no repositories configured. Use --url flag or add repositories to the config file")
 	}
 
 	return cfg, nil
@@ -278,11 +278,11 @@ func (cm *ConfigManager) applyCommandLineFlags(cfg *config.Config) {
 	flags := cm.CommandLineFlags
 
 	// Add repository if specified
-	if originServer, ok := flags["origin"].(string); ok && originServer != "" {
+	if upstreamURL, ok := flags["url"].(string); ok && upstreamURL != "" {
 		// Check if repository already exists
 		found := false
 		for _, repo := range cfg.Repositories {
-			if repo.URL == originServer {
+			if repo.URL == upstreamURL {
 				found = true
 				break
 			}
@@ -290,7 +290,7 @@ func (cm *ConfigManager) applyCommandLineFlags(cfg *config.Config) {
 
 		if !found {
 			cfg.Repositories = append(cfg.Repositories, config.Repository{
-				URL:     originServer,
+				URL:     upstreamURL,
 				Path:    "/",
 				Enabled: true,
 			})
@@ -394,7 +394,7 @@ func main() {
 		log.Fatalf("Failed to initialize cache: %v", err)
 	}
 
-	// Create custom HTTP client with timeout for origin server requests
+	// Create custom HTTP client with timeout for upstream server requests
 	httpClient := utils.CreateHTTPClient(cfg.Server.Timeout)
 
 	// Set up HTTP server

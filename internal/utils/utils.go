@@ -120,25 +120,51 @@ func ConvertSizeToBytes(size int64, unit string) int64 {
 
 // CreateHTTPClient creates an HTTP client with optimized settings for high traffic
 func CreateHTTPClient(timeoutSeconds int) *http.Client {
+	// Create transport with optimized settings
+	transport := &http.Transport{
+		MaxIdleConns:        500,
+		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     250,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
+		TLSHandshakeTimeout: 10 * time.Second,
+		// Optimize TCP connections
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: true,
+		}).DialContext,
+		// Enable TCP keepalives
+		DisableKeepAlives: false,
+	}
+
+	// Configure proxy from environment variables
+	// This will use HTTP_PROXY, HTTPS_PROXY, and NO_PROXY environment variables
+	proxyFunc := http.ProxyFromEnvironment
+	transport.Proxy = proxyFunc
+
+	// Log if proxy is configured
+	httpProxy := os.Getenv("HTTP_PROXY")
+	httpsProxy := os.Getenv("HTTPS_PROXY")
+	noProxy := os.Getenv("NO_PROXY")
+
+	if httpProxy != "" || httpsProxy != "" {
+		log.Printf("Using proxy configuration from environment variables")
+		if httpProxy != "" {
+			log.Printf("HTTP_PROXY domain: %s", GetProxyDomain(httpProxy))
+		}
+		if httpsProxy != "" {
+			log.Printf("HTTPS_PROXY domain: %s", GetProxyDomain(httpsProxy))
+		}
+		if noProxy != "" {
+			log.Printf("NO_PROXY: %s", noProxy)
+		}
+	}
+
 	return &http.Client{
-		Timeout: time.Duration(timeoutSeconds) * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        500,
-			MaxIdleConnsPerHost: 100,
-			MaxConnsPerHost:     250,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  false,
-			ForceAttemptHTTP2:   true,
-			TLSHandshakeTimeout: 10 * time.Second,
-			// Optimize TCP connections
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				DualStack: true,
-			}).DialContext,
-			// Enable TCP keepalives
-			DisableKeepAlives: false,
-		},
+		Timeout:   time.Duration(timeoutSeconds) * time.Second,
+		Transport: transport,
 	}
 }
 
@@ -161,8 +187,8 @@ func NormalizeBasePath(basePath string) string {
 	return basePath
 }
 
-// NormalizeOriginURL ensures a URL has the correct protocol and no trailing slash
-func NormalizeOriginURL(url string) string {
+// NormalizeURL ensures a URL has the correct protocol and no trailing slash
+func NormalizeURL(url string) string {
 	// Add protocol if missing
 	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 		url = "http://" + url
@@ -306,4 +332,43 @@ func GetContentType(path string) string {
 
 	// Default to binary for unknown types
 	return "application/octet-stream"
+}
+
+// GetProxyDomain extracts only the domain part from a proxy URL
+// Example: http://user:pass@proxy.example.com:8080 -> proxy.example.com
+func GetProxyDomain(proxyURL string) string {
+	// Remove protocol part if present
+	domainPart := proxyURL
+	if strings.Contains(proxyURL, "://") {
+		parts := strings.SplitN(proxyURL, "://", 2)
+		if len(parts) == 2 {
+			domainPart = parts[1]
+		}
+	}
+
+	// Remove user:password part if present
+	if strings.Contains(domainPart, "@") {
+		parts := strings.SplitN(domainPart, "@", 2)
+		if len(parts) == 2 {
+			domainPart = parts[1]
+		}
+	}
+
+	// Remove port if present
+	if strings.Contains(domainPart, ":") {
+		parts := strings.SplitN(domainPart, ":", 2)
+		if len(parts) == 2 {
+			domainPart = parts[0]
+		}
+	}
+
+	// Remove path if present
+	if strings.Contains(domainPart, "/") {
+		parts := strings.SplitN(domainPart, "/", 2)
+		if len(parts) == 2 {
+			domainPart = parts[0]
+		}
+	}
+
+	return domainPart
 }

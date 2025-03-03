@@ -16,12 +16,12 @@ import (
 
 // ServerConfig holds the configuration for the APT mirror server
 type ServerConfig struct {
-	OriginServer    string
+	UpstreamURL     string
 	Cache           storage.Cache
 	HeaderCache     storage.HeaderCache
 	ValidationCache storage.ValidationCache
 	LogRequests     bool
-	Client          *http.Client // HTTP client for making requests to origin servers
+	Client          *http.Client // HTTP client for making requests to upstream servers
 	LocalPath       string       // Local path prefix for URL mapping
 }
 
@@ -108,40 +108,41 @@ func getClient(config ServerConfig) *http.Client {
 	return utils.CreateHTTPClient(60) // Default 60 second timeout
 }
 
-// getOriginPath converts local path to origin path
-func getOriginPath(config ServerConfig, localPath string) string {
-	// Remove local path prefix
-	originPath := strings.TrimPrefix(localPath, config.LocalPath)
-	// Ensure path starts with /
-	if !strings.HasPrefix(originPath, "/") {
-		originPath = "/" + originPath
+// getRemotePath converts local path to remote path
+func getRemotePath(config ServerConfig, localPath string) string {
+	// Remove local path prefix to get the remote path
+	remotePath := strings.TrimPrefix(localPath, config.LocalPath)
+
+	// Ensure path starts with a slash
+	if !strings.HasPrefix(remotePath, "/") {
+		remotePath = "/" + remotePath
 	}
-	return originPath
+
+	return remotePath
 }
 
-// fetchFromOrigin fetches content from the origin server
-func fetchFromOrigin(config ServerConfig, r *http.Request, originURL string) (*http.Response, error) {
-	if config.LogRequests {
-		log.Printf("Fetching from origin: %s", originURL)
-	}
+// fetchFromUpstream fetches content from the upstream server
+func fetchFromUpstream(config ServerConfig, r *http.Request, upstreamURL string) (*http.Response, error) {
+	// Log the request
+	log.Printf("Fetching from upstream: %s", upstreamURL)
 
-	req, err := http.NewRequest(r.Method, originURL, nil)
+	// Create a new request
+	req, err := http.NewRequest(r.Method, upstreamURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("error creating request to origin: %w", err)
+		return nil, fmt.Errorf("error creating request to upstream: %w", err)
 	}
 
-	// Copy relevant headers from the client request to the origin request
+	// Copy relevant headers from the client request to the upstream request
 	req.Header.Set("User-Agent", "Go-APT-Cache/1.0")
 	if ifModifiedSince := r.Header.Get("If-Modified-Since"); ifModifiedSince != "" {
 		req.Header.Set("If-Modified-Since", ifModifiedSince)
 	}
 
-	client := getClient(config)
-	resp, err := client.Do(req)
+	// Send the request
+	resp, err := config.Client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("error fetching from origin: %w", err)
+		return nil, fmt.Errorf("error fetching from upstream: %w", err)
 	}
-	// Note: Caller is responsible for closing resp.Body
 
 	return resp, nil
 }
@@ -157,7 +158,7 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 		log.Printf("Stored in cache: %s (%d bytes)", path, len(body))
 	}
 
-	// Store original headers from origin server in header cache
+	// Store original headers from upstream server in header cache
 	err = config.HeaderCache.PutHeaders(path, headers)
 	if err != nil {
 		log.Printf("Error storing headers in cache: %v", err)
@@ -167,7 +168,7 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 
 // respondWithContent sends the response to the client
 func respondWithContent(w http.ResponseWriter, r *http.Request, headers http.Header, body []byte, contentLength int64) {
-	// Set response headers from origin or cache
+	// Set response headers from upstream or cache
 	for key, values := range headers {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -232,11 +233,11 @@ func checkAndHandleIfModifiedSince(w http.ResponseWriter, r *http.Request, lastM
 	return false
 }
 
-// validateWithOrigin checks with the origin server if the cached copy is still valid
-func validateWithOrigin(config ServerConfig, r *http.Request, cachedHeaders http.Header, lastModified time.Time) (bool, error) {
-	originPath := getOriginPath(config, r.URL.Path)
-	originURL := fmt.Sprintf("%s%s", config.OriginServer, originPath)
-	req, err := http.NewRequest(http.MethodHead, originURL, nil)
+// validateWithUpstream checks with the upstream server if the cached copy is still valid
+func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders http.Header, lastModified time.Time) (bool, error) {
+	remotePath := getRemotePath(config, r.URL.Path)
+	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
+	req, err := http.NewRequest(http.MethodHead, upstreamURL, nil)
 	if err != nil {
 		return false, fmt.Errorf("error creating HEAD request for validation: %w", err)
 	}
@@ -299,14 +300,14 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		return true
 	}
 
-	// Validate with origin if needed
-	if useIfModifiedSince && shouldValidateWithOrigin(r.URL.Path) {
+	// Validate with upstream if needed
+	if useIfModifiedSince && shouldValidateWithUpstream(r.URL.Path) {
 		validationKey := fmt.Sprintf(validationCacheKeyFormat, r.URL.Path)
 		isValid, _ := config.ValidationCache.Get(validationKey)
 		if !isValid {
-			cacheIsValid, err := validateWithOrigin(config, r, cachedHeaders, lastModified)
+			cacheIsValid, err := validateWithUpstream(config, r, cachedHeaders, lastModified)
 			if err != nil {
-				log.Printf("Error validating with origin: %v", err)
+				log.Printf("Error validating with upstream: %v", err)
 				// If validation fails, we still serve the cached content, but log the error
 			} else if cacheIsValid {
 				config.ValidationCache.Put(validationKey, time.Now())
@@ -314,7 +315,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				return true
 			}
 		} else {
-			// We have a recent valid result, no need to check with origin
+			// We have a recent valid result, no need to check with upstream
 			if config.LogRequests {
 				log.Printf("Using cached validation result for: %s", r.URL.Path)
 			}
@@ -352,7 +353,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 	return true
 }
 
-// handleCacheMiss handles a cache miss, fetching the resource from the origin server
+// handleCacheMiss handles a cache miss, fetching the resource from the upstream server
 func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig, useIfModifiedSince bool) {
 	path := r.URL.Path
 
@@ -385,14 +386,14 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	// We've acquired the lock, make sure to release it when done
 	defer releaseLock(path)
 
-	originPath := getOriginPath(config, path)
-	originURL := fmt.Sprintf("%s%s", config.OriginServer, originPath)
+	remotePath := getRemotePath(config, path)
+	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
 
-	// Fetch from origin
-	resp, err := fetchFromOrigin(config, r, originURL)
+	// Fetch from upstream
+	resp, err := fetchFromUpstream(config, r, upstreamURL)
 	if err != nil {
 		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
-		log.Printf("Error fetching from origin: %v", err)
+		log.Printf("Error fetching from upstream: %v", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -400,7 +401,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	if resp.StatusCode == http.StatusNotModified {
 		// Resource not modified (This should only happen if If-Modified-Since was sent)
 		if config.LogRequests {
-			log.Printf("Origin reports resource not modified: %s", path)
+			log.Printf("Upstream reports resource not modified: %s", path)
 		}
 
 		// Store validation result in validation cache
@@ -415,10 +416,10 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		// Forward error status from origin
-		log.Printf("Unexpected status code from origin: %d, URL: %s", resp.StatusCode, originURL)
+		// Forward error status from upstream
+		log.Printf("Unexpected status code from upstream: %d, URL: %s", resp.StatusCode, upstreamURL)
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body) // Forward the response body from the origin server
+		io.Copy(w, resp.Body) // Forward the response body from the upstream server
 		return
 	}
 
@@ -426,7 +427,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		log.Printf("Error reading response from origin: %v", err)
+		log.Printf("Error reading response from upstream: %v", err)
 		return
 	}
 
@@ -474,9 +475,9 @@ func shouldUseIfModifiedSince(path string) bool {
 	return patternType == utils.TypeFrequentlyChanging
 }
 
-// shouldValidateWithOrigin determines if we should check with the origin server
+// shouldValidateWithUpstream determines if we should check with the upstream server
 // to validate if our cached copy is still valid
-func shouldValidateWithOrigin(path string) bool {
+func shouldValidateWithUpstream(path string) bool {
 	// Validate Release files and directories
 	return strings.Contains(path, "InRelease") ||
 		strings.Contains(path, "Release") ||

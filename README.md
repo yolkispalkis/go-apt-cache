@@ -4,8 +4,8 @@ A lightweight APT mirror server written in Go that uses a local cache for effici
 
 ## Features
 
-- Serves APT repository content from a local cache or origin server
-- Caching hierarchy: Local Cache -> Origin Server
+- Serves APT repository content from a local cache or upstream server
+- Caching hierarchy: Local Cache -> Upstream Server
 - Support for multiple repositories (Ubuntu, Debian, etc.)
 - LRU (Least Recently Used) cache eviction policy
 - Configurable cache size and location
@@ -34,6 +34,18 @@ A lightweight APT mirror server written in Go that uses a local cache for effici
 ```
 docker build -t apt-cache .
 docker run -p 8080:8080 -v ./config.json:/app/config.json -v ./cache:/app/cache apt-cache
+```
+
+With proxy support:
+
+```
+docker run -p 8080:8080 \
+  -v ./config.json:/app/config.json \
+  -v ./cache:/app/cache \
+  -e HTTP_PROXY=http://proxy.example.com:8080 \
+  -e HTTPS_PROXY=http://proxy.example.com:8080 \
+  -e NO_PROXY=localhost,127.0.0.1 \
+  apt-cache
 ```
 
 ## Configuration
@@ -67,12 +79,12 @@ Example configuration file:
   },
   "repositories": [
     {
-      "origin": "archive.ubuntu.com",
+      "url": "archive.ubuntu.com",
       "path": "/ubuntu",
       "enabled": true
     },
     {
-      "origin": "deb.debian.org",
+      "url": "deb.debian.org",
       "path": "/debian",
       "enabled": true
     }
@@ -107,12 +119,12 @@ Usage of ./apt-cache:
         Log all requests (overrides config file) (default true)
   --lru
         Use LRU cache eviction policy (overrides config file) (default true)
-  --origin string
-        Origin APT server (overrides config file)
+  --url string
+        Upstream server URL to mirror (overrides config file)
   --port int
         Port to listen on (overrides config file)
   --timeout int
-        Timeout in seconds for HTTP requests to origin servers (default 30)
+        Timeout in seconds for HTTP requests to upstream servers (default 30)
 ```
 
 ## Usage
@@ -131,12 +143,34 @@ Or specify a configuration file:
 ./apt-cache --config my-config.json
 ```
 
+### Proxy Support
+
+The application supports HTTP/HTTPS proxies through standard environment variables:
+
+- `HTTP_PROXY`: Proxy server for HTTP requests (e.g., `http://proxy.example.com:8080`)
+- `HTTPS_PROXY`: Proxy server for HTTPS requests (e.g., `http://proxy.example.com:8080`)
+- `NO_PROXY`: Comma-separated list of hosts to exclude from proxying (e.g., `localhost,127.0.0.1`)
+
+Example usage with proxy:
+
+```bash
+# Set proxy environment variables
+export HTTP_PROXY=http://proxy.example.com:8080
+export HTTPS_PROXY=http://proxy.example.com:8080
+export NO_PROXY=localhost,127.0.0.1
+
+# Run the application
+./apt-cache
+```
+
+When proxy environment variables are set, the application will log the proxy configuration at startup.
+
 ### Quick Start with Command Line Options
 
-Run the server with a specific origin server:
+Run the server with a specific upstream server:
 
 ```
-./apt-cache --origin archive.ubuntu.com
+./apt-cache --url http://archive.ubuntu.com/ubuntu
 ```
 
 This will start the server on port 8080 and use the local filesystem for caching.
@@ -148,12 +182,12 @@ You can configure multiple repositories in the configuration file:
 ```json
 "repositories": [
   {
-    "origin": "archive.ubuntu.com",
+    "url": "archive.ubuntu.com",
     "path": "/ubuntu",
     "enabled": true
   },
   {
-    "origin": "deb.debian.org",
+    "url": "deb.debian.org",
     "path": "/debian",
     "enabled": true
   }
