@@ -107,6 +107,10 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		// Check If-Modified-Since header from client request
 		ifModifiedSince := r.Header.Get("If-Modified-Since")
 		if useIfModifiedSince && ifModifiedSince != "" {
+			if config.LogRequests {
+				log.Printf("Checking If-Modified-Since: %s for path: %s", ifModifiedSince, r.URL.Path)
+			}
+
 			ifModifiedSinceTime, err := time.Parse(http.TimeFormat, ifModifiedSince)
 			if err == nil {
 				// Get Last-Modified from cached headers or use the file's lastModified
@@ -122,11 +126,25 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 					lastModifiedTime = lastModified
 				}
 
+				if config.LogRequests {
+					log.Printf("Comparing - Last-Modified: %s, If-Modified-Since: %s for path: %s",
+						lastModifiedTime.Format(http.TimeFormat),
+						ifModifiedSinceTime.Format(http.TimeFormat),
+						r.URL.Path)
+				}
+
 				if !lastModifiedTime.After(ifModifiedSinceTime) {
 					// Resource not modified
+					if config.LogRequests {
+						log.Printf("Resource not modified (304) - Last-Modified is not after If-Modified-Since for path: %s", r.URL.Path)
+					}
 					w.WriteHeader(http.StatusNotModified)
 					return true
+				} else if config.LogRequests {
+					log.Printf("Resource modified - Last-Modified is after If-Modified-Since for path: %s", r.URL.Path)
 				}
+			} else if config.LogRequests {
+				log.Printf("Failed to parse If-Modified-Since header: %s, error: %v", ifModifiedSince, err)
 			}
 		}
 
@@ -140,8 +158,15 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				lastModifiedStr := cachedHeaders.Get("Last-Modified")
 				if lastModifiedStr != "" {
 					req.Header.Set("If-Modified-Since", lastModifiedStr)
+					if config.LogRequests {
+						log.Printf("Checking with upstream using If-Modified-Since: %s for path: %s", lastModifiedStr, r.URL.Path)
+					}
 				} else {
-					req.Header.Set("If-Modified-Since", lastModified.Format(http.TimeFormat))
+					formattedTime := lastModified.Format(http.TimeFormat)
+					req.Header.Set("If-Modified-Since", formattedTime)
+					if config.LogRequests {
+						log.Printf("Checking with upstream using If-Modified-Since (from file time): %s for path: %s", formattedTime, r.URL.Path)
+					}
 				}
 
 				// Add User-Agent header
@@ -156,11 +181,11 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 					if resp.StatusCode == http.StatusNotModified {
 						// Our cache is still valid, use it
 						if config.LogRequests {
-							log.Printf("Upstream confirms cache is still valid for: %s", r.URL.Path)
+							log.Printf("Upstream confirms cache is still valid (304) for: %s", r.URL.Path)
 						}
 					} else if resp.StatusCode == http.StatusOK {
 						// Upstream has a newer version, fetch it
-						log.Printf("Upstream has newer version for: %s", r.URL.Path)
+						log.Printf("Upstream has newer version (200) for: %s", r.URL.Path)
 
 						// Acquire lock for this resource to prevent multiple concurrent fetches
 						acquired, ch := acquireLock(r.URL.Path)
@@ -354,6 +379,9 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	if useIfModifiedSince {
 		if ifModifiedSince := r.Header.Get("If-Modified-Since"); ifModifiedSince != "" {
 			req.Header.Set("If-Modified-Since", ifModifiedSince)
+			if config.LogRequests {
+				log.Printf("Cache miss: Forwarding If-Modified-Since: %s to origin for path: %s", ifModifiedSince, path)
+			}
 		}
 	}
 
@@ -370,6 +398,9 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	// Handle response from origin server
 	if resp.StatusCode == http.StatusNotModified {
 		// Resource not modified
+		if config.LogRequests {
+			log.Printf("Origin reports resource not modified (304) for path: %s", path)
+		}
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
