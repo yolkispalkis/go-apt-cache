@@ -1,7 +1,7 @@
 version: '3'
 
 services:
-  apt-mirror:
+  apt-cache:
     build:
       context: .
       dockerfile: Dockerfile

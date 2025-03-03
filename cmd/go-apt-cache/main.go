@@ -16,9 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yolkispalkis/go-apt-mirror/internal/config"
-	"github.com/yolkispalkis/go-apt-mirror/internal/handlers"
-	"github.com/yolkispalkis/go-apt-mirror/internal/storage"
+	"github.com/yolkispalkis/go-apt-cache/internal/config"
+	"github.com/yolkispalkis/go-apt-cache/internal/handlers"
+	"github.com/yolkispalkis/go-apt-cache/internal/storage"
 )
 
 // createDirectory ensures a directory exists, handling common issues on different platforms

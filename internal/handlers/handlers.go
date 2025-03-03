@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yolkispalkis/go-apt-mirror/internal/storage"
+	"github.com/yolkispalkis/go-apt-cache/internal/storage"
 )
 
 // ServerConfig holds the configuration for the APT mirror server
@@ -145,7 +145,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				}
 
 				// Add User-Agent header
-				req.Header.Set("User-Agent", "Go-APT-Mirror/1.0")
+				req.Header.Set("User-Agent", "Go-APT-Cache/1.0")
 
 				// Check with upstream
 				client := getClient(config)
@@ -219,7 +219,7 @@ func fetchAndUpdateCache(config ServerConfig, path string, originURL string, cli
 		return nil, 0, nil
 	}
 
-	getReq.Header.Set("User-Agent", "Go-APT-Mirror/1.0")
+	getReq.Header.Set("User-Agent", "Go-APT-Cache/1.0")
 	getResp, err := client.Do(getReq)
 	if err != nil {
 		log.Printf("Error fetching from origin: %v", err)
@@ -348,7 +348,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 
 	// Copy relevant headers from client request to origin request
 	// Add User-Agent header
-	req.Header.Set("User-Agent", "Go-APT-Mirror/1.0")
+	req.Header.Set("User-Agent", "Go-APT-Cache/1.0")
 
 	// Add If-Modified-Since header if present in client request and we should use it
 	if useIfModifiedSince {

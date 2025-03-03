@@ -1,3 +1,3 @@
-module github.com/yolkispalkis/go-apt-mirror
+module github.com/yolkispalkis/go-apt-cache
 
 go 1.21

@@ -1,4 +1,4 @@
-# Go APT Mirror
+# Go APT Cache
 
 A lightweight APT mirror server written in Go that uses a local cache for efficient package serving. Designed to work behind a reverse proxy.
 
@@ -20,20 +20,20 @@ A lightweight APT mirror server written in Go that uses a local cache for effici
 
 1. Clone this repository:
    ```
-   git clone https://github.com/yolkispalkis/go-apt-mirror.git
-   cd go-apt-mirror
+   git clone https://github.com/yolkispalkis/go-apt-cache.git
+   cd go-apt-cache
    ```
 
 2. Build the binary:
    ```
-   go build -o apt-mirror ./cmd/server
+   go build -o apt-cache ./cmd/go-apt-cache
    ```
 
 ### Using Docker
 
 ```
-docker build -t apt-mirror .
-docker run -p 8080:8080 -v ./config.json:/app/config.json -v ./cache:/app/cache apt-mirror
+docker build -t apt-cache .
+docker run -p 8080:8080 -v ./config.json:/app/config.json -v ./cache:/app/cache apt-cache
 ```
 
 ## Configuration
@@ -43,7 +43,7 @@ docker run -p 8080:8080 -v ./config.json:/app/config.json -v ./cache:/app/cache 
 The server can be configured using a JSON configuration file. To create a default configuration file:
 
 ```
-./apt-mirror --create-config
+./apt-cache --create-config
 ```
 
 This will create a `config.json` file with default settings. You can edit this file to customize the server.
@@ -86,7 +86,7 @@ Example configuration file:
 You can also configure the server using command line options, which will override the settings in the configuration file:
 
 ```
-Usage of ./apt-mirror:
+Usage of ./apt-cache:
   --bind string
         Address to bind to (overrides config file)
   --cache-dir string
@@ -122,13 +122,13 @@ Usage of ./apt-mirror:
 Run the server with the default configuration:
 
 ```
-./apt-mirror
+./apt-cache
 ```
 
 Or specify a configuration file:
 
 ```
-./apt-mirror --config my-config.json
+./apt-cache --config my-config.json
 ```
 
 ### Quick Start with Command Line Options
@@ -136,7 +136,7 @@ Or specify a configuration file:
 Run the server with a specific origin server:
 
 ```
-./apt-mirror --origin archive.ubuntu.com
+./apt-cache --origin archive.ubuntu.com
 ```
 
 This will start the server on port 8080 and use the local filesystem for caching.
@@ -227,8 +227,8 @@ server {
     ProxyTimeout 300
     
     # Log settings
-    ErrorLog ${APACHE_LOG_DIR}/apt-mirror-error.log
-    CustomLog ${APACHE_LOG_DIR}/apt-mirror-access.log combined
+    ErrorLog ${APACHE_LOG_DIR}/apt-cache-error.log
+    CustomLog ${APACHE_LOG_DIR}/apt-cache-access.log combined
 </VirtualHost>
 ```
 
@@ -237,8 +237,8 @@ server {
 You can run the server using Docker:
 
 ```
-docker build -t apt-mirror .
-docker run -p 8080:8080 -v ./config.json:/app/config.json -v ./cache:/app/cache apt-mirror
+docker build -t apt-cache .
+docker run -p 8080:8080 -v ./config.json:/app/config.json -v ./cache:/app/cache apt-cache
 ```
 
 Or using Docker Compose:
@@ -247,7 +247,7 @@ Or using Docker Compose:
 version: '3'
 
 services:
-  apt-mirror:
+  apt-cache:
     build:
       context: .
       dockerfile: Dockerfile

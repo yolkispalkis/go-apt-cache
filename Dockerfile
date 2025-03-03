@@ -12,7 +12,7 @@ RUN go mod download
 COPY . .
 
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -o apt-mirror ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -o apt-cache ./cmd/go-apt-cache
 
 # Create a minimal runtime image
 FROM alpine:latest
@@ -20,7 +20,7 @@ FROM alpine:latest
 WORKDIR /app
 
 # Copy the binary from the builder stage
-COPY --from=builder /app/apt-mirror .
+COPY --from=builder /app/apt-cache .
 
 # Create default config file
 COPY --from=builder /app/config.json /app/config.json.default
@@ -32,5 +32,5 @@ RUN mkdir -p /app/cache
 EXPOSE 8080
 
 # Run the application
-ENTRYPOINT ["/app/apt-mirror"]
+ENTRYPOINT ["/app/apt-cache"]
 CMD ["--config", "/app/config.json"] 
