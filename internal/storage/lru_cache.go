@@ -312,6 +312,12 @@ func (c *LRUCache) initialize() error {
 		// Remove .filecache extension to get the original key
 		key = strings.TrimSuffix(key, ".filecache")
 
+		// Add leading slash if the key contains directory structure
+		// This is important for repository paths which are absolute
+		if strings.Contains(key, "/") {
+			key = "/" + key
+		}
+
 		// Add to cache
 		item := &cacheItem{
 			key:          key,
