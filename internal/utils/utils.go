@@ -174,54 +174,74 @@ func NormalizeOriginURL(url string) string {
 	return url
 }
 
-// FilePatternType represents different types of file patterns
-type FilePatternType int
+// FileType represents different types of repository files
+type FileType int
 
 const (
-	// FrequentlyChanging represents files that change frequently
-	FrequentlyChanging FilePatternType = iota
-	// CriticalMetadata represents critical metadata files
-	CriticalMetadata
-	// RarelyChanging represents files that rarely change
-	RarelyChanging
+	// TypeFrequentlyChanging represents files that change frequently (e.g., metadata)
+	TypeFrequentlyChanging FileType = iota
+	// TypeCriticalMetadata represents essential repository metadata files
+	TypeCriticalMetadata
+	// TypeRarelyChanging represents package files that rarely change
+	TypeRarelyChanging
 )
 
-// FilePatterns contains predefined patterns for different file types
-var FilePatterns = struct {
-	FrequentlyChanging []string
-	CriticalMetadata   []string
-	RarelyChanging     []string
-}{
-	FrequentlyChanging: []string{
-		"Release",
-		"Release.gpg",
-		"InRelease",
-		"Packages",
-		"Packages.gz",
-		"Packages.xz",
-		"Sources",
-		"Sources.gz",
-		"Sources.xz",
-		"Contents-",
-		"Index",
-		"ls-lR.gz",
-	},
-	CriticalMetadata: []string{
-		"Release",
-		"Release.gpg",
-		"InRelease",
-		"ls-lR.gz",
-	},
-	RarelyChanging: []string{
-		".deb",
-		".udeb",
-	},
+// FilePattern represents a pattern for matching repository files
+type FilePattern struct {
+	Pattern string
+	Type    FileType
 }
+
+// ContentTypeMapping represents a mapping between file extensions and MIME types
+type ContentTypeMapping struct {
+	Extensions []string
+	MIMEType   string
+}
+
+// Common file patterns in Debian repositories
+var (
+	filePatterns = []FilePattern{
+		// Critical metadata files (highest priority)
+		{Pattern: "InRelease", Type: TypeCriticalMetadata},
+		{Pattern: "Release.gpg", Type: TypeCriticalMetadata},
+		{Pattern: "/Release", Type: TypeCriticalMetadata},
+		{Pattern: "ls-lR.gz", Type: TypeCriticalMetadata},
+
+		// Frequently changing files
+		{Pattern: "Packages", Type: TypeFrequentlyChanging},
+		{Pattern: "Packages.gz", Type: TypeFrequentlyChanging},
+		{Pattern: "Packages.xz", Type: TypeFrequentlyChanging},
+		{Pattern: "Sources", Type: TypeFrequentlyChanging},
+		{Pattern: "Sources.gz", Type: TypeFrequentlyChanging},
+		{Pattern: "Sources.xz", Type: TypeFrequentlyChanging},
+		{Pattern: "Contents-", Type: TypeFrequentlyChanging},
+		{Pattern: "Index", Type: TypeFrequentlyChanging},
+
+		// Rarely changing files (lowest priority)
+		{Pattern: ".deb", Type: TypeRarelyChanging},
+		{Pattern: ".udeb", Type: TypeRarelyChanging},
+	}
+
+	// contentTypes maps file extensions to their MIME types
+	contentTypes = []ContentTypeMapping{
+		{Extensions: []string{".gz", ".gzip"}, MIMEType: "application/gzip"},
+		{Extensions: []string{".bz2"}, MIMEType: "application/x-bzip2"},
+		{Extensions: []string{".xz"}, MIMEType: "application/x-xz"},
+		{Extensions: []string{".deb", ".udeb"}, MIMEType: "application/vnd.debian.binary-package"},
+		{Extensions: []string{".asc"}, MIMEType: "application/pgp-signature"},
+		{Extensions: []string{".gpg"}, MIMEType: "application/pgp-encrypted"},
+		{Extensions: []string{".json"}, MIMEType: "application/json"},
+		{Extensions: []string{".xml"}, MIMEType: "application/xml"},
+		{Extensions: []string{".txt", ".list"}, MIMEType: "text/plain"},
+		{Extensions: []string{".html", ".htm"}, MIMEType: "text/html"},
+	}
+)
 
 // MatchesFilePattern checks if a path matches any of the given patterns
 func MatchesFilePattern(path string, patterns []string) bool {
+	normalizedPath := filepath.ToSlash(path)
 	for _, pattern := range patterns {
-		if strings.Contains(path, pattern) {
+		if strings.Contains(normalizedPath, pattern) {
 			return true
 		}
 	}
@@ -229,60 +249,40 @@ func MatchesFilePattern(path string, patterns []string) bool {
 }
 
 // GetFilePatternType determines the type of file based on its path
-func GetFilePatternType(path string) FilePatternType {
-	// Critical metadata files - check this first
-	if strings.Contains(path, "InRelease") ||
-		strings.Contains(path, "Release.gpg") ||
-		strings.Contains(path, "/Release") ||
-		strings.Contains(path, "ls-lR.gz") {
-		return CriticalMetadata
+func GetFilePatternType(path string) FileType {
+	normalizedPath := filepath.ToSlash(path)
+
+	// Check patterns in order of priority
+	for _, pattern := range filePatterns {
+		if strings.Contains(normalizedPath, pattern.Pattern) {
+			return pattern.Type
+		}
 	}
 
-	// Check for directory patterns
-	if strings.Contains(path, "/dists/") {
-		// Files in dists/ are generally frequently changing
-		return FrequentlyChanging
+	// Check directory-based patterns
+	switch {
+	case strings.Contains(normalizedPath, "/dists/"):
+		return TypeFrequentlyChanging
+	case strings.Contains(normalizedPath, "/pool/"):
+		return TypeRarelyChanging
+	default:
+		return TypeRarelyChanging
 	}
-
-	if strings.Contains(path, "/pool/") {
-		// Files in pool/ are generally rarely changing
-		return RarelyChanging
-	}
-
-	// Check for frequently changing patterns
-	if MatchesFilePattern(path, FilePatterns.FrequentlyChanging) {
-		return FrequentlyChanging
-	}
-
-	// Default to rarely changing
-	return RarelyChanging
 }
 
 // GetContentType determines the content type based on file extension
 func GetContentType(path string) string {
-	ext := filepath.Ext(path)
-	switch strings.ToLower(ext) {
-	case ".gz", ".gzip":
-		return "application/gzip"
-	case ".bz2":
-		return "application/x-bzip2"
-	case ".xz":
-		return "application/x-xz"
-	case ".deb":
-		return "application/vnd.debian.binary-package"
-	case ".asc":
-		return "application/pgp-signature"
-	case ".json":
-		return "application/json"
-	case ".txt":
-		return "text/plain"
-	case ".html", ".htm":
-		return "text/html"
-	case ".xml":
-		return "application/xml"
-	case ".gpg":
-		return "application/pgp-encrypted"
-	default:
-		return "application/octet-stream"
+	ext := strings.ToLower(filepath.Ext(path))
+
+	// Check for known content types
+	for _, mapping := range contentTypes {
+		for _, extension := range mapping.Extensions {
+			if ext == extension {
+				return mapping.MIMEType
+			}
+		}
 	}
+
+	// Default to binary for unknown types
+	return "application/octet-stream"
 }

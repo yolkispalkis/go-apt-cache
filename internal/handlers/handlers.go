@@ -502,7 +502,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 func shouldUseIfModifiedSince(path string) bool {
 	// Use the file pattern type to determine if we should use If-Modified-Since
 	patternType := utils.GetFilePatternType(path)
-	return patternType == utils.FrequentlyChanging || patternType == utils.CriticalMetadata
+	return patternType == utils.TypeFrequentlyChanging || patternType == utils.TypeCriticalMetadata
 }
 
 // shouldValidateWithOrigin determines if we should check with the origin server
@@ -510,7 +510,7 @@ func shouldUseIfModifiedSince(path string) bool {
 func shouldValidateWithOrigin(path string) bool {
 	// Validate InRelease files and other critical metadata
 	patternType := utils.GetFilePatternType(path)
-	return patternType == utils.CriticalMetadata ||
+	return patternType == utils.TypeCriticalMetadata ||
 		strings.Contains(path, "InRelease") ||
 		strings.Contains(path, "Release") ||
 		strings.HasSuffix(path, "/")
