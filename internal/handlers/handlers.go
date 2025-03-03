@@ -326,16 +326,19 @@ func setBasicHeaders(w http.ResponseWriter, r *http.Request, cachedHeaders http.
 	if strings.HasSuffix(r.URL.Path, "/") {
 		w.Header().Set("Content-Type", "text/html")
 	} else {
-		// Try to get Content-Type from cached headers first
+		// Only set Content-Type if it's not in cached headers
 		contentType := ""
 		if cachedHeaders != nil {
 			contentType = cachedHeaders.Get("Content-Type")
 		}
-		// If Content-Type is not in cached headers, determine it from file extension
 		if contentType == "" {
 			contentType = utils.GetContentType(r.URL.Path)
+			if contentType != "" {
+				w.Header().Set("Content-Type", contentType)
+			}
+		} else {
+			w.Header().Set("Content-Type", contentType)
 		}
-		w.Header().Set("Content-Type", contentType)
 	}
 	w.Header().Set("Last-Modified", lastModified.Format(http.TimeFormat))
 
@@ -474,22 +477,14 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		log.Printf("Stored in cache: %s (%d bytes)", path, len(body))
 	}
 
-	// Set content type if not already set in response headers
-	if resp.Header.Get("Content-Type") == "" {
-		contentType := utils.GetContentType(path)
-		if contentType != "" {
-			resp.Header.Set("Content-Type", contentType)
-		}
-	}
-
-	// Store headers in header cache
+	// Store headers in header cache first
 	err = config.HeaderCache.PutHeaders(path, resp.Header)
 	if err != nil {
 		log.Printf("Error storing headers in cache: %v", err)
 		// Continue even if header caching fails
 	}
 
-	// Set response headers
+	// Set response headers from origin
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
