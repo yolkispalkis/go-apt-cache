@@ -204,6 +204,7 @@ var FilePatterns = struct {
 		"Sources.xz",
 		"Contents-",
 		"Index",
+		"ls-lR.gz",
 	},
 	CriticalMetadata: []string{
 		"Release",
