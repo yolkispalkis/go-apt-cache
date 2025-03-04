@@ -231,7 +231,7 @@ func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders ht
 		return false, fmt.Errorf("error creating HEAD request for validation: %w", err)
 	}
 
-	// Use our cached Last-Modified as If-Modified-Since when checking upstream
+	// Always send If-Modified-Since when validating with upstream
 	lastModifiedStr := cachedHeaders.Get("Last-Modified")
 	if lastModifiedStr == "" {
 		lastModifiedStr = lastModified.Format(http.TimeFormat)
@@ -255,9 +255,10 @@ func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders ht
 			logging.Info("Upstream confirms cache is still valid: %s", r.URL.Path)
 		}
 		return true, nil
-	} else if resp.StatusCode != http.StatusOK {
-		logging.Error("Unexpected status from upstream during validation: %d for %s", resp.StatusCode, r.URL.Path)
 	}
+
+	// If status is not 304, it means the file has been modified
+	// We'll treat this as cache invalidation
 	return false, nil
 }
 
@@ -294,32 +295,43 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 	if useIfModifiedSince && fileType == utils.TypeFrequentlyChanging {
 		validationKey := fmt.Sprintf(validationCacheKeyFormat, r.URL.Path)
 		isValid, _ := config.ValidationCache.Get(validationKey)
+
+		// Check with upstream if validation cache is invalid or expired
 		if !isValid {
 			cacheIsValid, err := validateWithUpstream(config, r, cachedHeaders, lastModified)
 			if err != nil {
 				logging.Error("Error validating with upstream: %v", err)
 				// If validation fails, we still serve the cached content, but log the error
-			} else if cacheIsValid {
-				config.ValidationCache.Put(validationKey, time.Now())
-				if r.Header.Get("If-Modified-Since") != "" {
-					sendNotModified(w, config, r)
-					return true
+			} else {
+				if cacheIsValid {
+					// Cache is still valid, update validation cache
+					config.ValidationCache.Put(validationKey, time.Now())
+
+					// If client sent If-Modified-Since, check if we need to send 304
+					if r.Header.Get("If-Modified-Since") != "" {
+						if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
+							return true
+						}
+					}
+				} else {
+					// Content has been modified on upstream, treat as cache miss
+					if config.LogRequests {
+						logging.Info("Content modified on upstream, invalidating cache: %s", r.URL.Path)
+					}
+					return false
 				}
 			}
 		} else {
-			// We have a recent valid result, no need to check with upstream
-			if config.LogRequests {
-				logging.Info("Using cached validation result for: %s", r.URL.Path)
-			}
+			// We have a valid cache entry, check if client needs update
 			if r.Header.Get("If-Modified-Since") != "" {
-				sendNotModified(w, config, r)
-				return true
+				if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
+					return true
+				}
 			}
 		}
 	}
 
-	// If we reach here, we either didn't need to validate, or validation failed (or we skipped it due to an error).
-	// In any case, we serve the cached content with cached headers
+	// If we reach here, serve the cached content
 
 	// Convert io.ReadCloser to []byte
 	bodyBytes, err := io.ReadAll(content)
