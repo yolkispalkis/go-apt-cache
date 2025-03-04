@@ -4,26 +4,16 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/yolkispalkis/go-apt-cache/internal/storage"
+	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/utils"
 )
 
-// ServerConfig holds the configuration for the APT mirror server
-type ServerConfig struct {
-	UpstreamURL     string
-	Cache           storage.Cache
-	HeaderCache     storage.HeaderCache
-	ValidationCache storage.ValidationCache
-	LogRequests     bool
-	Client          *http.Client // HTTP client for making requests to upstream servers
-	LocalPath       string       // Local path prefix for URL mapping
-}
+// ServerConfig definition has been moved to server_config.go
 
 // requestLock provides a mechanism to prevent concurrent requests for the same resource
 // This helps prevent the "thundering herd" problem where multiple clients request the same
@@ -124,7 +114,7 @@ func getRemotePath(config ServerConfig, localPath string) string {
 // fetchFromUpstream fetches content from the upstream server
 func fetchFromUpstream(config ServerConfig, r *http.Request, upstreamURL string) (*http.Response, error) {
 	// Log the request
-	log.Printf("Fetching from upstream: %s", upstreamURL)
+	logging.Info("Fetching from upstream: %s", upstreamURL)
 
 	// Create a new request
 	req, err := http.NewRequest(r.Method, upstreamURL, nil)
@@ -152,16 +142,16 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 	// Update content cache
 	err := config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified)
 	if err != nil {
-		log.Printf("Error storing in cache: %v", err)
+		logging.Error("Error storing in cache: %v", err)
 		// Continue even if caching fails
 	} else if config.LogRequests {
-		log.Printf("Stored in cache: %s (%d bytes)", path, len(body))
+		logging.Info("Stored in cache: %s (%d bytes)", path, len(body))
 	}
 
 	// Store original headers from upstream server in header cache
 	err = config.HeaderCache.PutHeaders(path, headers)
 	if err != nil {
-		log.Printf("Error storing headers in cache: %v", err)
+		logging.Error("Error storing headers in cache: %v", err)
 		// Continue even if header caching fails
 	}
 }
@@ -185,7 +175,7 @@ func respondWithContent(w http.ResponseWriter, r *http.Request, headers http.Hea
 	if r.Method != http.MethodHead {
 		_, err := w.Write(body)
 		if err != nil {
-			log.Printf("Error writing response body: %v", err)
+			logging.Error("Error writing response body: %v", err)
 		}
 	}
 }
@@ -193,7 +183,7 @@ func respondWithContent(w http.ResponseWriter, r *http.Request, headers http.Hea
 // sendNotModified sends a 304 Not Modified response.
 func sendNotModified(w http.ResponseWriter, config ServerConfig, r *http.Request) {
 	if config.LogRequests {
-		log.Printf("Resource not modified: %s", r.URL.Path)
+		logging.Info("Resource not modified: %s", r.URL.Path)
 	}
 	w.WriteHeader(http.StatusNotModified)
 }
@@ -209,7 +199,7 @@ func checkAndHandleIfModifiedSince(w http.ResponseWriter, r *http.Request, lastM
 	ifModifiedSinceTime, err := time.Parse(http.TimeFormat, ifModifiedSince)
 	if err != nil {
 		if config.LogRequests {
-			log.Printf("Failed to parse If-Modified-Since header: %s, error: %v", ifModifiedSince, err)
+			logging.Error("Failed to parse If-Modified-Since header: %s, error: %v", ifModifiedSince, err)
 		}
 		return false // Treat as if the header wasn't sent
 	}
@@ -251,7 +241,7 @@ func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders ht
 	req.Header.Set("User-Agent", "Go-APT-Cache/1.0")
 
 	if config.LogRequests {
-		log.Printf("Validating cached file with upstream: %s", r.URL.Path)
+		logging.Info("Validating cached file with upstream: %s", r.URL.Path)
 	}
 
 	client := getClient(config)
@@ -263,11 +253,11 @@ func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders ht
 
 	if resp.StatusCode == http.StatusNotModified {
 		if config.LogRequests {
-			log.Printf("Upstream confirms cache is still valid: %s", r.URL.Path)
+			logging.Info("Upstream confirms cache is still valid: %s", r.URL.Path)
 		}
 		return true, nil
 	} else if resp.StatusCode != http.StatusOK {
-		log.Printf("Unexpected status from upstream during validation: %d for %s", resp.StatusCode, r.URL.Path)
+		logging.Error("Unexpected status from upstream during validation: %d for %s", resp.StatusCode, r.URL.Path)
 	}
 	return false, nil
 }
@@ -279,7 +269,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 	cachedHeaders, headerErr := config.HeaderCache.GetHeaders(r.URL.Path)
 	if headerErr != nil {
 		// Fallback to basic headers if no cached headers
-		log.Printf("No cached headers found for %s: %v", r.URL.Path, headerErr)
+		logging.Error("No cached headers found for %s: %v", r.URL.Path, headerErr)
 		setBasicHeaders(w, r, nil, lastModified, useIfModifiedSince, config)
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
 
@@ -289,7 +279,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		}
 		_, err := io.Copy(w, content)
 		if err != nil {
-			log.Printf("Error writing response: %v", err)
+			logging.Error("Error writing response: %v", err)
 		}
 		return true
 	}
@@ -307,7 +297,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		if !isValid {
 			cacheIsValid, err := validateWithUpstream(config, r, cachedHeaders, lastModified)
 			if err != nil {
-				log.Printf("Error validating with upstream: %v", err)
+				logging.Error("Error validating with upstream: %v", err)
 				// If validation fails, we still serve the cached content, but log the error
 			} else if cacheIsValid {
 				config.ValidationCache.Put(validationKey, time.Now())
@@ -317,7 +307,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		} else {
 			// We have a recent valid result, no need to check with upstream
 			if config.LogRequests {
-				log.Printf("Using cached validation result for: %s", r.URL.Path)
+				logging.Info("Using cached validation result for: %s", r.URL.Path)
 			}
 			sendNotModified(w, config, r)
 			return true
@@ -330,7 +320,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 	// Convert io.ReadCloser to []byte
 	bodyBytes, err := io.ReadAll(content)
 	if err != nil {
-		log.Printf("Error reading cached content: %v", err)
+		logging.Error("Error reading cached content: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return true // Return true as we handled the error
 	}
@@ -347,7 +337,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 	if r.Method != http.MethodHead {
 		_, err := w.Write(bodyBytes)
 		if err != nil {
-			log.Printf("Error writing response body: %v", err)
+			logging.Error("Error writing response body: %v", err)
 		}
 	}
 	return true
@@ -368,7 +358,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		if err == nil {
 			// Another request has fetched this resource
 			if config.LogRequests {
-				log.Printf("Resource was fetched by another request: %s", path)
+				logging.Info("Resource was fetched by another request: %s", path)
 			}
 			handleCacheHit(w, r, config, content, contentLength, lastModified, useIfModifiedSince)
 			return
@@ -377,7 +367,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		// If still not in cache, acquire the lock and fetch it
 		if !reacquireLock(path) {
 			// This should not happen, but handle it gracefully
-			log.Printf("Failed to acquire lock after waiting: %s", path)
+			logging.Error("Failed to acquire lock after waiting: %s", path)
 			http.Error(w, "Server busy, please try again", http.StatusServiceUnavailable)
 			return
 		}
@@ -393,7 +383,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	resp, err := fetchFromUpstream(config, r, upstreamURL)
 	if err != nil {
 		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
-		log.Printf("Error fetching from upstream: %v", err)
+		logging.Error("Error fetching from upstream: %v", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -401,14 +391,14 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	if resp.StatusCode == http.StatusNotModified {
 		// Resource not modified (This should only happen if If-Modified-Since was sent)
 		if config.LogRequests {
-			log.Printf("Upstream reports resource not modified: %s", path)
+			logging.Info("Upstream reports resource not modified: %s", path)
 		}
 
 		// Store validation result in validation cache
 		validationKey := fmt.Sprintf(validationCacheKeyFormat, path)
 		config.ValidationCache.Put(validationKey, time.Now())
 		if config.LogRequests {
-			log.Printf("Stored validation result in cache for: %s", path)
+			logging.Info("Stored validation result in cache for: %s", path)
 		}
 
 		sendNotModified(w, config, r)
@@ -417,7 +407,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 
 	if resp.StatusCode != http.StatusOK {
 		// Forward error status from upstream
-		log.Printf("Unexpected status code from upstream: %d, URL: %s", resp.StatusCode, upstreamURL)
+		logging.Error("Unexpected status code from upstream: %d, URL: %s", resp.StatusCode, upstreamURL)
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body) // Forward the response body from the upstream server
 		return
@@ -427,7 +417,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		log.Printf("Error reading response from upstream: %v", err)
+		logging.Error("Error reading response from upstream: %v", err)
 		return
 	}
 
@@ -468,11 +458,27 @@ func setBasicHeaders(w http.ResponseWriter, r *http.Request, _ http.Header, last
 	}
 }
 
-// shouldUseIfModifiedSince determines if a file should use If-Modified-Since logic
+// shouldUseIfModifiedSince determines if a file should use If-Modified-Since based on its path
 func shouldUseIfModifiedSince(path string) bool {
-	// Use the file pattern type to determine if we should use If-Modified-Since
-	patternType := utils.GetFilePatternType(path)
-	return patternType == utils.TypeFrequentlyChanging
+	// Files that should use If-Modified-Since:
+	// - Release files
+	// - InRelease files
+	// - Packages files
+	// - Sources files
+	// - Index files
+
+	lowercasePath := strings.ToLower(path)
+
+	// Check for specific file patterns
+	if strings.Contains(lowercasePath, "release") ||
+		strings.Contains(lowercasePath, "packages") ||
+		strings.Contains(lowercasePath, "sources") ||
+		strings.Contains(lowercasePath, "index") {
+		return true
+	}
+
+	// Default to not using If-Modified-Since for other files
+	return false
 }
 
 // shouldValidateWithUpstream determines if we should check with the upstream server
@@ -488,7 +494,7 @@ func shouldValidateWithUpstream(path string) bool {
 func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if config.LogRequests {
-			log.Printf("Request: %s", r.URL.Path)
+			logging.Info("Request: %s", r.URL.Path)
 		}
 
 		if !validateRequest(w, r) {
@@ -501,7 +507,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			isValid, _ := config.ValidationCache.Get(validationKey)
 			if isValid {
 				if config.LogRequests {
-					log.Printf("Using cached validation result for: %s", r.URL.Path)
+					logging.Info("Using cached validation result for: %s", r.URL.Path)
 				}
 				sendNotModified(w, config, r)
 				return
@@ -513,7 +519,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 		if err == nil {
 			// Cache hit
 			if config.LogRequests {
-				log.Printf("Cache hit for: %s", r.URL.Path)
+				logging.Info("Cache hit for: %s", r.URL.Path)
 			}
 			if handleCacheHit(w, r, config, content, contentLength, lastModified, useIfModifiedSince) {
 				return
@@ -532,6 +538,7 @@ func HandleRelease(config ServerConfig) http.HandlerFunc {
 }
 
 // HandleCacheableRequest handles requests for cacheable files
+// These are cached in storage but use If-Modified-Since based on file type
 func HandleCacheableRequest(config ServerConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Determine if this file should use If-Modified-Since based on its path

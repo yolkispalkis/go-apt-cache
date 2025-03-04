@@ -1,17 +1,23 @@
 {
   "server": {
     "listenAddress": ":8080",
+    "unixSocketPath": "",
     "logRequests": true,
     "timeout": 60
   },
   "cache": {
     "directory": "./cache",
-    "maxSize": 10240,
-    "sizeUnit": "MB",
+    "maxSize": "10GB",
     "enabled": true,
     "lru": true,
     "cleanOnStart": false,
     "validationCacheTTL": 300
+  },
+  "logging": {
+    "filePath": "./logs/go-apt-cache.log",
+    "disableTerminal": false,
+    "maxSize": "10MB",
+    "level": "info"
   },
   "repositories": [
     {

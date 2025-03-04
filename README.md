@@ -66,32 +66,69 @@ Example configuration file:
 {
   "server": {
     "listenAddress": ":8080",
+    "unixSocketPath": "/var/run/apt-cache.sock",
     "logRequests": true,
-    "timeout": 30
+    "timeout": 60
   },
   "cache": {
     "directory": "./cache",
-    "maxSize": 1024,
-    "sizeUnit": "MB",
+    "maxSize": "10GB",
     "enabled": true,
     "lru": true,
-    "cleanOnStart": false
+    "cleanOnStart": false,
+    "validationCacheTTL": 300
+  },
+  "logging": {
+    "filePath": "./logs/go-apt-cache.log",
+    "disableTerminal": false,
+    "maxSize": "10MB",
+    "level": "info"
   },
   "repositories": [
     {
-      "url": "archive.ubuntu.com",
+      "url": "http://archive.ubuntu.com/ubuntu",
       "path": "/ubuntu",
       "enabled": true
     },
     {
-      "url": "deb.debian.org",
+      "url": "http://deb.debian.org/debian",
       "path": "/debian",
+      "enabled": true
+    },
+    {
+      "url": "http://security.ubuntu.com/ubuntu-security",
+      "path": "/ubuntu-security",
       "enabled": true
     }
   ],
   "version": "1.0.0"
 }
 ```
+
+### Configuration Sections
+
+#### Server Configuration
+
+- `listenAddress`: The address and port to listen on (e.g. `:8080`). Set to empty string to disable TCP listening.
+- `unixSocketPath`: Path to Unix socket (e.g. `/var/run/apt-cache.sock`). Set to empty string to disable Unix socket listening.
+- `logRequests`: Whether to log all HTTP requests
+- `timeout`: Timeout in seconds for HTTP requests
+
+#### Cache Configuration
+
+- `directory`: The directory where cached files will be stored
+- `maxSize`: Maximum cache size with unit (e.g. "1GB", "500MB", "10KB")
+- `enabled`: Whether to enable caching
+- `lru`: Whether to use LRU (Least Recently Used) cache eviction policy
+- `cleanOnStart`: Whether to clean the cache on startup
+- `validationCacheTTL`: Time in seconds to cache validation results
+
+#### Logging Configuration
+
+- `filePath`: Path to log file (empty for no file logging)
+- `disableTerminal`: Whether to disable terminal output
+- `maxSize`: Maximum log file size with unit (e.g. "10MB", "1GB")
+- `level`: Log level: "debug", "info", "warning", "error", "fatal"
 
 ### Command Line Options
 
@@ -101,20 +138,20 @@ You can also configure the server using command line options, which will overrid
 Usage of ./apt-cache:
   --bind string
         Address to bind to (overrides config file)
+  --unix-socket string
+        Path to Unix socket (overrides config file)
   --cache-dir string
         Local cache directory (overrides config file)
-  --cache-size int
-        Maximum cache size (overrides config file)
-  --cache-size-unit string
-        Cache size unit: bytes, MB, or GB (overrides config file)
+  --cache-size string
+        Maximum cache size with unit, e.g. "1GB", "500MB" (overrides config file)
   --clean-cache
         Clean cache on startup (overrides config file)
   --config string
         Path to configuration file (default "config.json")
   --create-config
         Create default configuration file if it doesn't exist
-  --disable-cache
-        Disable local caching (overrides config file)
+  --cache-enabled
+        Enable local caching (overrides config file) (default true)
   --log-requests
         Log all requests (overrides config file) (default true)
   --lru
@@ -124,7 +161,15 @@ Usage of ./apt-cache:
   --port int
         Port to listen on (overrides config file)
   --timeout int
-        Timeout in seconds for HTTP requests to upstream servers (default 30)
+        Timeout in seconds for HTTP requests to upstream servers (default 60)
+  --log-file string
+        Path to log file (overrides config file)
+  --disable-terminal-log
+        Disable terminal logging (overrides config file)
+  --log-max-size string
+        Maximum log file size with unit, e.g. "10MB", "1GB" (overrides config file)
+  --log-level string
+        Log level: debug, info, warning, error, fatal (overrides config file)
 ```
 
 ## Usage
@@ -182,12 +227,12 @@ You can configure multiple repositories in the configuration file:
 ```json
 "repositories": [
   {
-    "url": "archive.ubuntu.com",
+    "url": "http://archive.ubuntu.com/ubuntu",
     "path": "/ubuntu",
     "enabled": true
   },
   {
-    "url": "deb.debian.org",
+    "url": "http://deb.debian.org/debian",
     "path": "/debian",
     "enabled": true
   }
@@ -297,6 +342,7 @@ services:
 
 The server includes several cache management features:
 
+- **Size Specification**: Cache and log file sizes can be specified with units (e.g., "1GB", "500MB", "10KB").
 - **LRU Eviction**: When the cache reaches its maximum size, the least recently used items are removed.
 - **Cache Cleaning**: You can enable cache cleaning on startup with the `--clean-cache` flag or by setting `cleanOnStart: true` in the configuration file.
 - **Cache Statistics**: The server provides cache statistics via the `/status` endpoint.

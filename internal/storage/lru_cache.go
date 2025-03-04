@@ -22,6 +22,14 @@ type FileOperations struct {
 	basePath string
 }
 
+// FileType represents the type of file to operate on
+type FileType int
+
+const (
+	RegularFile FileType = iota
+	CacheFile
+)
+
 // NewFileOperations creates a new FileOperations instance
 func NewFileOperations(basePath string) *FileOperations {
 	return &FileOperations{
@@ -35,21 +43,30 @@ func (f *FileOperations) EnsureDirectoryExists(relativePath string) error {
 	return utils.CreateDirectory(dirPath)
 }
 
-// GetFilePath returns the full path for a file
-func (f *FileOperations) GetFilePath(key string) string {
+// getFilePath returns the full path for a file based on the file type
+func (f *FileOperations) getFilePath(key string, fileType FileType) string {
 	// Convert key to safe filename
 	safePath := safeFilename(key)
+
+	// Add extension for cache files
+	if fileType == CacheFile {
+		safePath += ".filecache"
+	}
+
 	return filepath.Join(f.basePath, safePath)
+}
+
+// GetFilePath returns the full path for a regular file
+func (f *FileOperations) GetFilePath(key string) string {
+	return f.getFilePath(key, RegularFile)
 }
 
 // GetCacheFilePath returns the full path for a cache file with the .filecache extension
 func (f *FileOperations) GetCacheFilePath(key string) string {
-	// Convert key to safe filename and add .filecache extension
-	safePath := safeFilename(key) + ".filecache"
-	return filepath.Join(f.basePath, safePath)
+	return f.getFilePath(key, CacheFile)
 }
 
-// ReadFile reads a file and returns its contents
+// ReadFile reads a regular file and returns its contents
 func (f *FileOperations) ReadFile(key string) ([]byte, error) {
 	filePath := f.GetFilePath(key)
 	return os.ReadFile(filePath)
@@ -61,59 +78,41 @@ func (f *FileOperations) ReadCacheFile(key string) ([]byte, error) {
 	return os.ReadFile(filePath)
 }
 
-// WriteFile writes data to a file
+// writeFileWithTemp is a helper function to write data to a file with atomic operations
+func (f *FileOperations) writeFileWithTemp(filePath string, data []byte) error {
+	// Ensure directory exists
+	dirPath := filepath.Dir(filePath)
+	if err := utils.CreateDirectory(dirPath); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// Create a temporary file first to ensure atomic writes
+	tempFilePath := filePath + ".tmp"
+	if err := os.WriteFile(tempFilePath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write temporary file: %w", err)
+	}
+
+	// Rename the temporary file to the target file (atomic operation)
+	if err := os.Rename(tempFilePath, filePath); err != nil {
+		return fmt.Errorf("failed to rename temporary file: %w", err)
+	}
+
+	return nil
+}
+
+// WriteFile writes data to a regular file
 func (f *FileOperations) WriteFile(key string, data []byte) error {
 	filePath := f.GetFilePath(key)
-
-	// Ensure directory exists
-	dirPath := filepath.Dir(filePath)
-	if err := createDirectoryWithParents(dirPath); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	// Create a temporary file first to ensure atomic writes
-	tempFilePath := filePath + ".tmp"
-	if err := os.WriteFile(tempFilePath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write temporary file: %w", err)
-	}
-
-	// Rename the temporary file to the target file (atomic operation)
-	if err := os.Rename(tempFilePath, filePath); err != nil {
-		// If rename fails, try to remove the temporary file
-		os.Remove(tempFilePath)
-		return fmt.Errorf("failed to rename temporary file: %w", err)
-	}
-
-	return nil
+	return f.writeFileWithTemp(filePath, data)
 }
 
-// WriteCacheFile writes data to a cache file with .filecache extension
+// WriteCacheFile writes data to a cache file
 func (f *FileOperations) WriteCacheFile(key string, data []byte) error {
 	filePath := f.GetCacheFilePath(key)
-
-	// Ensure directory exists
-	dirPath := filepath.Dir(filePath)
-	if err := createDirectoryWithParents(dirPath); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	// Create a temporary file first to ensure atomic writes
-	tempFilePath := filePath + ".tmp"
-	if err := os.WriteFile(tempFilePath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write temporary file: %w", err)
-	}
-
-	// Rename the temporary file to the target file (atomic operation)
-	if err := os.Rename(tempFilePath, filePath); err != nil {
-		// If rename fails, try to remove the temporary file
-		os.Remove(tempFilePath)
-		return fmt.Errorf("failed to rename temporary file: %w", err)
-	}
-
-	return nil
+	return f.writeFileWithTemp(filePath, data)
 }
 
-// FileExists checks if a file exists
+// FileExists checks if a regular file exists
 func (f *FileOperations) FileExists(key string) bool {
 	filePath := f.GetFilePath(key)
 	_, err := os.Stat(filePath)
@@ -127,7 +126,7 @@ func (f *FileOperations) CacheFileExists(key string) bool {
 	return err == nil
 }
 
-// DeleteFile deletes a file
+// DeleteFile deletes a regular file
 func (f *FileOperations) DeleteFile(key string) error {
 	filePath := f.GetFilePath(key)
 	return os.Remove(filePath)
@@ -176,7 +175,7 @@ func NewLRUCache(basePath string, maxSizeBytes int64) (*LRUCache, error) {
 // NewLRUCacheWithOptions creates a new LRU cache with the given options
 func NewLRUCacheWithOptions(options LRUCacheOptions) (*LRUCache, error) {
 	// Create base directory if it doesn't exist
-	if err := createDirectoryWithParents(options.BasePath); err != nil {
+	if err := utils.CreateDirectory(options.BasePath); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
@@ -393,7 +392,7 @@ func (c *LRUCache) Put(key string, content io.Reader, contentLength int64, lastM
 
 	// Create directory if it doesn't exist
 	dirPath := filepath.Dir(filePath)
-	if err := createDirectoryWithParents(dirPath); err != nil {
+	if err := utils.CreateDirectory(dirPath); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
@@ -464,11 +463,6 @@ func (c *LRUCache) Put(key string, content io.Reader, contentLength int64, lastM
 	c.currentSize += written
 
 	return nil
-}
-
-// createDirectoryWithParents is now a wrapper around CreateDirectory
-func createDirectoryWithParents(dirPath string) error {
-	return utils.CreateDirectory(dirPath)
 }
 
 // makeRoom removes least recently used items to make room for a new item
@@ -584,7 +578,7 @@ func (c *FileHeaderCache) PutHeaders(key string, headers http.Header) error {
 
 	// Ensure directory exists
 	dirPath := filepath.Dir(filePath)
-	if err := createDirectoryWithParents(dirPath); err != nil {
+	if err := utils.CreateDirectory(dirPath); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 

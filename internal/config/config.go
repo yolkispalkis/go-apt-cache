@@ -19,45 +19,60 @@ type Repository struct {
 // CacheConfig represents cache configuration
 type CacheConfig struct {
 	Directory          string `json:"directory"`          // Cache directory
-	MaxSize            int64  `json:"maxSize"`            // Maximum cache size
-	SizeUnit           string `json:"sizeUnit"`           // Size unit: "bytes", "MB", or "GB"
+	MaxSize            string `json:"maxSize"`            // Maximum cache size (e.g. "1GB", "500MB")
 	Enabled            bool   `json:"enabled"`            // Whether cache is enabled
 	LRU                bool   `json:"lru"`                // Whether to use LRU eviction policy
 	CleanOnStart       bool   `json:"cleanOnStart"`       // Whether to clean the cache on startup
 	ValidationCacheTTL int    `json:"validationCacheTTL"` // Time in seconds to cache validation results
 }
 
+// LoggingConfig represents logging configuration
+type LoggingConfig struct {
+	FilePath        string `json:"filePath"`        // Path to log file (empty for no file logging)
+	DisableTerminal bool   `json:"disableTerminal"` // Whether to disable terminal output
+	MaxSize         string `json:"maxSize"`         // Maximum log file size (e.g. "10MB", "1GB")
+	Level           string `json:"level"`           // Log level: "debug", "info", "warning", "error", "fatal"
+}
+
 // ServerConfig represents the server configuration
 type ServerConfig struct {
-	ListenAddress string `json:"listenAddress"` // Address to listen on (e.g. ":8080")
-	LogRequests   bool   `json:"logRequests"`   // Whether to log all requests
-	Timeout       int    `json:"timeout"`       // Timeout in seconds for HTTP requests
+	ListenAddress  string `json:"listenAddress"`  // Address to listen on (e.g. ":8080")
+	UnixSocketPath string `json:"unixSocketPath"` // Path to Unix socket (e.g. "/var/run/apt-cache.sock")
+	LogRequests    bool   `json:"logRequests"`    // Whether to log all requests
+	Timeout        int    `json:"timeout"`        // Timeout in seconds for HTTP requests
 }
 
 // Config represents the complete application configuration
 type Config struct {
-	Server       ServerConfig `json:"server"`
-	Cache        CacheConfig  `json:"cache"`
-	Repositories []Repository `json:"repositories"`
-	Version      string       `json:"version"` // Configuration version
+	Server       ServerConfig  `json:"server"`
+	Cache        CacheConfig   `json:"cache"`
+	Logging      LoggingConfig `json:"logging"` // Logging configuration
+	Repositories []Repository  `json:"repositories"`
+	Version      string        `json:"version"` // Configuration version
 }
 
 // DefaultConfig returns a default configuration
 func DefaultConfig() Config {
 	return Config{
 		Server: ServerConfig{
-			ListenAddress: ":8080",
-			LogRequests:   true,
-			Timeout:       30,
+			ListenAddress:  ":8080",
+			UnixSocketPath: "",
+			LogRequests:    true,
+			Timeout:        30,
 		},
 		Cache: CacheConfig{
 			Directory:          "./cache",
-			MaxSize:            1024,
-			SizeUnit:           "MB",
+			MaxSize:            "1GB",
 			Enabled:            true,
 			LRU:                true,
 			CleanOnStart:       false,
 			ValidationCacheTTL: 300, // 5 minutes default
+		},
+		Logging: LoggingConfig{
+			FilePath:        "./logs/go-apt-cache.log",
+			DisableTerminal: false,
+			MaxSize:         "10MB",
+			Level:           "info",
 		},
 		Repositories: []Repository{
 			{
@@ -92,6 +107,14 @@ func LoadConfig(path string) (Config, error) {
 	// Set defaults for any missing fields
 	if config.Server.Timeout <= 0 {
 		config.Server.Timeout = 30
+	}
+
+	// Set default logging configuration if not present
+	if config.Logging.MaxSize == "" {
+		config.Logging.MaxSize = "10MB"
+	}
+	if config.Logging.Level == "" {
+		config.Logging.Level = "info"
 	}
 
 	// Filter out disabled repositories

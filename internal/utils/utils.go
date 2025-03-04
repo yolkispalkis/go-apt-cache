@@ -2,120 +2,33 @@ package utils
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
 
-// CreateDirectory ensures a directory exists, handling common issues on different platforms
+// CreateDirectory ensures a directory exists
 func CreateDirectory(path string) error {
-	// First attempt to create the directory
+	// Create the directory with proper permissions
 	if err := os.MkdirAll(path, 0755); err != nil {
-		log.Printf("Error creating directory %s: %v", path, err)
-
-		// Try the component-by-component approach for Windows
-		if runtime.GOOS == "windows" {
-			// Split the path into components
-			components := strings.Split(filepath.ToSlash(path), "/")
-			currentPath := components[0]
-
-			// On Windows, the first component might be empty for absolute paths
-			if currentPath == "" && len(components) > 1 {
-				currentPath = components[1]
-				components = components[2:]
-			} else {
-				components = components[1:]
-			}
-
-			// Add drive letter back for Windows
-			if !strings.HasSuffix(currentPath, ":") {
-				// Check if we need to add the drive letter
-				if strings.Contains(path, ":") {
-					driveLetter := strings.Split(path, ":")[0]
-					currentPath = driveLetter + ":"
-				}
-			}
-
-			// Create each directory component
-			for _, component := range components {
-				if component == "" {
-					continue
-				}
-
-				currentPath = filepath.Join(currentPath, component)
-				err = os.Mkdir(currentPath, 0755)
-				if err != nil && !os.IsExist(err) {
-					// Check if the path exists but is a file
-					info, statErr := os.Stat(currentPath)
-					if statErr == nil && !info.IsDir() {
-						// It's a file, try to remove it and create directory
-						if removeErr := os.Remove(currentPath); removeErr != nil {
-							return fmt.Errorf("failed to remove file at directory path: %w", removeErr)
-						}
-						if mkdirErr := os.Mkdir(currentPath, 0755); mkdirErr != nil {
-							return fmt.Errorf("failed to create directory after removing file: %w", mkdirErr)
-						}
-					} else {
-						return fmt.Errorf("failed to create directory component %s: %w", currentPath, err)
-					}
-				}
-			}
-
-			return nil
-		}
-
-		return err
+		return fmt.Errorf("failed to create directory %s: %w", path, err)
 	}
 
-	// Verify the directory was created and is actually a directory
+	// Verify the directory was created correctly
 	info, err := os.Stat(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Try again with a different approach
-			if err := os.MkdirAll(path, 0755); err != nil {
-				return fmt.Errorf("failed to create directory on second attempt: %w", err)
-			}
-			return nil
-		}
-		return fmt.Errorf("error checking directory: %w", err)
+		return fmt.Errorf("failed to verify directory creation: %w", err)
 	}
 
-	// If path exists but is not a directory, try to handle it
 	if !info.IsDir() {
-		log.Printf("Path exists but is not a directory: %s", path)
-		// Try to remove the file and create directory
-		if err := os.Remove(path); err != nil {
-			return fmt.Errorf("failed to remove file at directory path: %w", err)
-		}
-		if err := os.MkdirAll(path, 0755); err != nil {
-			return fmt.Errorf("failed to create directory after removing file: %w", err)
-		}
+		return fmt.Errorf("%s exists but is not a directory", path)
 	}
 
 	return nil
-}
-
-// ConvertSizeToBytes converts a size value from a specified unit to bytes
-func ConvertSizeToBytes(size int64, unit string) int64 {
-	switch strings.ToUpper(unit) {
-	case "MB":
-		return size * 1024 * 1024
-	case "GB":
-		return size * 1024 * 1024 * 1024
-	case "TB":
-		return size * 1024 * 1024 * 1024 * 1024
-	case "BYTES", "":
-		// No conversion needed
-		return size
-	default:
-		log.Printf("Warning: Unknown size unit '%s', using bytes", unit)
-		return size
-	}
 }
 
 // CreateHTTPClient creates an HTTP client with optimized settings for high traffic
@@ -140,32 +53,37 @@ func CreateHTTPClient(timeoutSeconds int) *http.Client {
 	}
 
 	// Configure proxy from environment variables
-	// This will use HTTP_PROXY, HTTPS_PROXY, and NO_PROXY environment variables
 	proxyFunc := http.ProxyFromEnvironment
 	transport.Proxy = proxyFunc
 
-	// Log if proxy is configured
-	httpProxy := os.Getenv("HTTP_PROXY")
-	httpsProxy := os.Getenv("HTTPS_PROXY")
-	noProxy := os.Getenv("NO_PROXY")
-
-	if httpProxy != "" || httpsProxy != "" {
-		log.Printf("Using proxy configuration from environment variables")
-		if httpProxy != "" {
-			log.Printf("HTTP_PROXY domain: %s", GetProxyDomain(httpProxy))
-		}
-		if httpsProxy != "" {
-			log.Printf("HTTPS_PROXY domain: %s", GetProxyDomain(httpsProxy))
-		}
-		if noProxy != "" {
-			log.Printf("NO_PROXY: %s", noProxy)
-		}
-	}
-
-	return &http.Client{
-		Timeout:   time.Duration(timeoutSeconds) * time.Second,
+	// Create client with the transport
+	client := &http.Client{
 		Transport: transport,
+		Timeout:   time.Duration(timeoutSeconds) * time.Second,
 	}
+
+	return client
+}
+
+// CreateHTTPClientWithProxy creates an HTTP client with optimized settings and specific proxy configuration
+func CreateHTTPClientWithProxy(timeoutSeconds int, proxyURL string) *http.Client {
+	// Create the base client
+	client := CreateHTTPClient(timeoutSeconds)
+
+	// If proxy URL is provided, configure it
+	if proxyURL != "" {
+		// Parse the proxy URL
+		parsedURL, err := url.Parse(proxyURL)
+		if err == nil {
+			// Get the transport
+			if transport, ok := client.Transport.(*http.Transport); ok {
+				// Set the proxy function
+				transport.Proxy = http.ProxyURL(parsedURL)
+			}
+		}
+	}
+
+	return client
 }
 
 // NormalizeBasePath ensures a base path starts and ends with a slash
@@ -319,56 +237,32 @@ func GetFilePatternType(path string) FileType {
 
 // GetContentType determines the content type based on file extension
 func GetContentType(path string) string {
+	// Get file extension
 	ext := strings.ToLower(filepath.Ext(path))
+	if ext == "" {
+		return "application/octet-stream"
+	}
+
+	// Remove the leading dot
+	ext = ext[1:]
 
 	// Check for known content types
 	for _, mapping := range contentTypes {
 		for _, extension := range mapping.Extensions {
-			if ext == extension {
+			if extension == ext {
 				return mapping.MIMEType
 			}
 		}
 	}
 
-	// Default to binary for unknown types
+	// Default content type
 	return "application/octet-stream"
 }
 
-// GetProxyDomain extracts only the domain part from a proxy URL
-// Example: http://user:pass@proxy.example.com:8080 -> proxy.example.com
-func GetProxyDomain(proxyURL string) string {
-	// Remove protocol part if present
-	domainPart := proxyURL
-	if strings.Contains(proxyURL, "://") {
-		parts := strings.SplitN(proxyURL, "://", 2)
-		if len(parts) == 2 {
-			domainPart = parts[1]
-		}
+// WrapError wraps an error with a message
+func WrapError(message string, err error) error {
+	if err == nil {
+		return nil
 	}
-
-	// Remove user:password part if present
-	if strings.Contains(domainPart, "@") {
-		parts := strings.SplitN(domainPart, "@", 2)
-		if len(parts) == 2 {
-			domainPart = parts[1]
-		}
-	}
-
-	// Remove port if present
-	if strings.Contains(domainPart, ":") {
-		parts := strings.SplitN(domainPart, ":", 2)
-		if len(parts) == 2 {
-			domainPart = parts[0]
-		}
-	}
-
-	// Remove path if present
-	if strings.Contains(domainPart, "/") {
-		parts := strings.SplitN(domainPart, "/", 2)
-		if len(parts) == 2 {
-			domainPart = parts[0]
-		}
-	}
-
-	return domainPart
+	return fmt.Errorf("%s: %w", message, err)
 }
