@@ -26,6 +26,26 @@ var requestLock = struct {
 // validationCacheKeyFormat is the format string for validation cache keys.
 const validationCacheKeyFormat = "validation:%s"
 
+// List of allowed response headers
+var allowedResponseHeaders = map[string]bool{
+	"Content-Type":   true,
+	"Date":           true,
+	"Etag":           true,
+	"Last-Modified":  true,
+	"Content-Length": true,
+}
+
+// filterAndSetHeaders sets only allowed headers from the source headers to response writer
+func filterAndSetHeaders(w http.ResponseWriter, headers http.Header) {
+	for header, values := range headers {
+		if allowedResponseHeaders[http.CanonicalHeaderKey(header)] {
+			for _, value := range values {
+				w.Header().Add(header, value)
+			}
+		}
+	}
+}
+
 // acquireLock tries to acquire a lock for a resource path
 // Returns true if the lock was acquired, false if it's already locked
 // If it's already locked, the caller should wait on the returned channel
@@ -156,12 +176,8 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 
 // respondWithContent sends the response to the client
 func respondWithContent(w http.ResponseWriter, r *http.Request, headers http.Header, body []byte, contentLength int64) {
-	// Set response headers from upstream or cache
-	for key, values := range headers {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
+	// Set allowed response headers from upstream or cache
+	filterAndSetHeaders(w, headers)
 
 	// Set content length only if not already present
 	if w.Header().Get("Content-Length") == "" {
@@ -341,12 +357,8 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		return true // Return true as we handled the error
 	}
 
-	// Use cached headers exactly as they were stored
-	for key, values := range cachedHeaders {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
+	// Use cached headers exactly as they were stored, but only allowed ones
+	filterAndSetHeaders(w, cachedHeaders)
 
 	// Write status code and body (if not a HEAD request)
 	w.WriteHeader(http.StatusOK)
