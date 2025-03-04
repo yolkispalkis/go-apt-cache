@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -129,48 +130,108 @@ func getRemotePath(config ServerConfig, localPath string) string {
 	return remotePath
 }
 
-// fetchFromUpstream fetches content from the upstream server
+// fetchFromUpstream fetches a resource from the upstream server
 func fetchFromUpstream(config ServerConfig, r *http.Request, upstreamURL string) (*http.Response, error) {
-	// Log the request
-	logging.Info("Fetching from upstream: %s", upstreamURL)
-
-	// Create a new request
+	// Create request to upstream server
 	req, err := http.NewRequest(r.Method, upstreamURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("error creating request to upstream: %w", err)
+		return nil, err
 	}
 
-	// Copy relevant headers from the client request to the upstream request
+	// Copy relevant headers from original request
+	copyRelevantHeaders(req, r)
+
+	// Add User-Agent header to identify our application
 	req.Header.Set("User-Agent", "Go-APT-Cache/1.0")
-	if ifModifiedSince := r.Header.Get("If-Modified-Since"); ifModifiedSince != "" {
-		req.Header.Set("If-Modified-Since", ifModifiedSince)
+
+	// Set accept-encoding to support compression if client supports it
+	if r.Header.Get("Accept-Encoding") != "" {
+		req.Header.Set("Accept-Encoding", r.Header.Get("Accept-Encoding"))
+	} else {
+		// By default accept gzip and deflate
+		req.Header.Set("Accept-Encoding", "gzip, deflate")
 	}
 
-	// Send the request
-	resp, err := config.Client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error fetching from upstream: %w", err)
+	// Get client with optimized settings
+	client := getClient(config)
+
+	// Set timeout in context
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	// Stream response from upstream
+	return client.Do(req)
+}
+
+// copyRelevantHeaders copies relevant headers from the original request to the upstream request
+func copyRelevantHeaders(upstreamReq *http.Request, originalReq *http.Request) {
+	// Headers to copy
+	relevantHeaders := []string{
+		"If-Modified-Since",
+		"If-None-Match",
+		"Range",
+		"Authorization",
+		"Cache-Control",
 	}
 
-	return resp, nil
+	for _, header := range relevantHeaders {
+		if value := originalReq.Header.Get(header); value != "" {
+			upstreamReq.Header.Set(header, value)
+		}
+	}
 }
 
 // updateCache updates both the content cache and the header cache
 func updateCache(config ServerConfig, path string, body []byte, lastModified time.Time, headers http.Header) {
-	// Update content cache
-	err := config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified)
-	if err != nil {
-		logging.Error("Error storing in cache: %v", err)
-		// Continue even if caching fails
-	} else if config.LogRequests {
-		logging.Info("Stored in cache: %s (%d bytes)", path, len(body))
-	}
+	// Create a separate context for background caching operations with a timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	// Store original headers from upstream server in header cache
-	err = config.HeaderCache.PutHeaders(path, headers)
-	if err != nil {
-		logging.Error("Error storing headers in cache: %v", err)
-		// Continue even if header caching fails
+	// Use a channel to coordinate header and content caching
+	done := make(chan struct{}, 2)
+
+	// Update header cache in a goroutine
+	go func() {
+		defer func() {
+			done <- struct{}{}
+		}()
+
+		// Store original headers from upstream server in header cache
+		err := config.HeaderCache.PutHeaders(path, headers)
+		if err != nil {
+			logging.Error("Error storing headers in cache: %v", err)
+			// Continue even if header caching fails
+		} else if config.LogRequests {
+			logging.Info("Stored headers in cache: %s", path)
+		}
+	}()
+
+	// Update content cache in a goroutine
+	go func() {
+		defer func() {
+			done <- struct{}{}
+		}()
+
+		// Update content cache
+		err := config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified)
+		if err != nil {
+			logging.Error("Error storing in cache: %v", err)
+			// Continue even if caching fails
+		} else if config.LogRequests {
+			logging.Info("Stored in cache: %s (%d bytes)", path, len(body))
+		}
+	}()
+
+	// Wait for both operations to complete or context to timeout
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+			// One operation completed
+		case <-ctx.Done():
+			logging.Error("Timeout while updating cache for: %s", path)
+			return
+		}
 	}
 }
 
@@ -476,14 +537,16 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		}
 
 		// Update cache
-		updateCache(config, path, body, lastModifiedTime, resp.Header)
+		go updateCache(config, path, body, lastModifiedTime, resp.Header)
 		return
 	}
 
-	// For GET requests, stream the response to both client and cache
-	var body []byte
-	if contentLength > 0 && contentLength < 100*1024*1024 { // Only buffer reasonably sized files (<100MB)
-		// Create a buffer to store the response body for caching
+	// Handle the body based on size and content type
+	streamingThreshold := int64(20 * 1024 * 1024) // 20MB threshold for small files
+
+	// Determine if we should use streaming vs buffered approach
+	if contentLength > 0 && contentLength < streamingThreshold {
+		// Small file: buffer entirely for both client and cache
 		buffer := &bytes.Buffer{}
 
 		// Create a TeeReader to write to both the client and the buffer
@@ -497,24 +560,39 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		}
 
 		// Get the buffered body for caching
-		body = buffer.Bytes()
+		body := buffer.Bytes()
+
+		// Update cache in background
+		go updateCache(config, path, body, lastModifiedTime, resp.Header)
 	} else {
-		// For very large files or unknown content length, read all at once
-		// This is less efficient but ensures we have the complete body for caching
-		body, err = io.ReadAll(resp.Body)
+		// Large file: read chunks and write to both client and cache concurrently
+		// Create a pipe for sending data to the cache
+		pr, pw := io.Pipe()
+
+		// Set up a MultiWriter to write to both the client and cache pipe
+		mw := io.MultiWriter(w, pw)
+
+		// Start a goroutine to handle caching
+		go func() {
+			defer pw.Close() // Ensure the pipe is closed when done
+
+			// Read from the pipe and update the cache
+			body, err := io.ReadAll(pr)
+			if err != nil {
+				logging.Error("Error reading from pipe for caching: %v", err)
+				return
+			}
+
+			updateCache(config, path, body, lastModifiedTime, resp.Header)
+		}()
+
+		// Copy data from the response to the MultiWriter
+		_, err := io.Copy(mw, resp.Body)
 		if err != nil {
-			logging.Error("Error reading response from upstream: %v", err)
+			logging.Error("Error copying response to client and cache: %v", err)
 			return
 		}
-
-		// Use respondWithContent to send the response
-		respondWithContent(w, r, resp.Header, body, int64(len(body)))
 	}
-
-	// Update cache in background to not delay the response further
-	go func() {
-		updateCache(config, path, body, lastModifiedTime, resp.Header)
-	}()
 }
 
 // setBasicHeaders sets basic headers when cached headers are not available
