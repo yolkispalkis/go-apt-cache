@@ -235,26 +235,6 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 	}
 }
 
-// respondWithContent sends the response to the client
-func respondWithContent(w http.ResponseWriter, r *http.Request, headers http.Header, body []byte, contentLength int64) {
-	// Set allowed response headers from upstream or cache
-	filterAndSetHeaders(w, headers)
-
-	// Set content length only if not already present
-	if w.Header().Get("Content-Length") == "" {
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
-	}
-
-	// Write status code and body (if not a HEAD request)
-	w.WriteHeader(http.StatusOK)
-	if r.Method != http.MethodHead {
-		_, err := w.Write(body)
-		if err != nil {
-			logging.Error("Error writing response body: %v", err)
-		}
-	}
-}
-
 // sendNotModified sends a 304 Not Modified response.
 func sendNotModified(w http.ResponseWriter, config ServerConfig, r *http.Request) {
 	if config.LogRequests {
