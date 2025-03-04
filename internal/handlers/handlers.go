@@ -291,7 +291,8 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 	}
 
 	// Validate with upstream if needed
-	if useIfModifiedSince && shouldValidateWithUpstream(r.URL.Path) {
+	fileType := utils.GetFilePatternType(r.URL.Path)
+	if useIfModifiedSince && fileType == utils.TypeFrequentlyChanging {
 		validationKey := fmt.Sprintf(validationCacheKeyFormat, r.URL.Path)
 		isValid, _ := config.ValidationCache.Get(validationKey)
 		if !isValid {
@@ -458,38 +459,6 @@ func setBasicHeaders(w http.ResponseWriter, r *http.Request, _ http.Header, last
 	}
 }
 
-// shouldUseIfModifiedSince determines if a file should use If-Modified-Since based on its path
-func shouldUseIfModifiedSince(path string) bool {
-	// Files that should use If-Modified-Since:
-	// - Release files
-	// - InRelease files
-	// - Packages files
-	// - Sources files
-	// - Index files
-
-	lowercasePath := strings.ToLower(path)
-
-	// Check for specific file patterns
-	if strings.Contains(lowercasePath, "release") ||
-		strings.Contains(lowercasePath, "packages") ||
-		strings.Contains(lowercasePath, "sources") ||
-		strings.Contains(lowercasePath, "index") {
-		return true
-	}
-
-	// Default to not using If-Modified-Since for other files
-	return false
-}
-
-// shouldValidateWithUpstream determines if we should check with the upstream server
-// to validate if our cached copy is still valid
-func shouldValidateWithUpstream(path string) bool {
-	// Validate Release files and directories
-	return strings.Contains(path, "InRelease") ||
-		strings.Contains(path, "Release") ||
-		strings.HasSuffix(path, "/")
-}
-
 // HandleRequest is a common handler for all types of requests
 func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -541,8 +510,8 @@ func HandleRelease(config ServerConfig) http.HandlerFunc {
 // These are cached in storage but use If-Modified-Since based on file type
 func HandleCacheableRequest(config ServerConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Determine if this file should use If-Modified-Since based on its path
-		useIfModifiedSince := shouldUseIfModifiedSince(r.URL.Path)
-		HandleRequest(config, useIfModifiedSince)(w, r)
+		// Determine if this file should use If-Modified-Since based on its type
+		fileType := utils.GetFilePatternType(r.URL.Path)
+		HandleRequest(config, fileType == utils.TypeFrequentlyChanging)(w, r)
 	}
 }

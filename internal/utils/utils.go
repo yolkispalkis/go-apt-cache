@@ -202,20 +202,14 @@ var (
 	}
 )
 
-// MatchesFilePattern checks if a path matches any of the given patterns
-func MatchesFilePattern(path string, patterns []string) bool {
-	normalizedPath := filepath.ToSlash(path)
-	for _, pattern := range patterns {
-		if strings.Contains(normalizedPath, pattern) {
-			return true
-		}
-	}
-	return false
-}
-
 // GetFilePatternType determines the type of file based on its path
 func GetFilePatternType(path string) FileType {
 	normalizedPath := filepath.ToSlash(path)
+
+	// Directories are considered frequently changing
+	if strings.HasSuffix(normalizedPath, "/") {
+		return TypeFrequentlyChanging
+	}
 
 	// Check patterns in order of priority
 	for _, pattern := range filePatterns {
