@@ -371,7 +371,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 	return true
 }
 
-// handleCacheMiss handles a cache miss, fetching the resource from the upstream server
+// handleCacheMiss handles the case when the requested resource is not in cache
 func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig, useIfModifiedSince bool) {
 	path := r.URL.Path
 
@@ -437,16 +437,12 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	if resp.StatusCode != http.StatusOK {
 		// Forward error status from upstream
 		logging.Error("Unexpected status code from upstream: %d, URL: %s", resp.StatusCode, upstreamURL)
+
+		// Set response headers from upstream
+		filterAndSetHeaders(w, resp.Header)
+
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body) // Forward the response body from the upstream server
-		return
-	}
-
-	// Read response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		logging.Error("Error reading response from upstream: %v", err)
 		return
 	}
 
@@ -458,11 +454,67 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		}
 	}
 
-	// Update cache
-	updateCache(config, path, body, lastModifiedTime, resp.Header)
+	// Set allowed response headers from upstream
+	filterAndSetHeaders(w, resp.Header)
 
-	// Respond to the client
-	respondWithContent(w, r, resp.Header, body, int64(len(body)))
+	// Set content length only if not already present
+	contentLength := resp.ContentLength
+	if w.Header().Get("Content-Length") == "" && contentLength > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
+	}
+
+	// Write status code
+	w.WriteHeader(http.StatusOK)
+
+	// For HEAD requests, we don't send the body
+	if r.Method == http.MethodHead {
+		// Read response body to cache it, but don't send to client
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			logging.Error("Error reading response from upstream for HEAD request: %v", err)
+			return
+		}
+
+		// Update cache
+		updateCache(config, path, body, lastModifiedTime, resp.Header)
+		return
+	}
+
+	// For GET requests, stream the response to both client and cache
+	var body []byte
+	if contentLength > 0 && contentLength < 100*1024*1024 { // Only buffer reasonably sized files (<100MB)
+		// Create a buffer to store the response body for caching
+		buffer := &bytes.Buffer{}
+
+		// Create a TeeReader to write to both the client and the buffer
+		teeReader := io.TeeReader(resp.Body, buffer)
+
+		// Stream the response to the client
+		_, err := io.Copy(w, teeReader)
+		if err != nil {
+			logging.Error("Error streaming response to client: %v", err)
+			return
+		}
+
+		// Get the buffered body for caching
+		body = buffer.Bytes()
+	} else {
+		// For very large files or unknown content length, read all at once
+		// This is less efficient but ensures we have the complete body for caching
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			logging.Error("Error reading response from upstream: %v", err)
+			return
+		}
+
+		// Use respondWithContent to send the response
+		respondWithContent(w, r, resp.Header, body, int64(len(body)))
+	}
+
+	// Update cache in background to not delay the response further
+	go func() {
+		updateCache(config, path, body, lastModifiedTime, resp.Header)
+	}()
 }
 
 // setBasicHeaders sets basic headers when cached headers are not available
