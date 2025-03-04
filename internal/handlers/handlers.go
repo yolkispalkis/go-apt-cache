@@ -301,16 +301,20 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				// If validation fails, we still serve the cached content, but log the error
 			} else if cacheIsValid {
 				config.ValidationCache.Put(validationKey, time.Now())
-				sendNotModified(w, config, r)
-				return true
+				if r.Header.Get("If-Modified-Since") != "" {
+					sendNotModified(w, config, r)
+					return true
+				}
 			}
 		} else {
 			// We have a recent valid result, no need to check with upstream
 			if config.LogRequests {
 				logging.Info("Using cached validation result for: %s", r.URL.Path)
 			}
-			sendNotModified(w, config, r)
-			return true
+			if r.Header.Get("If-Modified-Since") != "" {
+				sendNotModified(w, config, r)
+				return true
+			}
 		}
 	}
 
@@ -471,7 +475,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 		}
 
 		// Check if we have a recent validation result in the validation cache first
-		if useIfModifiedSince {
+		if useIfModifiedSince && r.Header.Get("If-Modified-Since") != "" {
 			validationKey := fmt.Sprintf(validationCacheKeyFormat, r.URL.Path)
 			isValid, _ := config.ValidationCache.Get(validationKey)
 			if isValid {
