@@ -103,10 +103,8 @@ func getRemotePath(config ServerConfig, localPath string) string {
 	// Remove local path prefix to get the remote path
 	remotePath := strings.TrimPrefix(localPath, config.LocalPath)
 
-	// Ensure path starts with a slash
-	if !strings.HasPrefix(remotePath, "/") {
-		remotePath = "/" + remotePath
-	}
+	// Ensure path doesn't start with a slash to avoid double slashes when concatenating with upstream URL
+	remotePath = strings.TrimPrefix(remotePath, "/")
 
 	return remotePath
 }
@@ -226,6 +224,7 @@ func checkAndHandleIfModifiedSince(w http.ResponseWriter, r *http.Request, lastM
 // validateWithUpstream checks with the upstream server if the cached copy is still valid
 func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders http.Header, lastModified time.Time) (bool, error) {
 	remotePath := getRemotePath(config, r.URL.Path)
+	// Ensure we don't have double slashes in the URL
 	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
 	req, err := http.NewRequest(http.MethodHead, upstreamURL, nil)
 	if err != nil {
@@ -378,6 +377,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	defer releaseLock(path)
 
 	remotePath := getRemotePath(config, path)
+	// Ensure we don't have double slashes in the URL
 	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
 
 	// Fetch from upstream

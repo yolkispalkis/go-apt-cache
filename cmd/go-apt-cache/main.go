@@ -174,6 +174,7 @@ func (ss *ServerSetup) registerRepositoryHandlers(mux *http.ServeMux) {
 			ss.HeaderCache,
 			ss.ValidationCache,
 			ss.HTTPClient,
+			basePath,
 		)
 
 		// Register handler for this path
@@ -549,6 +550,7 @@ func createServer(cfg config.Config, cache storage.Cache, headerCache storage.He
 			headerCache,
 			validationCache,
 			client,
+			basePath,
 		)
 
 		// Register the handler

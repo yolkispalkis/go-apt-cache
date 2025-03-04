@@ -22,6 +22,7 @@ func NewRepositoryHandler(
 	headerCache storage.HeaderCache,
 	validationCache storage.ValidationCache,
 	client *http.Client,
+	localPath string,
 ) http.Handler {
 	// Use the new factory function from server_config.go
 	config := NewRepositoryServerConfig(
@@ -31,6 +32,9 @@ func NewRepositoryHandler(
 		validationCache,
 		client,
 	)
+
+	// Set the local path for URL mapping
+	config.LocalPath = localPath
 
 	return &RepositoryHandler{
 		config: config,
