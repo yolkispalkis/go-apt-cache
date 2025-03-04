@@ -58,6 +58,7 @@ func (ci *CacheInitializer) Initialize() (storage.Cache, storage.HeaderCache, st
 	// Initialize cache based on configuration
 	var cache storage.Cache
 	var headerCache storage.HeaderCache
+	var err error
 
 	// Create LRU cache if enabled
 	if cfg.Cache.LRU {
@@ -103,7 +104,10 @@ func (ci *CacheInitializer) Initialize() (storage.Cache, storage.HeaderCache, st
 	}
 
 	// Create header cache
-	headerCache = storage.NewNoopHeaderCache() // Placeholder - implement header cache if needed
+	headerCache, err = storage.NewFileHeaderCache(cacheDir)
+	if err != nil {
+		return nil, nil, nil, utils.WrapError("failed to create header cache", err)
+	}
 	logging.Info("Using header cache at %s", cacheDir)
 
 	// Create validation cache
