@@ -24,6 +24,12 @@ var requestLock = struct {
 	inProgress map[string]chan struct{}
 }{inProgress: make(map[string]chan struct{})}
 
+// cacheMutex protects access to the currentlyCaching map
+var cacheMutex = sync.Mutex{}
+
+// currentlyCaching tracks resources that are currently being cached
+var currentlyCaching = make(map[string]struct{})
+
 // validationCacheKeyFormat is the format string for validation cache keys.
 const validationCacheKeyFormat = "validation:%s"
 
@@ -187,6 +193,29 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 	// Create a separate context for background caching operations with a timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// Use a mutex to prevent concurrent updates for the same resource
+	cacheMutex.Lock()
+	// Check if this path is currently being cached by another goroutine
+	if _, exists := currentlyCaching[path]; exists {
+		// Already being cached, skip this update
+		cacheMutex.Unlock()
+		if config.LogRequests {
+			logging.Info("Skipping duplicate cache update for: %s", path)
+		}
+		return
+	}
+
+	// Mark this path as being cached
+	currentlyCaching[path] = struct{}{}
+	cacheMutex.Unlock()
+
+	// Ensure we remove this path from currentlyCaching when done
+	defer func() {
+		cacheMutex.Lock()
+		delete(currentlyCaching, path)
+		cacheMutex.Unlock()
+	}()
 
 	// Use a channel to coordinate header and content caching
 	done := make(chan struct{}, 2)
@@ -535,8 +564,19 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		// Stream the response to the client
 		_, err := io.Copy(w, teeReader)
 		if err != nil {
-			logging.Error("Error streaming response to client: %v", err)
-			return
+			// Check if the error is due to client disconnection/context cancellation
+			// This is normal for apt-get which often sends requests and cancels them
+			if strings.Contains(err.Error(), "context canceled") ||
+				strings.Contains(err.Error(), "connection reset by peer") ||
+				strings.Contains(err.Error(), "broken pipe") {
+				// This is an expected error when client disconnects
+				if config.LogRequests {
+					logging.Info("Client disconnected during download: %s", path)
+				}
+			} else {
+				logging.Error("Error streaming response to client: %v", err)
+			}
+			// Continue with caching even if client disconnected
 		}
 
 		// Get the buffered body for caching
@@ -569,8 +609,18 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		// Copy data from the response to the MultiWriter
 		_, err := io.Copy(mw, resp.Body)
 		if err != nil {
-			logging.Error("Error copying response to client and cache: %v", err)
-			return
+			// Check if the error is due to client disconnection/context cancellation
+			if strings.Contains(err.Error(), "context canceled") ||
+				strings.Contains(err.Error(), "connection reset by peer") ||
+				strings.Contains(err.Error(), "broken pipe") {
+				// This is an expected error when client disconnects
+				if config.LogRequests {
+					logging.Info("Client disconnected during download: %s", path)
+				}
+			} else {
+				logging.Error("Error copying response to client and cache: %v", err)
+			}
+			// The cache goroutine will detect the error and handle it
 		}
 	}
 }
