@@ -478,6 +478,176 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 	// Ensure we don't have double slashes in the URL
 	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
 
+	// For HEAD requests, we handle things differently
+	if r.Method == http.MethodHead {
+		handleHeadRequest(w, r, config, upstreamURL, path)
+		return
+	}
+
+	// For APT clients, we need to handle GET requests carefully
+	// APT often expects complete content info upfront
+	handleGetRequest(w, r, config, upstreamURL, path)
+}
+
+// handleHeadRequest handles HEAD requests from clients
+func handleHeadRequest(w http.ResponseWriter, r *http.Request, config ServerConfig, upstreamURL string, path string) {
+	// Fetch from upstream
+	resp, err := fetchFromUpstream(config, r, upstreamURL)
+	if err != nil {
+		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+		logging.Error("Error fetching from upstream: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Get last modified time
+	lastModifiedTime := time.Now()
+	if lastModifiedHeader := resp.Header.Get("Last-Modified"); lastModifiedHeader != "" {
+		if parsedTime, err := time.Parse(http.TimeFormat, lastModifiedHeader); err == nil {
+			lastModifiedTime = parsedTime
+		}
+	}
+
+	// Set headers and status code
+	filterAndSetHeaders(w, resp.Header)
+	w.WriteHeader(resp.StatusCode)
+
+	// Read response body to cache it, but don't send to client (it's a HEAD request)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logging.Error("Error reading response from upstream for HEAD request: %v", err)
+		return
+	}
+
+	// Update cache in background
+	go updateCache(config, path, body, lastModifiedTime, resp.Header)
+}
+
+// handleGetRequest handles GET requests, optimized for APT clients
+func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfig, upstreamURL string, path string) {
+	// Fetch from upstream with a special request to get headers first
+	// We'll make a HEAD request first to get accurate content details
+	headReq, _ := http.NewRequest(http.MethodHead, upstreamURL, nil)
+	copyRelevantHeaders(headReq, r)
+	headReq.Header.Set("User-Agent", "Go-APT-Cache/1.0")
+
+	// Get client with optimized settings
+	client := getClient(config)
+	headResp, err := client.Do(headReq)
+	if err != nil {
+		// Failed to get HEAD, try a direct GET instead
+		getFullContent(w, r, config, upstreamURL, path)
+		return
+	}
+	defer headResp.Body.Close()
+
+	if headResp.StatusCode == http.StatusNotModified {
+		// Resource not modified (This should only happen if If-Modified-Since was sent)
+		if config.LogRequests {
+			logging.Info("Upstream reports resource not modified: %s", path)
+		}
+
+		// Store validation result in validation cache
+		validationKey := fmt.Sprintf(validationCacheKeyFormat, path)
+		config.ValidationCache.Put(validationKey, time.Now())
+		if config.LogRequests {
+			logging.Info("Stored validation result in cache for: %s", path)
+		}
+
+		sendNotModified(w, config, r)
+		return
+	}
+
+	if headResp.StatusCode != http.StatusOK {
+		// Forward error status from upstream
+		logging.Error("Unexpected status code from upstream HEAD: %d, URL: %s", headResp.StatusCode, upstreamURL)
+
+		// Set response headers from upstream
+		filterAndSetHeaders(w, headResp.Header)
+
+		w.WriteHeader(headResp.StatusCode)
+		return
+	}
+
+	// Now we have headers, we can properly set them before streaming content
+	// Get the content length
+	contentLength := headResp.ContentLength
+
+	// GET the full content now
+	getRcvq, _ := http.NewRequest(http.MethodGet, upstreamURL, nil)
+	copyRelevantHeaders(getRcvq, r)
+	getRcvq.Header.Set("User-Agent", "Go-APT-Cache/1.0")
+
+	getResp, err := client.Do(getRcvq)
+	if err != nil {
+		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+		logging.Error("Error fetching content from upstream: %v", err)
+		return
+	}
+	defer getResp.Body.Close()
+
+	if getResp.StatusCode != http.StatusOK {
+		// Forward error status from upstream
+		logging.Error("Unexpected status code from upstream GET: %d, URL: %s", getResp.StatusCode, upstreamURL)
+
+		// Set response headers from upstream
+		filterAndSetHeaders(w, getResp.Header)
+
+		w.WriteHeader(getResp.StatusCode)
+		io.Copy(w, getResp.Body)
+		return
+	}
+
+	// Get last modified time
+	lastModifiedTime := time.Now()
+	if lastModifiedHeader := getResp.Header.Get("Last-Modified"); lastModifiedHeader != "" {
+		if parsedTime, err := time.Parse(http.TimeFormat, lastModifiedHeader); err == nil {
+			lastModifiedTime = parsedTime
+		}
+	}
+
+	// Set allowed response headers from head request (which should have accurate content information)
+	filterAndSetHeaders(w, headResp.Header)
+
+	// Ensure Content-Length is set accurately - APT clients rely on this
+	if contentLength > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
+	}
+
+	// Write status code
+	w.WriteHeader(http.StatusOK)
+
+	// Now stream the content and cache simultaneously
+	buffer := &bytes.Buffer{}
+
+	// Create a TeeReader to write to both the client and the buffer
+	teeReader := io.TeeReader(getResp.Body, buffer)
+
+	// Stream the response to the client
+	_, err = io.Copy(w, teeReader)
+	if err != nil {
+		// Check if the error is due to client disconnection/context cancellation
+		if strings.Contains(err.Error(), "context canceled") ||
+			strings.Contains(err.Error(), "connection reset by peer") ||
+			strings.Contains(err.Error(), "broken pipe") {
+			// This is an expected error when client disconnects
+			if config.LogRequests {
+				logging.Info("Client disconnected during download: %s", path)
+			}
+		} else {
+			logging.Error("Error streaming response to client: %v", err)
+		}
+	}
+
+	// Get the buffered body for caching
+	body := buffer.Bytes()
+
+	// Update cache in background
+	go updateCache(config, path, body, lastModifiedTime, headResp.Header)
+}
+
+// getFullContent fetches the full content directly when HEAD request fails
+func getFullContent(w http.ResponseWriter, r *http.Request, config ServerConfig, upstreamURL string, path string) {
 	// Fetch from upstream
 	resp, err := fetchFromUpstream(config, r, upstreamURL)
 	if err != nil {
@@ -512,7 +682,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		filterAndSetHeaders(w, resp.Header)
 
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body) // Forward the response body from the upstream server
+		io.Copy(w, resp.Body)
 		return
 	}
 
@@ -524,105 +694,40 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		}
 	}
 
-	// Set allowed response headers from upstream
+	// For APT clients, we need to buffer the entire response to get accurate content length
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		logging.Error("Error reading response from upstream: %v", err)
+		return
+	}
+
+	// Set allowed response headers
 	filterAndSetHeaders(w, resp.Header)
 
-	// Set content length only if not already present
-	contentLength := resp.ContentLength
-	if w.Header().Get("Content-Length") == "" && contentLength > 0 {
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
-	}
+	// Set accurate Content-Length
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 
 	// Write status code
 	w.WriteHeader(http.StatusOK)
 
-	// For HEAD requests, we don't send the body
-	if r.Method == http.MethodHead {
-		// Read response body to cache it, but don't send to client
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			logging.Error("Error reading response from upstream for HEAD request: %v", err)
-			return
-		}
-
-		// Update cache
-		go updateCache(config, path, body, lastModifiedTime, resp.Header)
-		return
-	}
-
-	// Handle the body based on size and content type
-	streamingThreshold := int64(20 * 1024 * 1024) // 20MB threshold for small files
-
-	// Determine if we should use streaming vs buffered approach
-	if contentLength > 0 && contentLength < streamingThreshold {
-		// Small file: buffer entirely for both client and cache
-		buffer := &bytes.Buffer{}
-
-		// Create a TeeReader to write to both the client and the buffer
-		teeReader := io.TeeReader(resp.Body, buffer)
-
-		// Stream the response to the client
-		_, err := io.Copy(w, teeReader)
-		if err != nil {
-			// Check if the error is due to client disconnection/context cancellation
-			// This is normal for apt-get which often sends requests and cancels them
-			if strings.Contains(err.Error(), "context canceled") ||
-				strings.Contains(err.Error(), "connection reset by peer") ||
-				strings.Contains(err.Error(), "broken pipe") {
-				// This is an expected error when client disconnects
-				if config.LogRequests {
-					logging.Info("Client disconnected during download: %s", path)
-				}
-			} else {
-				logging.Error("Error streaming response to client: %v", err)
+	// Write the body
+	_, err = w.Write(body)
+	if err != nil {
+		if strings.Contains(err.Error(), "context canceled") ||
+			strings.Contains(err.Error(), "connection reset by peer") ||
+			strings.Contains(err.Error(), "broken pipe") {
+			// This is an expected error when client disconnects
+			if config.LogRequests {
+				logging.Info("Client disconnected during download: %s", path)
 			}
-			// Continue with caching even if client disconnected
-		}
-
-		// Get the buffered body for caching
-		body := buffer.Bytes()
-
-		// Update cache in background
-		go updateCache(config, path, body, lastModifiedTime, resp.Header)
-	} else {
-		// Large file: read chunks and write to both client and cache concurrently
-		// Create a pipe for sending data to the cache
-		pr, pw := io.Pipe()
-
-		// Set up a MultiWriter to write to both the client and cache pipe
-		mw := io.MultiWriter(w, pw)
-
-		// Start a goroutine to handle caching
-		go func() {
-			defer pw.Close() // Ensure the pipe is closed when done
-
-			// Read from the pipe and update the cache
-			body, err := io.ReadAll(pr)
-			if err != nil {
-				logging.Error("Error reading from pipe for caching: %v", err)
-				return
-			}
-
-			updateCache(config, path, body, lastModifiedTime, resp.Header)
-		}()
-
-		// Copy data from the response to the MultiWriter
-		_, err := io.Copy(mw, resp.Body)
-		if err != nil {
-			// Check if the error is due to client disconnection/context cancellation
-			if strings.Contains(err.Error(), "context canceled") ||
-				strings.Contains(err.Error(), "connection reset by peer") ||
-				strings.Contains(err.Error(), "broken pipe") {
-				// This is an expected error when client disconnects
-				if config.LogRequests {
-					logging.Info("Client disconnected during download: %s", path)
-				}
-			} else {
-				logging.Error("Error copying response to client and cache: %v", err)
-			}
-			// The cache goroutine will detect the error and handle it
+		} else {
+			logging.Error("Error writing response body: %v", err)
 		}
 	}
+
+	// Update cache in background
+	go updateCache(config, path, body, lastModifiedTime, resp.Header)
 }
 
 // setBasicHeaders sets basic headers when cached headers are not available
