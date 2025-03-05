@@ -309,8 +309,13 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 		} else if config.LogRequests {
 			logging.Info("Stored in cache: %s (%d bytes)", path, len(body))
 		}
+
+		// Explicitly clear the body to help garbage collection
+		body = nil
 	case <-ctx.Done():
 		logging.Error("Cache update timed out for: %s", path)
+		// Explicitly clear the body to help garbage collection
+		body = nil
 	}
 }
 
@@ -596,6 +601,9 @@ func handleHeadRequest(w http.ResponseWriter, r *http.Request, config ServerConf
 
 	// Update cache in background
 	go updateCache(config, path, body, lastModifiedTime, resp.Header)
+
+	// Clear body to help garbage collection
+	body = nil
 }
 
 // handleGetRequest handles GET requests, optimized for APT clients
@@ -688,8 +696,14 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfi
 		}
 	}
 
+	// Get buffer bytes for caching
+	bufBytes := buf.Bytes()
+
 	// Update cache in background with the captured content
-	go updateCache(config, path, buf.Bytes(), lastModifiedTime, getResp.Header)
+	go updateCache(config, path, bufBytes, lastModifiedTime, getResp.Header)
+
+	// Reset buffer to help garbage collection
+	buf.Reset()
 }
 
 // getFullContent fetches the full content directly when HEAD request fails
@@ -774,8 +788,14 @@ func getFullContent(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		}
 	}
 
+	// Get buffer bytes for caching
+	bufBytes := buf.Bytes()
+
 	// Update cache in background with the captured content
-	go updateCache(config, path, buf.Bytes(), lastModifiedTime, resp.Header)
+	go updateCache(config, path, bufBytes, lastModifiedTime, resp.Header)
+
+	// Reset buffer to help garbage collection
+	buf.Reset()
 }
 
 // setBasicHeaders sets basic headers when cached headers are not available
