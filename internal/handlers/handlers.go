@@ -122,7 +122,8 @@ func getClient(config ServerConfig) *http.Client {
 	if config.Client != nil {
 		return config.Client
 	}
-	return utils.CreateHTTPClient(60) // Default 60 second timeout
+	// Use a longer timeout for GET requests to handle large files
+	return utils.CreateHTTPClient(120) // Increased timeout to 120 seconds
 }
 
 // getRemotePath converts local path to remote path
@@ -161,8 +162,15 @@ func fetchFromUpstream(config ServerConfig, r *http.Request, upstreamURL string)
 	// Get client with optimized settings
 	client := getClient(config)
 
-	// Set timeout in context
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	// Set timeout in context - use a shorter timeout for HEAD requests
+	var timeout time.Duration
+	if r.Method == http.MethodHead {
+		timeout = 10 * time.Second
+	} else {
+		timeout = 60 * time.Second // Longer timeout for GET requests to allow for large files
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	req = req.WithContext(ctx)
 
@@ -191,7 +199,7 @@ func copyRelevantHeaders(upstreamReq *http.Request, originalReq *http.Request) {
 // updateCache updates both the content cache and the header cache
 func updateCache(config ServerConfig, path string, body []byte, lastModified time.Time, headers http.Header) {
 	// Create a separate context for background caching operations with a timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second) // Increased timeout
 	defer cancel()
 
 	// Use a mutex to prevent concurrent updates for the same resource
@@ -217,50 +225,53 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 		cacheMutex.Unlock()
 	}()
 
-	// Use a channel to coordinate header and content caching
-	done := make(chan struct{}, 2)
+	// Use a WaitGroup to coordinate header and content caching
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Track errors
+	var headerErr, contentErr error
 
 	// Update header cache in a goroutine
 	go func() {
-		defer func() {
-			done <- struct{}{}
-		}()
+		defer wg.Done()
 
 		// Store original headers from upstream server in header cache
-		err := config.HeaderCache.PutHeaders(path, headers)
-		if err != nil {
-			logging.Error("Error storing headers in cache: %v", err)
-			// Continue even if header caching fails
-		} else if config.LogRequests {
-			logging.Info("Stored headers in cache: %s", path)
-		}
+		headerErr = config.HeaderCache.PutHeaders(path, headers)
 	}()
 
 	// Update content cache in a goroutine
 	go func() {
-		defer func() {
-			done <- struct{}{}
-		}()
+		defer wg.Done()
 
 		// Update content cache
-		err := config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified)
-		if err != nil {
-			logging.Error("Error storing in cache: %v", err)
-			// Continue even if caching fails
+		contentErr = config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified)
+	}()
+
+	// Use a channel to handle timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	// Wait for completion or timeout
+	select {
+	case <-done:
+		// Both operations completed
+		if headerErr != nil {
+			logging.Error("Error storing headers in cache: %v", headerErr)
+		} else if config.LogRequests {
+			logging.Info("Stored headers in cache: %s", path)
+		}
+
+		if contentErr != nil {
+			logging.Error("Error storing in cache: %v", contentErr)
 		} else if config.LogRequests {
 			logging.Info("Stored in cache: %s (%d bytes)", path, len(body))
 		}
-	}()
-
-	// Wait for both operations to complete or context to timeout
-	for i := 0; i < 2; i++ {
-		select {
-		case <-done:
-			// One operation completed
-		case <-ctx.Done():
-			logging.Error("Timeout while updating cache for: %s", path)
-			return
-		}
+	case <-ctx.Done():
+		logging.Error("Cache update timed out for: %s", path)
 	}
 }
 
@@ -484,8 +495,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		return
 	}
 
-	// For APT clients, we need to handle GET requests carefully
-	// APT often expects complete content info upfront
+	// For GET requests, stream content directly
 	handleGetRequest(w, r, config, upstreamURL, path)
 }
 
@@ -525,23 +535,23 @@ func handleHeadRequest(w http.ResponseWriter, r *http.Request, config ServerConf
 
 // handleGetRequest handles GET requests, optimized for APT clients
 func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfig, upstreamURL string, path string) {
-	// Fetch from upstream with a special request to get headers first
-	// We'll make a HEAD request first to get accurate content details
-	headReq, _ := http.NewRequest(http.MethodHead, upstreamURL, nil)
-	copyRelevantHeaders(headReq, r)
-	headReq.Header.Set("User-Agent", "Go-APT-Cache/1.0")
-
 	// Get client with optimized settings
 	client := getClient(config)
-	headResp, err := client.Do(headReq)
+
+	// Make a direct GET request to upstream
+	getReq, _ := http.NewRequest(http.MethodGet, upstreamURL, nil)
+	copyRelevantHeaders(getReq, r)
+	getReq.Header.Set("User-Agent", "Go-APT-Cache/1.0")
+
+	getResp, err := client.Do(getReq)
 	if err != nil {
-		// Failed to get HEAD, try a direct GET instead
-		getFullContent(w, r, config, upstreamURL, path)
+		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+		logging.Error("Error fetching content from upstream: %v", err)
 		return
 	}
-	defer headResp.Body.Close()
+	defer getResp.Body.Close()
 
-	if headResp.StatusCode == http.StatusNotModified {
+	if getResp.StatusCode == http.StatusNotModified {
 		// Resource not modified (This should only happen if If-Modified-Since was sent)
 		if config.LogRequests {
 			logging.Info("Upstream reports resource not modified: %s", path)
@@ -557,34 +567,6 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfi
 		sendNotModified(w, config, r)
 		return
 	}
-
-	if headResp.StatusCode != http.StatusOK {
-		// Forward error status from upstream
-		logging.Error("Unexpected status code from upstream HEAD: %d, URL: %s", headResp.StatusCode, upstreamURL)
-
-		// Set response headers from upstream
-		filterAndSetHeaders(w, headResp.Header)
-
-		w.WriteHeader(headResp.StatusCode)
-		return
-	}
-
-	// Now we have headers, we can properly set them before streaming content
-	// Get the content length
-	contentLength := headResp.ContentLength
-
-	// GET the full content now
-	getRcvq, _ := http.NewRequest(http.MethodGet, upstreamURL, nil)
-	copyRelevantHeaders(getRcvq, r)
-	getRcvq.Header.Set("User-Agent", "Go-APT-Cache/1.0")
-
-	getResp, err := client.Do(getRcvq)
-	if err != nil {
-		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
-		logging.Error("Error fetching content from upstream: %v", err)
-		return
-	}
-	defer getResp.Body.Close()
 
 	if getResp.StatusCode != http.StatusOK {
 		// Forward error status from upstream
@@ -606,25 +588,25 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfi
 		}
 	}
 
-	// Set allowed response headers from head request (which should have accurate content information)
-	filterAndSetHeaders(w, headResp.Header)
+	// Set allowed response headers
+	filterAndSetHeaders(w, getResp.Header)
 
-	// Ensure Content-Length is set accurately - APT clients rely on this
-	if contentLength > 0 {
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
+	// Ensure Content-Length is set if available
+	if getResp.ContentLength > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", getResp.ContentLength))
 	}
 
 	// Write status code
 	w.WriteHeader(http.StatusOK)
 
-	// Now stream the content and cache simultaneously
-	buffer := &bytes.Buffer{}
+	// Create a buffer to store the content for caching
+	var buf bytes.Buffer
 
-	// Create a TeeReader to write to both the client and the buffer
-	teeReader := io.TeeReader(getResp.Body, buffer)
+	// Use a MultiWriter to write to both the client and our buffer
+	mw := io.MultiWriter(w, &buf)
 
-	// Stream the response to the client
-	_, err = io.Copy(w, teeReader)
+	// Stream the content directly to the client while also capturing it for caching
+	_, err = io.Copy(mw, getResp.Body)
 	if err != nil {
 		// Check if the error is due to client disconnection/context cancellation
 		if strings.Contains(err.Error(), "context canceled") ||
@@ -639,11 +621,8 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfi
 		}
 	}
 
-	// Get the buffered body for caching
-	body := buffer.Bytes()
-
-	// Update cache in background
-	go updateCache(config, path, body, lastModifiedTime, headResp.Header)
+	// Update cache in background with the captured content
+	go updateCache(config, path, buf.Bytes(), lastModifiedTime, getResp.Header)
 }
 
 // getFullContent fetches the full content directly when HEAD request fails
@@ -694,25 +673,25 @@ func getFullContent(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		}
 	}
 
-	// For APT clients, we need to buffer the entire response to get accurate content length
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		logging.Error("Error reading response from upstream: %v", err)
-		return
-	}
-
 	// Set allowed response headers
 	filterAndSetHeaders(w, resp.Header)
 
-	// Set accurate Content-Length
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	// Set Content-Length if available
+	if resp.ContentLength > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", resp.ContentLength))
+	}
 
 	// Write status code
 	w.WriteHeader(http.StatusOK)
 
-	// Write the body
-	_, err = w.Write(body)
+	// Create a buffer to store the content for caching
+	var buf bytes.Buffer
+
+	// Use a MultiWriter to write to both the client and our buffer
+	mw := io.MultiWriter(w, &buf)
+
+	// Stream the content directly to the client while also capturing it for caching
+	_, err = io.Copy(mw, resp.Body)
 	if err != nil {
 		if strings.Contains(err.Error(), "context canceled") ||
 			strings.Contains(err.Error(), "connection reset by peer") ||
@@ -722,12 +701,12 @@ func getFullContent(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				logging.Info("Client disconnected during download: %s", path)
 			}
 		} else {
-			logging.Error("Error writing response body: %v", err)
+			logging.Error("Error streaming response to client: %v", err)
 		}
 	}
 
-	// Update cache in background
-	go updateCache(config, path, body, lastModifiedTime, resp.Header)
+	// Update cache in background with the captured content
+	go updateCache(config, path, buf.Bytes(), lastModifiedTime, resp.Header)
 }
 
 // setBasicHeaders sets basic headers when cached headers are not available

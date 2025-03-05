@@ -35,21 +35,27 @@ func CreateDirectory(path string) error {
 func CreateHTTPClient(timeoutSeconds int) *http.Client {
 	// Create transport with optimized settings
 	transport := &http.Transport{
-		MaxIdleConns:        500,
-		MaxIdleConnsPerHost: 100,
-		MaxConnsPerHost:     250,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:        1000,
+		MaxIdleConnsPerHost: 200,
+		MaxConnsPerHost:     500,
+		IdleConnTimeout:     120 * time.Second,
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
 		TLSHandshakeTimeout: 10 * time.Second,
 		// Optimize TCP connections
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   15 * time.Second,
+			KeepAlive: 60 * time.Second,
 			DualStack: true,
 		}).DialContext,
 		// Enable TCP keepalives
 		DisableKeepAlives: false,
+		// Add response header timeout
+		ResponseHeaderTimeout: 30 * time.Second,
+		// Add write buffer size for faster uploads
+		WriteBufferSize: 64 * 1024,
+		// Add read buffer size for faster downloads
+		ReadBufferSize: 64 * 1024,
 	}
 
 	// Configure proxy from environment variables
