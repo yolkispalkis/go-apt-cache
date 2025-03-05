@@ -504,8 +504,9 @@ func handleHeadRequest(w http.ResponseWriter, r *http.Request, config ServerConf
 	// Fetch from upstream
 	resp, err := fetchFromUpstream(config, r, upstreamURL)
 	if err != nil {
-		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
-		logging.Error("Error fetching from upstream: %v", err)
+		// If HEAD request fails, fall back to GET request
+		logging.Error("HEAD request failed, falling back to GET: %v", err)
+		getFullContent(w, r, config, upstreamURL, path)
 		return
 	}
 	defer resp.Body.Close()
@@ -616,6 +617,8 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfi
 			if config.LogRequests {
 				logging.Info("Client disconnected during download: %s", path)
 			}
+			// Don't update cache if client disconnected to avoid corrupted cache
+			return
 		} else {
 			logging.Error("Error streaming response to client: %v", err)
 		}
@@ -700,6 +703,8 @@ func getFullContent(w http.ResponseWriter, r *http.Request, config ServerConfig,
 			if config.LogRequests {
 				logging.Info("Client disconnected during download: %s", path)
 			}
+			// Don't update cache if client disconnected to avoid corrupted cache
+			return
 		} else {
 			logging.Error("Error streaming response to client: %v", err)
 		}

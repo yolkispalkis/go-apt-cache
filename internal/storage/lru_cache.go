@@ -368,11 +368,45 @@ func (c *LRUCache) Get(key string) (io.ReadCloser, int64, time.Time, error) {
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
+		c.mutex.Lock()
+		c.lruList.Remove(element)
+		delete(c.items, key)
+		c.currentSize -= item.size
+		c.mutex.Unlock()
 		return nil, 0, time.Time{}, fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	// Enhanced validation: Check if file is empty or has unexpected size
+	if info.Size() == 0 {
+		file.Close()
+		// Remove corrupted file from cache
+		c.mutex.Lock()
+		c.lruList.Remove(element)
+		delete(c.items, key)
+		c.currentSize -= item.size
+		c.mutex.Unlock()
+		// Also remove the physical file
+		os.Remove(filePath)
+		return nil, 0, time.Time{}, fmt.Errorf("corrupted file in cache (zero size): %s", key)
 	}
 
 	// Update item size if it has changed
 	if info.Size() != item.size {
+		// If the size difference is significant, consider the file corrupted
+		if float64(info.Size())/float64(item.size) < 0.9 || float64(info.Size())/float64(item.size) > 1.1 {
+			file.Close()
+			// Remove corrupted file from cache
+			c.mutex.Lock()
+			c.lruList.Remove(element)
+			delete(c.items, key)
+			c.currentSize -= item.size
+			c.mutex.Unlock()
+			// Also remove the physical file
+			os.Remove(filePath)
+			return nil, 0, time.Time{}, fmt.Errorf("corrupted file in cache (size mismatch): expected %d bytes, got %d bytes", item.size, info.Size())
+		}
+
+		// Update size if within acceptable range
 		c.mutex.Lock()
 		c.currentSize = c.currentSize - item.size + info.Size()
 		item.size = info.Size()
@@ -418,11 +452,31 @@ func (c *LRUCache) Put(key string, content io.Reader, contentLength int64, lastM
 		return fmt.Errorf("failed to close file: %w", err)
 	}
 
-	// Validate file size if contentLength is provided
+	// Enhanced validation:
+	// 1. Check file size if contentLength is provided
 	if contentLength > 0 && written != contentLength {
 		// Remove file if size validation failed
 		os.Remove(tempFilePath)
 		return fmt.Errorf("file size validation failed: expected %d bytes, got %d bytes", contentLength, written)
+	}
+
+	// 2. Additional validation - check if file is readable and has expected size
+	validateFile, err := os.Open(tempFilePath)
+	if err != nil {
+		os.Remove(tempFilePath)
+		return fmt.Errorf("file validation failed - cannot open file: %w", err)
+	}
+
+	fileInfo, err := validateFile.Stat()
+	validateFile.Close()
+	if err != nil {
+		os.Remove(tempFilePath)
+		return fmt.Errorf("file validation failed - cannot stat file: %w", err)
+	}
+
+	if fileInfo.Size() != written {
+		os.Remove(tempFilePath)
+		return fmt.Errorf("file validation failed - file size mismatch: expected %d bytes, got %d bytes", written, fileInfo.Size())
 	}
 
 	// Set file modification time
