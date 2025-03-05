@@ -491,23 +491,26 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 
 	// If we reach here, serve the cached content
 
-	// Convert io.ReadCloser to []byte
-	bodyBytes, err := io.ReadAll(content)
-	if err != nil {
-		logging.Error("Error reading cached content: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return true // Return true as we handled the error
-	}
-
 	// Use cached headers exactly as they were stored, but only allowed ones
 	filterAndSetHeaders(w, cachedHeaders)
 
 	// Write status code and body (if not a HEAD request)
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
-		_, err := w.Write(bodyBytes)
+		// Stream the file directly to the client instead of loading it into memory
+		_, err := io.Copy(w, content)
 		if err != nil {
-			logging.Error("Error writing response body: %v", err)
+			// Check if the error is due to client disconnection
+			if strings.Contains(err.Error(), "context canceled") ||
+				strings.Contains(err.Error(), "connection reset by peer") ||
+				strings.Contains(err.Error(), "broken pipe") {
+				// This is an expected error when client disconnects
+				if config.LogRequests {
+					logging.Info("Client disconnected during download: %s", r.URL.Path)
+				}
+				return true
+			}
+			logging.Error("Error streaming response: %v", err)
 		}
 	}
 	return true
