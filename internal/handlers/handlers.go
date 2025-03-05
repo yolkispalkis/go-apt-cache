@@ -16,22 +16,17 @@ import (
 
 // ServerConfig definition has been moved to server_config.go
 
-// requestLock provides a mechanism to prevent concurrent requests for the same resource
-// This helps prevent the "thundering herd" problem where multiple clients request the same
-// uncached resource simultaneously
+// requestLock provides a mechanism to prevent concurrent requests for the same resource.
+// This now also handles the "currentlyCaching" state.
 var requestLock = struct {
 	sync.RWMutex
-	inProgress map[string]chan struct{}
-}{inProgress: make(map[string]chan struct{})}
+	inProgress map[string]*cacheRequest
+}{inProgress: make(map[string]*cacheRequest)}
 
-// cacheMutex protects access to the currentlyCaching map
-var cacheMutex = sync.Mutex{}
-
-// currentlyCaching tracks resources that are currently being cached
-var currentlyCaching = make(map[string]struct{})
-
-// validationCacheKeyFormat is the format string for validation cache keys.
-const validationCacheKeyFormat = "validation:%s"
+// cacheRequest holds the state for a single in-progress cache request.
+type cacheRequest struct {
+	done chan struct{} // Channel to signal completion.
+}
 
 // List of allowed response headers
 var allowedResponseHeaders = map[string]bool{
@@ -59,49 +54,36 @@ func filterAndSetHeaders(w http.ResponseWriter, headers http.Header) {
 	}
 }
 
-// acquireLock tries to acquire a lock for a resource path
-// Returns true if the lock was acquired, false if it's already locked
-// If it's already locked, the caller should wait on the returned channel
+// acquireLock tries to acquire a lock for a resource path.
+// It returns:
+// - true if the lock was acquired (no other request is in progress).
+// - false if the lock is already held (another request is in progress).
+// - a channel that will be closed when the lock is released.
+// This function now atomically handles both locking and the "currently caching" state.
 func acquireLock(path string) (bool, chan struct{}) {
-	requestLock.RLock()
-	ch, exists := requestLock.inProgress[path]
-	requestLock.RUnlock()
-
-	if exists {
-		return false, ch
-	}
-
 	requestLock.Lock()
 	defer requestLock.Unlock()
 
-	// Check again in case another goroutine acquired the lock
-	// between our RUnlock and Lock
-	ch, exists = requestLock.inProgress[path]
-	if exists {
-		return false, ch
+	if req, exists := requestLock.inProgress[path]; exists {
+		// Another request is already in progress; return false and the existing channel.
+		return false, req.done
 	}
 
-	// Create a new channel and acquire the lock
-	ch = make(chan struct{})
-	requestLock.inProgress[path] = ch
-	return true, ch
+	// No other request is in progress; create a new cacheRequest and acquire the lock.
+	req := &cacheRequest{done: make(chan struct{})}
+	requestLock.inProgress[path] = req
+	return true, req.done
 }
 
-// releaseLock releases the lock for a resource path and notifies waiters
+// releaseLock releases the lock for a resource path and notifies waiters.
 func releaseLock(path string) {
 	requestLock.Lock()
 	defer requestLock.Unlock()
 
-	if ch, exists := requestLock.inProgress[path]; exists {
-		close(ch) // Notify all waiters
+	if req, exists := requestLock.inProgress[path]; exists {
+		close(req.done) // Notify all waiters that the request is complete.
 		delete(requestLock.inProgress, path)
 	}
-}
-
-// reacquireLock attempts to re-acquire the lock after waiting on the channel.
-func reacquireLock(path string) bool {
-	acquired, _ := acquireLock(path)
-	return acquired
 }
 
 // Common HTTP request handling functions to avoid duplication
@@ -241,28 +223,7 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second) // Increased timeout
 	defer cancel()
 
-	// Use a mutex to prevent concurrent updates for the same resource
-	cacheMutex.Lock()
-	// Check if this path is currently being cached by another goroutine
-	if _, exists := currentlyCaching[path]; exists {
-		// Already being cached, skip this update
-		cacheMutex.Unlock()
-		if config.LogRequests {
-			logging.Info("Skipping duplicate cache update for: %s", path)
-		}
-		return
-	}
-
-	// Mark this path as being cached
-	currentlyCaching[path] = struct{}{}
-	cacheMutex.Unlock()
-
-	// Ensure we remove this path from currentlyCaching when done
-	defer func() {
-		cacheMutex.Lock()
-		delete(currentlyCaching, path)
-		cacheMutex.Unlock()
-	}()
+	// No need for currentlyCaching map anymore, as acquireLock handles this.
 
 	// Use a WaitGroup to coordinate header and content caching
 	var wg sync.WaitGroup
@@ -448,7 +409,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 
 	// Only validate frequently changing files with upstream
 	if useIfModifiedSince && fileType == utils.TypeFrequentlyChanging {
-		validationKey := fmt.Sprintf(validationCacheKeyFormat, r.URL.Path)
+		validationKey := fmt.Sprintf("validation:%s", r.URL.Path)
 		isValid, _ := config.ValidationCache.Get(validationKey)
 
 		// Check with upstream if validation cache is invalid or expired
@@ -525,16 +486,19 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig, useIfModifiedSince bool) {
 	path := r.URL.Path
 
-	// Acquire lock for this resource
-	acquired, ch := acquireLock(path)
+	// Acquire lock for this resource.  This also handles the "currently caching" state.
+	acquired, done := acquireLock(path)
 	if !acquired {
-		// Wait for the other request to finish fetching
-		<-ch
+		// Another request is already fetching this resource; wait for it to complete.
+		if config.LogRequests {
+			logging.Info("Waiting for another request to fetch: %s", path)
+		}
+		<-done
 
-		// Check if the resource is now in cache
+		// After waiting, try to get the resource from the cache again.
 		content, contentLength, lastModified, err := config.Cache.Get(path)
 		if err == nil {
-			// Another request has fetched this resource
+			// Another request has fetched this resource and put it in the cache.
 			if config.LogRequests {
 				logging.Info("Resource was fetched by another request: %s", path)
 			}
@@ -542,16 +506,15 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			return
 		}
 
-		// If still not in cache, acquire the lock and fetch it
-		if !reacquireLock(path) {
-			// This should not happen, but handle it gracefully
-			logging.Error("Failed to acquire lock after waiting: %s", path)
-			http.Error(w, "Server busy, please try again", http.StatusServiceUnavailable)
-			return
-		}
+		// If it's *still* not in the cache, something went wrong with the other request.
+		// We *could* try to acquire the lock again and fetch, but to avoid potential
+		// infinite loops, it's better to just return an error.
+		logging.Error("Resource not found in cache after waiting for another request: %s", path)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
 	}
 
-	// We've acquired the lock, make sure to release it when done
+	// We've acquired the lock; make sure to release it when done.
 	defer releaseLock(path)
 
 	remotePath := getRemotePath(config, path)
@@ -631,7 +594,7 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfi
 		}
 
 		// Store validation result in validation cache
-		validationKey := fmt.Sprintf(validationCacheKeyFormat, path)
+		validationKey := fmt.Sprintf("validation:%s", path)
 		config.ValidationCache.Put(validationKey, time.Now())
 		if config.LogRequests {
 			logging.Info("Stored validation result in cache for: %s", path)
@@ -674,6 +637,7 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfi
 
 	// Create a buffer to store the content for caching
 	var buf bytes.Buffer
+	defer buf.Reset() // Ensure buffer is reset even on early returns
 
 	// Use a MultiWriter to write to both the client and our buffer
 	mw := io.MultiWriter(w, &buf)
@@ -701,9 +665,6 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfi
 
 	// Update cache in background with the captured content
 	go updateCache(config, path, bufBytes, lastModifiedTime, getResp.Header)
-
-	// Reset buffer to help garbage collection
-	buf.Reset()
 }
 
 // getFullContent fetches the full content directly when HEAD request fails
@@ -724,7 +685,7 @@ func getFullContent(w http.ResponseWriter, r *http.Request, config ServerConfig,
 		}
 
 		// Store validation result in validation cache
-		validationKey := fmt.Sprintf(validationCacheKeyFormat, path)
+		validationKey := fmt.Sprintf("validation:%s", path)
 		config.ValidationCache.Put(validationKey, time.Now())
 		if config.LogRequests {
 			logging.Info("Stored validation result in cache for: %s", path)
@@ -767,6 +728,7 @@ func getFullContent(w http.ResponseWriter, r *http.Request, config ServerConfig,
 
 	// Create a buffer to store the content for caching
 	var buf bytes.Buffer
+	defer buf.Reset() // Ensure buffer is reset even on early returns.
 
 	// Use a MultiWriter to write to both the client and our buffer
 	mw := io.MultiWriter(w, &buf)
@@ -793,9 +755,6 @@ func getFullContent(w http.ResponseWriter, r *http.Request, config ServerConfig,
 
 	// Update cache in background with the captured content
 	go updateCache(config, path, bufBytes, lastModifiedTime, resp.Header)
-
-	// Reset buffer to help garbage collection
-	buf.Reset()
 }
 
 // setBasicHeaders sets basic headers when cached headers are not available
@@ -833,7 +792,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 
 		// Check if we have a recent validation result in the validation cache first
 		if useIfModifiedSince && r.Header.Get("If-Modified-Since") != "" {
-			validationKey := fmt.Sprintf(validationCacheKeyFormat, r.URL.Path)
+			validationKey := fmt.Sprintf("validation:%s", r.URL.Path)
 			isValid, _ := config.ValidationCache.Get(validationKey)
 			if isValid {
 				if config.LogRequests {
