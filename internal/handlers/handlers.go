@@ -185,7 +185,6 @@ func copyRelevantHeaders(upstreamReq *http.Request, originalReq *http.Request) {
 		"If-Modified-Since",
 		"If-None-Match",
 		"Range",
-		"Authorization",
 		"Cache-Control",
 	}
 
