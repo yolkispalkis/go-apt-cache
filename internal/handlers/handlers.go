@@ -42,6 +42,12 @@ var allowedResponseHeaders = map[string]bool{
 	"Content-Length": true,
 }
 
+// clientCache stores HTTP clients to avoid creating new ones for each request
+var clientCache = struct {
+	sync.RWMutex
+	clients map[int]*http.Client
+}{clients: make(map[int]*http.Client)}
+
 // filterAndSetHeaders sets only allowed headers from the source headers to response writer
 func filterAndSetHeaders(w http.ResponseWriter, headers http.Header) {
 	for header, values := range headers {
@@ -122,8 +128,27 @@ func getClient(config ServerConfig) *http.Client {
 	if config.Client != nil {
 		return config.Client
 	}
+
 	// Use a longer timeout for GET requests to handle large files
-	return utils.CreateHTTPClient(120) // Increased timeout to 120 seconds
+	timeout := 120 // Increased timeout to 120 seconds
+
+	// Check if we already have a client with this timeout
+	clientCache.RLock()
+	client, exists := clientCache.clients[timeout]
+	clientCache.RUnlock()
+
+	if exists {
+		return client
+	}
+
+	// Create a new client and cache it
+	client = utils.CreateHTTPClient(timeout)
+
+	clientCache.Lock()
+	clientCache.clients[timeout] = client
+	clientCache.Unlock()
+
+	return client
 }
 
 // getRemotePath converts local path to remote path
@@ -145,8 +170,23 @@ func fetchFromUpstream(config ServerConfig, r *http.Request, upstreamURL string)
 		return nil, err
 	}
 
-	// Copy relevant headers from original request
-	copyRelevantHeaders(req, r)
+	// For rarely changing files, we can minimize headers to reduce overhead
+	fileType := utils.GetFilePatternType(r.URL.Path)
+	if fileType == utils.TypeRarelyChanging {
+		// For rarely changing files, we only need essential headers
+		if r.Header.Get("Range") != "" {
+			req.Header.Set("Range", r.Header.Get("Range"))
+		}
+		if r.Header.Get("If-Modified-Since") != "" {
+			req.Header.Set("If-Modified-Since", r.Header.Get("If-Modified-Since"))
+		}
+		if r.Header.Get("If-None-Match") != "" {
+			req.Header.Set("If-None-Match", r.Header.Get("If-None-Match"))
+		}
+	} else {
+		// For frequently changing files, copy all relevant headers
+		copyRelevantHeaders(req, r)
+	}
 
 	// Add User-Agent header to identify our application
 	req.Header.Set("User-Agent", "Debian APT-HTTP/1.3 (2.2.4)")
@@ -319,6 +359,18 @@ func checkAndHandleIfModifiedSince(w http.ResponseWriter, r *http.Request, lastM
 
 // validateWithUpstream checks with the upstream server if the cached copy is still valid
 func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders http.Header, lastModified time.Time) (bool, error) {
+	// Check file type to determine if we need to validate with upstream
+	fileType := utils.GetFilePatternType(r.URL.Path)
+
+	// For rarely changing files (like .deb packages), we can skip validation
+	// They almost never change once published
+	if fileType == utils.TypeRarelyChanging {
+		if config.LogRequests {
+			logging.Info("Skipping upstream validation for rarely changing file: %s", r.URL.Path)
+		}
+		return true, nil
+	}
+
 	remotePath := getRemotePath(config, r.URL.Path)
 	// Ensure we don't have double slashes in the URL
 	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
@@ -388,6 +440,8 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 
 	// Validate with upstream if needed
 	fileType := utils.GetFilePatternType(r.URL.Path)
+
+	// Only validate frequently changing files with upstream
 	if useIfModifiedSince && fileType == utils.TypeFrequentlyChanging {
 		validationKey := fmt.Sprintf(validationCacheKeyFormat, r.URL.Path)
 		isValid, _ := config.ValidationCache.Get(validationKey)
@@ -423,6 +477,14 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
 					return true
 				}
+			}
+		}
+	} else if fileType == utils.TypeRarelyChanging {
+		// For rarely changing files, we can assume they're valid for much longer
+		// Just check if client needs a 304 Not Modified response
+		if r.Header.Get("If-Modified-Since") != "" {
+			if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
+				return true
 			}
 		}
 	}
