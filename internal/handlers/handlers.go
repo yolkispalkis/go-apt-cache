@@ -149,7 +149,7 @@ func fetchFromUpstream(config ServerConfig, r *http.Request, upstreamURL string)
 	copyRelevantHeaders(req, r)
 
 	// Add User-Agent header to identify our application
-	req.Header.Set("User-Agent", "Go-APT-Cache/1.0")
+	req.Header.Set("User-Agent", "Debian APT-HTTP/1.3 (2.2.4)")
 
 	// Set accept-encoding to support compression if client supports it
 	if r.Header.Get("Accept-Encoding") != "" {
@@ -334,7 +334,7 @@ func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders ht
 		lastModifiedStr = lastModified.Format(http.TimeFormat)
 	}
 	req.Header.Set("If-Modified-Since", lastModifiedStr)
-	req.Header.Set("User-Agent", "Go-APT-Cache/1.0")
+	req.Header.Set("User-Agent", "Debian APT-HTTP/1.3 (2.2.4)")
 
 	if config.LogRequests {
 		logging.Info("Validating cached file with upstream: %s", r.URL.Path)
@@ -542,7 +542,7 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfi
 	// Make a direct GET request to upstream
 	getReq, _ := http.NewRequest(http.MethodGet, upstreamURL, nil)
 	copyRelevantHeaders(getReq, r)
-	getReq.Header.Set("User-Agent", "Go-APT-Cache/1.0")
+	getReq.Header.Set("User-Agent", "Debian APT-HTTP/1.3 (2.2.4)")
 
 	getResp, err := client.Do(getReq)
 	if err != nil {
