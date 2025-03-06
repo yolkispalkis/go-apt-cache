@@ -132,7 +132,7 @@ func copyRelevantHeaders(upstreamReq *http.Request, originalReq *http.Request) {
 }
 
 func updateCache(config ServerConfig, path string, body []byte, lastModified time.Time, headers http.Header) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second) // Increased timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -143,23 +143,23 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 
 	go func() {
 		defer wg.Done()
-		logging.Debug("updateCache: Storing headers for %s", path) // More context
+		logging.Debug("updateCache: Storing headers for %s", path)
 		if err := config.HeaderCache.PutHeaders(path, headers); err != nil {
-			logging.Error("updateCache: Error storing headers for %s: %v", path, err) // More context
-			errChan <- fmt.Errorf("header error: %w", err)                            // Send error to channel
-			return                                                                    // Exit goroutine on error
+			logging.Error("updateCache: Error storing headers for %s: %v", path, err)
+			errChan <- fmt.Errorf("header error: %w", err) // Send error to channel
+			return                                         // Exit goroutine on error
 		}
 		logging.Debug("updateCache: Headers stored successfully for %s", path)
 	}()
 
 	go func() {
 		defer wg.Done()
-		logging.Debug("updateCache: Storing content for %s, size: %d", path, len(body)) // More context
+		logging.Debug("updateCache: Storing content for %s, size: %d", path, len(body))
 		if len(body) > 0 {
 			if err := config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified); err != nil {
-				logging.Error("updateCache: Error storing content for %s: %v", path, err) // More context
-				errChan <- fmt.Errorf("content error: %w", err)                           // Send error to channel
-				return                                                                    // Exit goroutine on error
+				logging.Error("updateCache: Error storing content for %s: %v", path, err)
+				errChan <- fmt.Errorf("content error: %w", err) // Send error to channel
+				return                                          // Exit goroutine on error
 			}
 			logging.Debug("updateCache: Content stored successfully for %s", path)
 		} else {
@@ -492,6 +492,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			return
 		}
 		go updateCache(config, cacheKey, buf.Bytes(), lastModifiedTime, resp.Header)
+		buf.Reset() // Clear the buffer after use
 
 	} else {
 		handleDirectUpstream(w, r, config)
@@ -529,11 +530,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			return
 		}
 
-		cacheKey := r.URL.Path
-		if config.LocalPath != "/" {
-			cacheKey = strings.TrimPrefix(cacheKey, config.LocalPath)
-		}
-		cacheKey = strings.TrimPrefix(cacheKey, "/")
+		cacheKey := r.URL.Path // Use the full path as the cache key
 
 		if useIfModifiedSince && r.Header.Get("If-Modified-Since") != "" {
 			validationKey := fmt.Sprintf("validation:%s", r.URL.Path) // Use r.URL.Path for validationKey
