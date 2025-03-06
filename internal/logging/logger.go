@@ -91,9 +91,8 @@ type Logger struct {
 }
 
 type loggerImpl struct {
-	out   io.Writer
-	mu    sync.Mutex
-	flags int
+	out io.Writer
+	mu  sync.Mutex
 }
 
 func (l *loggerImpl) Print(v ...interface{}) {
@@ -108,7 +107,7 @@ func (l *loggerImpl) Output(calldepth int, s string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	_, err := l.out.Write([]byte(s))
+	_, err := l.out.Write([]byte(s + "\n"))
 	return err
 }
 
