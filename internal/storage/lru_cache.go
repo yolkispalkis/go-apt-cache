@@ -284,6 +284,8 @@ func (c *LRUCache) Get(key string) (io.ReadCloser, int64, time.Time, error) {
 	element, exists := c.items[key]
 	c.mutex.RUnlock()
 
+	logging.Debug("LRUCache.Get called for key: %s, exists: %v", key, exists) // CONFIRM THIS
+
 	if !exists {
 		return nil, 0, time.Time{}, fmt.Errorf("item not found in cache: %s", key)
 	}
@@ -291,9 +293,11 @@ func (c *LRUCache) Get(key string) (io.ReadCloser, int64, time.Time, error) {
 	c.mutex.Lock()
 	c.lruList.MoveToFront(element)
 	item := element.Value.(*cacheItem)
+	logging.Debug("LRUCache.Get: Item last modified: %v", item.lastModified) // ADD THIS - Log Last Modified
 	c.mutex.Unlock()
 
 	filePath := c.fileOps.GetCacheFilePath(key)
+	logging.Debug("LRUCache.Get: File path: %s", filePath) // CONFIRM THIS
 
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -304,6 +308,7 @@ func (c *LRUCache) Get(key string) (io.ReadCloser, int64, time.Time, error) {
 			c.currentSize -= item.size
 			c.mutex.Unlock()
 		}
+		logging.Error("LRUCache.Get: Failed to open file: %v", err) // CONFIRM THIS
 		return nil, 0, time.Time{}, fmt.Errorf("failed to open file: %w", err)
 	}
 
@@ -315,9 +320,11 @@ func (c *LRUCache) Get(key string) (io.ReadCloser, int64, time.Time, error) {
 		delete(c.items, key)
 		c.currentSize -= item.size
 		c.mutex.Unlock()
+		logging.Error("LRUCache.Get: Failed to get file info: %v", err) // CONFIRM THIS
 		return nil, 0, time.Time{}, fmt.Errorf("failed to get file info: %w", err)
 	}
-
+	// Log file size
+	logging.Debug("LRUCache.Get: File size from stat: %d", info.Size())
 	if info.Size() == 0 {
 		file.Close()
 		c.mutex.Lock()
