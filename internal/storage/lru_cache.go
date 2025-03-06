@@ -292,7 +292,7 @@ func (c *LRUCache) Get(key string) (io.ReadCloser, int64, time.Time, error) {
 	element, exists := c.items[key]
 	c.mutex.RUnlock()
 
-	logging.Debug("LRUCache.Get called for key: %s, exists: %v", key, exists)
+	logging.Debug("LRUCache: Get key=%s (exists=%v)", key, exists)
 
 	if !exists {
 		return nil, 0, time.Time{}, fmt.Errorf("item not found in cache: %s", key)
@@ -301,11 +301,11 @@ func (c *LRUCache) Get(key string) (io.ReadCloser, int64, time.Time, error) {
 	c.mutex.Lock()
 	c.lruList.MoveToFront(element)
 	item := element.Value.(*cacheItem)
-	logging.Debug("LRUCache.Get: Item last modified: %v", item.lastModified)
+	logging.Debug("LRUCache: Item last modified=%v", item.lastModified)
 	c.mutex.Unlock()
 
 	filePath := c.fileOps.GetCacheFilePath(key)
-	logging.Debug("LRUCache.Get: File path: %s", filePath)
+	logging.Debug("LRUCache: File path=%s", filePath)
 
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -316,7 +316,7 @@ func (c *LRUCache) Get(key string) (io.ReadCloser, int64, time.Time, error) {
 			c.currentSize -= item.size
 			c.mutex.Unlock()
 		}
-		logging.Error("LRUCache.Get: Failed to open file: %v", err)
+		logging.Error("LRUCache: Failed to open file - %v", err)
 		return nil, 0, time.Time{}, fmt.Errorf("failed to open file: %w", err)
 	}
 
@@ -325,13 +325,13 @@ func (c *LRUCache) Get(key string) (io.ReadCloser, int64, time.Time, error) {
 		file.Close()
 		c.mutex.Lock()
 		c.lruList.Remove(element)
-		delete(c.items, key)
+		delete(c.items, item.key)
 		c.currentSize -= item.size
 		c.mutex.Unlock()
-		logging.Error("LRUCache.Get: Failed to get file info: %v", err)
+		logging.Error("LRUCache: Failed to get file info - %v", err)
 		return nil, 0, time.Time{}, fmt.Errorf("failed to get file info: %w", err)
 	}
-	logging.Debug("LRUCache.Get: File size from stat: %d", info.Size())
+	logging.Debug("LRUCache: File size=%d bytes", info.Size())
 	if info.Size() == 0 {
 		file.Close()
 		c.mutex.Lock()
@@ -452,8 +452,8 @@ func (c *LRUCache) makeRoom(size int64) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	logging.Debug("makeRoom called with size: %d", size)
-	logging.Debug("Current cache size: %d, Max size: %d", c.currentSize, c.maxSizeBytes)
+	logging.Debug("Cache: Making room for %d bytes", size)
+	logging.Debug("Cache: Current size=%d bytes, Max size=%d bytes", c.currentSize, c.maxSizeBytes)
 
 	if c.lruList.Len() == 0 || size <= 0 {
 		return
@@ -464,13 +464,13 @@ func (c *LRUCache) makeRoom(size int64) {
 	}
 
 	if c.currentSize+size <= c.maxSizeBytes {
-		logging.Debug("makeRoom: No need to free space.")
+		logging.Debug("Cache: No need to free space")
 		return
 	}
 
 	spaceToFree := (c.currentSize + size) - c.maxSizeBytes
 	spaceToFree += spaceToFree / 10
-	logging.Debug("makeRoom: spaceToFree calculated as: %d", spaceToFree)
+	logging.Debug("Cache: Need to free %d bytes", spaceToFree)
 
 	freedSpace := int64(0)
 
@@ -481,7 +481,7 @@ func (c *LRUCache) makeRoom(size int64) {
 		}
 
 		item := element.Value.(*cacheItem)
-		logging.Debug("makeRoom: Evicting item: %s, size: %d", item.key, item.size)
+		logging.Debug("Cache: Evicting item=%s (size=%d bytes)", item.key, item.size)
 
 		c.lruList.Remove(element)
 		delete(c.items, item.key)
@@ -493,7 +493,7 @@ func (c *LRUCache) makeRoom(size int64) {
 			logging.Warning("failed to remove file %s: %v", item.key, err)
 		}
 	}
-	logging.Debug("makeRoom: Total freed space: %d", freedSpace)
+	logging.Debug("Cache: Total freed space=%d bytes", freedSpace)
 }
 
 func (c *LRUCache) GetCacheStats() (int, int64, int64) {

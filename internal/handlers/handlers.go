@@ -142,28 +142,28 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 
 	go func() {
 		defer wg.Done()
-		logging.Debug("updateCache: Storing headers for %s", path)
+		logging.Debug("Cache update: Storing headers for %s", path)
 		if err := config.HeaderCache.PutHeaders(path, headers); err != nil {
-			logging.Error("updateCache: Error storing headers for %s: %v", path, err)
+			logging.Error("Cache update: Error storing headers - %v", err)
 			errChan <- fmt.Errorf("header error: %w", err)
 			return
 		}
-		logging.Debug("updateCache: Headers stored successfully for %s", path)
+		logging.Debug("Cache update: Headers stored successfully for %s", path)
 	}()
 
 	go func() {
 		defer wg.Done()
-		logging.Debug("updateCache: Storing content for %s, size: %d", path, len(body))
+		logging.Debug("Cache update: Storing content for %s (%d bytes)", path, len(body))
 		if len(body) > 0 {
 			if err := config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified); err != nil {
-				logging.Error("updateCache: Error storing content for %s: %v", path, err)
+				logging.Error("Cache update: Error storing content - %v", err)
 				errChan <- fmt.Errorf("content error: %w", err)
 				return
 			}
-			logging.Debug("updateCache: Content stored successfully for %s", path)
+			logging.Debug("Cache update: Content stored successfully for %s", path)
 		} else {
 			err := fmt.Errorf("empty body received for %s", path)
-			logging.Error("updateCache: %v", err)
+			logging.Error("Cache update: %v", err)
 			errChan <- err
 		}
 	}()
@@ -178,30 +178,30 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 	case <-done:
 		select {
 		case err := <-errChan:
-			logging.Error("updateCache: Error during update: %v", err)
+			logging.Error("Cache update: Error during update - %v", err)
 			_ = config.HeaderCache.PutHeaders(path, http.Header{})
 			if delErr := config.Cache.Put(path, bytes.NewReader([]byte{}), 0, time.Time{}); delErr != nil {
-				logging.Error("updateCache: failed to clear cache: %v", delErr)
+				logging.Error("Cache update: Failed to clear cache - %v", delErr)
 			}
 
 		default:
 			if config.LogRequests {
-				logging.Info("Stored headers in cache: %s", path)
-				logging.Info("Stored in cache: %s (%d bytes)", path, len(body))
+				logging.Info("Cache: Stored headers for %s", path)
+				logging.Info("Cache: Stored content for %s (%d bytes)", path, len(body))
 			}
 		}
 	case <-ctx.Done():
-		logging.Error("Cache update timed out for: %s", path)
+		logging.Error("Cache update: Timed out for %s", path)
 		_ = config.HeaderCache.PutHeaders(path, http.Header{})
 		if delErr := config.Cache.Put(path, bytes.NewReader([]byte{}), 0, time.Time{}); delErr != nil {
-			logging.Error("updateCache: failed to clear cache: %v", delErr)
+			logging.Error("Cache update: Failed to clear cache - %v", delErr)
 		}
 	}
 }
 
 func sendNotModified(w http.ResponseWriter, config ServerConfig, r *http.Request) {
 	if config.LogRequests {
-		logging.Info("Resource not modified: %s", r.URL.Path)
+		logging.Info("Response: Not modified %s", r.URL.Path)
 	}
 	w.WriteHeader(http.StatusNotModified)
 }
@@ -262,27 +262,27 @@ func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders ht
 	req.Header.Set("If-Modified-Since", lastModifiedStr)
 	req.Header.Set("User-Agent", defaultUserAgent)
 
-	logging.Debug("validateWithUpstream: Validating %s", r.URL.Path)
-	logging.Debug("validateWithUpstream: Upstream URL: %s", upstreamURL)
-	logging.Debug("validateWithUpstream: If-Modified-Since: %s", lastModifiedStr)
+	logging.Debug("Validation: Checking %s", r.URL.Path)
+	logging.Debug("Validation: Upstream URL=%s", upstreamURL)
+	logging.Debug("Validation: If-Modified-Since=%s", lastModifiedStr)
 
 	if config.LogRequests {
-		logging.Info("Validating cached file with upstream: %s", r.URL.Path)
+		logging.Info("Validation: Checking cached file with upstream: %s", r.URL.Path)
 	}
 
 	client := getClient(config)
 	resp, err := client.Do(req)
 	if err != nil {
-		logging.Error("validateWithUpstream: Error checking with upstream: %v", err)
+		logging.Error("Validation: Error checking with upstream - %v", err)
 		return false, fmt.Errorf("error checking with upstream: %w", err)
 	}
 	defer resp.Body.Close()
 
-	logging.Debug("validateWithUpstream: Upstream response status: %s", resp.Status)
+	logging.Debug("Validation: Upstream response status=%s", resp.Status)
 
 	if resp.StatusCode == http.StatusNotModified {
 		if config.LogRequests {
-			logging.Info("Upstream confirms cache is still valid: %s", r.URL.Path)
+			logging.Info("Validation: Cache is valid according to upstream: %s", r.URL.Path)
 		}
 		return true, nil
 	}
@@ -317,11 +317,10 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 
 	fileType := utils.GetFilePatternType(r.URL.Path)
 
-	if useIfModifiedSince && fileType == utils.TypeFrequentlyChanging {
-		remotePath := getRemotePath(config, r.URL.Path)
-		validationKey := fmt.Sprintf("validation:%s", remotePath)
+	if fileType == utils.TypeFrequentlyChanging && useIfModifiedSince {
+		validationKey := fmt.Sprintf("validation:%s", r.URL.Path)
 		isValid, _ := config.ValidationCache.Get(validationKey)
-		logging.Debug("handleCacheHit: Validation cache check for %s: isValid=%v", r.URL.Path, isValid)
+		logging.Debug("Cache hit: Validation check for %s (isValid=%v)", r.URL.Path, isValid)
 
 		if !isValid {
 			cacheIsValid, err := validateWithUpstream(config, r, cachedHeaders, lastModified)
@@ -434,7 +433,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		remotePath := getRemotePath(config, r.URL.Path)
 		upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
 
-		logging.Debug("handleCacheMiss: Cache miss for %s, fetching from upstream URL: %s", cacheKey, upstreamURL)
+		logging.Debug("handleCacheMiss: Fetching from upstream: %s → %s", cacheKey, upstreamURL)
 
 		client := getClient(config)
 		req, _ := http.NewRequest(r.Method, upstreamURL, nil)
@@ -553,7 +552,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			isValid, _ := config.ValidationCache.Get(validationKey)
 			if isValid {
 				if config.LogRequests {
-					logging.Info("Using cached validation result for: %s", r.URL.Path)
+					logging.Info("Validation: Using cached result for %s", r.URL.Path)
 				}
 				sendNotModified(w, config, r)
 				return
@@ -563,14 +562,14 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 		content, contentLength, lastModified, err := config.Cache.Get(cacheKey)
 		if err == nil {
 			if config.LogRequests {
-				logging.Info("Cache hit for: %s (key: %s)", r.URL.Path, cacheKey) // Keep original request in log
+				logging.Info("Cache hit: %s [key: %s]", r.URL.Path, cacheKey)
 			}
 			if handleCacheHit(w, r, config, content, contentLength, lastModified, useIfModifiedSince, cacheKey) {
 				return
 			}
 		} else {
 			if config.LogRequests {
-				logging.Info("Cache miss for: %s (key: %s), error: %v", r.URL.Path, cacheKey, err)
+				logging.Info("Cache miss: %s [key: %s] - %v", r.URL.Path, cacheKey, err)
 			}
 		}
 
