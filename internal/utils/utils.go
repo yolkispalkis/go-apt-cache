@@ -249,6 +249,9 @@ func SafeFilename(key string) string {
 	if dir != "" {
 		components := strings.Split(dir, "/")
 		for _, component := range components {
+			if component == "" {
+				continue
+			}
 			safe := strings.ReplaceAll(component, ":", "_")
 			safe = strings.ReplaceAll(safe, "?", "_")
 			safe = strings.ReplaceAll(safe, "*", "_")

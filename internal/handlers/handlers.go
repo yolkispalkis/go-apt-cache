@@ -525,7 +525,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			return
 		}
 
-		// Use the client's request path as the cache key
+		// Use the client's request path as the cache key, including the repository path prefix
 		cacheKey := strings.TrimPrefix(r.URL.Path, "/")
 		remotePath := getRemotePath(config, r.URL.Path) // Get path *without* prefix
 

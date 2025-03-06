@@ -45,7 +45,15 @@ func (f *FileOperations) getFilePath(key string, fileType FileType) string {
 		safePath += ".filecache"
 	}
 
-	return filepath.Join(f.basePath, safePath)
+	fullPath := filepath.Join(f.basePath, safePath)
+
+	// Ensure directory exists
+	dir := filepath.Dir(fullPath)
+	if err := utils.CreateDirectory(dir); err != nil {
+		logging.Error("Failed to create directory for cache file: %v", err)
+	}
+
+	return fullPath
 }
 
 func (f *FileOperations) GetFilePath(key string) string {
@@ -511,7 +519,7 @@ func (c *FileHeaderCache) GetHeaders(key string) (http.Header, error) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	filePath := filepath.Join(c.basePath, utils.SafeFilename(key)+".headercache")
+	filePath := c.fileOps.GetFilePath(key + ".headercache")
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -534,7 +542,7 @@ func (c *FileHeaderCache) PutHeaders(key string, headers http.Header) error {
 		return fmt.Errorf("failed to marshal headers: %w", err)
 	}
 
-	filePath := filepath.Join(c.basePath, utils.SafeFilename(key)+".headercache")
+	filePath := c.fileOps.GetFilePath(key + ".headercache")
 
 	dirPath := filepath.Dir(filePath)
 	if err := utils.CreateDirectory(dirPath); err != nil {
