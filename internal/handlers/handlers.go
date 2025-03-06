@@ -300,7 +300,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 
 	cachedHeaders, headerErr := config.HeaderCache.GetHeaders(cacheKey)
 	if headerErr != nil {
-		logging.Error("No cached headers found for %s: %v", r.URL.Path, headerErr)
+		logging.Error("No cached headers found for %s: %v", cacheKey, headerErr)
 		setBasicHeaders(w, r, nil, lastModified, useIfModifiedSince, config)
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
 
@@ -323,7 +323,8 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 	fileType := utils.GetFilePatternType(r.URL.Path)
 
 	if useIfModifiedSince && fileType == utils.TypeFrequentlyChanging {
-		validationKey := fmt.Sprintf("validation:%s", r.URL.Path) // Use r.URL.Path for validationKey
+		remotePath := getRemotePath(config, r.URL.Path)
+		validationKey := fmt.Sprintf("validation:%s", remotePath) // Use remotePath, not r.URL.Path
 		isValid, _ := config.ValidationCache.Get(validationKey)
 		logging.Debug("handleCacheHit: Validation cache check for %s: isValid=%v", r.URL.Path, isValid)
 
@@ -331,10 +332,10 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 			cacheIsValid, err := validateWithUpstream(config, r, cachedHeaders, lastModified)
 			if err != nil {
 				logging.Error("Error validating with upstream: %v", err)
-				return false
+				return false // Return false on validation failure
 			}
 			if cacheIsValid {
-				config.ValidationCache.Put(validationKey, time.Now()) // Use r.URL.Path for validationKey
+				config.ValidationCache.Put(validationKey, time.Now()) // Use remotePath, not r.URL.Path
 
 				if r.Header.Get("If-Modified-Since") != "" {
 					if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
@@ -345,10 +346,10 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				if config.LogRequests {
 					logging.Info("Content modified on upstream, invalidating cache: %s", r.URL.Path)
 				}
-				return false
+				return false // Explicitly return false if upstream says it's modified
 			}
-
 		} else {
+			// If the validation cache says it's valid, and we have If-Modified-Since, check it.
 			if r.Header.Get("If-Modified-Since") != "" {
 				if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
 					return true
@@ -356,6 +357,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 			}
 		}
 	} else if fileType == utils.TypeRarelyChanging {
+		// For rarely changing files, honor If-Modified-Since, but don't validate upstream.
 		if r.Header.Get("If-Modified-Since") != "" {
 			if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
 				return true
@@ -493,6 +495,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		}
 		go updateCache(config, cacheKey, buf.Bytes(), lastModifiedTime, resp.Header)
 		buf.Reset() // Clear the buffer after use
+		logging.Debug("handleCacheMiss: Cache miss for %s, fetching from upstream", cacheKey)
 
 	} else {
 		handleDirectUpstream(w, r, config)
@@ -531,9 +534,11 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 		}
 
 		cacheKey := r.URL.Path // Use the full path as the cache key
+		remotePath := getRemotePath(config, r.URL.Path)
 
 		if useIfModifiedSince && r.Header.Get("If-Modified-Since") != "" {
-			validationKey := fmt.Sprintf("validation:%s", r.URL.Path) // Use r.URL.Path for validationKey
+			// Use remotePath for validationKey, not r.URL.Path
+			validationKey := fmt.Sprintf("validation:%s", remotePath)
 			isValid, _ := config.ValidationCache.Get(validationKey)
 			if isValid {
 				if config.LogRequests {
@@ -547,7 +552,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 		content, contentLength, lastModified, err := config.Cache.Get(cacheKey)
 		if err == nil {
 			if config.LogRequests {
-				logging.Info("Cache hit for: %s", r.URL.Path)
+				logging.Info("Cache hit for: %s", r.URL.Path) // Keep original request in log
 			}
 			if handleCacheHit(w, r, config, content, contentLength, lastModified, useIfModifiedSince, cacheKey) {
 				return
