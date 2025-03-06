@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"crypto/md5"
 	"fmt"
 	"net"
 	"net/http"
@@ -11,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 )
 
@@ -231,35 +229,40 @@ func WrapError(message string, err error) error {
 
 func SafeFilename(key string) string {
 	key = filepath.ToSlash(key)
-
 	if key == "/" {
 		return "root"
 	}
-
 	key = strings.TrimPrefix(key, "/")
 
-	id := uuid.New().String()
+	dir, file := filepath.Split(key)
 
-	shortHash := fmt.Sprintf("%x", md5.Sum([]byte(key)))[:8]
+	safeFile := strings.ReplaceAll(file, ":", "_")
+	safeFile = strings.ReplaceAll(safeFile, "?", "_")
+	safeFile = strings.ReplaceAll(safeFile, "*", "_")
+	safeFile = strings.ReplaceAll(safeFile, "\"", "_")
+	safeFile = strings.ReplaceAll(safeFile, "<", "_")
+	safeFile = strings.ReplaceAll(safeFile, ">", "_")
+	safeFile = strings.ReplaceAll(safeFile, "|", "_")
+	safeFile = strings.ReplaceAll(safeFile, "\\", "_")
 
-	safeBaseName := fmt.Sprintf("%s-%s", shortHash, id)
-
-	components := strings.Split(key, "/")
-	safeComponents := make([]string, 0, len(components)+1)
-
-	for _, component := range components {
-		safe := strings.ReplaceAll(component, ":", "_")
-		safe = strings.ReplaceAll(safe, "?", "_")
-		safe = strings.ReplaceAll(safe, "*", "_")
-		safe = strings.ReplaceAll(safe, "\"", "_")
-		safe = strings.ReplaceAll(safe, "<", "_")
-		safe = strings.ReplaceAll(safe, ">", "_")
-		safe = strings.ReplaceAll(safe, "|", "_")
-		safe = strings.ReplaceAll(safe, "\\", "_")
-		safeComponents = append(safeComponents, safe)
+	var safeComponents []string
+	if dir != "" {
+		components := strings.Split(dir, "/")
+		for _, component := range components {
+			safe := strings.ReplaceAll(component, ":", "_")
+			safe = strings.ReplaceAll(safe, "?", "_")
+			safe = strings.ReplaceAll(safe, "*", "_")
+			safe = strings.ReplaceAll(safe, "\"", "_")
+			safe = strings.ReplaceAll(safe, "<", "_")
+			safe = strings.ReplaceAll(safe, ">", "_")
+			safe = strings.ReplaceAll(safe, "|", "_")
+			safe = strings.ReplaceAll(safe, "\\", "_")
+			safeComponents = append(safeComponents, safe)
+		}
 	}
 
-	safeComponents = append(safeComponents, safeBaseName)
-
-	return filepath.Join(safeComponents...)
+	if len(safeComponents) > 0 {
+		return filepath.Join(filepath.Join(safeComponents...), safeFile)
+	}
+	return safeFile
 }
