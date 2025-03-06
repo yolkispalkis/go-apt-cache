@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -115,8 +116,6 @@ func getRemotePath(config ServerConfig, localPath string) string {
 	return remotePath
 }
 
-// Removed fetchFromUpstream
-
 func copyRelevantHeaders(upstreamReq *http.Request, originalReq *http.Request) {
 	relevantHeaders := []string{
 		"If-Modified-Since",
@@ -132,7 +131,7 @@ func copyRelevantHeaders(upstreamReq *http.Request, originalReq *http.Request) {
 	}
 }
 
-func updateCache(config ServerConfig, path string, body io.Reader, lastModified time.Time, headers http.Header) {
+func updateCache(config ServerConfig, path string, body []byte, lastModified time.Time, headers http.Header) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -148,7 +147,11 @@ func updateCache(config ServerConfig, path string, body io.Reader, lastModified 
 
 	go func() {
 		defer wg.Done()
-		contentErr = config.Cache.Put(path, body, -1, lastModified)
+		if len(body) > 0 {
+			contentErr = config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified)
+		} else {
+			contentErr = fmt.Errorf("empty body received for %s", path)
+		}
 		if contentErr != nil {
 			logging.Error("Error storing in cache: %v", contentErr)
 		}
@@ -169,7 +172,7 @@ func updateCache(config ServerConfig, path string, body io.Reader, lastModified 
 		}
 
 		if contentErr == nil && config.LogRequests {
-			logging.Info("Stored in cache: %s", path)
+			logging.Info("Stored in cache: %s (%d bytes)", path, len(body))
 		}
 
 	case <-ctx.Done():
@@ -353,7 +356,7 @@ func handleDirectUpstream(w http.ResponseWriter, r *http.Request, config ServerC
 	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
 
 	client := getClient(config)
-	req, err := http.NewRequest(r.Method, upstreamURL, nil) // Use r.Method
+	req, err := http.NewRequest(r.Method, upstreamURL, nil)
 	if err != nil {
 		http.Error(w, "Error creating request to upstream", http.StatusInternalServerError)
 		logging.Error("Error creating request to upstream: %v", err)
@@ -429,31 +432,20 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			return
 		}
 
-		pipeReader, pipeWriter := io.Pipe()
+		var buf bytes.Buffer
+		mw := io.MultiWriter(w, &buf)
 
-		go func() {
-			_, err := io.Copy(pipeWriter, resp.Body)
-			if err != nil {
-				pipeWriter.CloseWithError(err)
-			} else {
-				pipeWriter.Close()
+		lastModifiedTime := time.Now()
+		if lastModifiedHeader := resp.Header.Get("Last-Modified"); lastModifiedHeader != "" {
+			if parsedTime, err := time.Parse(http.TimeFormat, lastModifiedHeader); err == nil {
+				lastModifiedTime = parsedTime
 			}
-		}()
-
-		go func() {
-			lastModifiedTime := time.Now()
-			if lastModifiedHeader := resp.Header.Get("Last-Modified"); lastModifiedHeader != "" {
-				if parsedTime, err := time.Parse(http.TimeFormat, lastModifiedHeader); err == nil {
-					lastModifiedTime = parsedTime
-				}
-			}
-			updateCache(config, path, pipeReader, lastModifiedTime, resp.Header)
-		}()
+		}
 
 		filterAndSetHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
 
-		_, err = io.Copy(w, pipeReader)
+		_, err = io.Copy(mw, resp.Body)
 		if err != nil {
 			if strings.Contains(err.Error(), "context canceled") ||
 				strings.Contains(err.Error(), "connection reset by peer") ||
@@ -464,14 +456,14 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			} else {
 				logging.Error("Error streaming response to client: %v", err)
 			}
+			return
 		}
+		go updateCache(config, path, buf.Bytes(), lastModifiedTime, resp.Header)
 
 	} else {
 		handleDirectUpstream(w, r, config)
 	}
 }
-
-// Removed handleHeadRequest
 
 func setBasicHeaders(w http.ResponseWriter, r *http.Request, _ http.Header, lastModified time.Time, useIfModifiedSince bool, config ServerConfig) {
 	if strings.HasSuffix(r.URL.Path, "/") {
