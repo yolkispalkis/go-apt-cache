@@ -231,7 +231,10 @@ func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	prefix := fmt.Sprintf("[%s] ", level.String())
+	// Добавляем дату и время
+	now := time.Now().Format("2006-01-02 15:04:05")
+	prefix := fmt.Sprintf("[%s] [%s] ", now, level.String())
+
 	var message string
 	if format == "" {
 		message = fmt.Sprint(args...)
