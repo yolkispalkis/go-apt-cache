@@ -434,6 +434,8 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		remotePath := getRemotePath(config, r.URL.Path)
 		upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
 
+		logging.Debug("handleCacheMiss: Cache miss for %s, fetching from upstream URL: %s", cacheKey, upstreamURL)
+
 		client := getClient(config)
 		req, _ := http.NewRequest(r.Method, upstreamURL, nil)
 		copyRelevantHeaders(req, r)
@@ -485,9 +487,9 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			}
 			return
 		}
+		logging.Debug("handleCacheMiss: Successfully fetched content for %s, storing in cache", cacheKey)
 		go updateCache(config, cacheKey, buf.Bytes(), lastModifiedTime, resp.Header)
 		buf.Reset() // Clear the buffer after use
-		logging.Debug("handleCacheMiss: Cache miss for %s, fetching from upstream", cacheKey)
 
 	} else {
 		handleDirectUpstream(w, r, config)
@@ -525,9 +527,25 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			return
 		}
 
-		// Use the client's request path as the cache key, including the repository path prefix
-		cacheKey := strings.TrimPrefix(r.URL.Path, "/")
-		remotePath := getRemotePath(config, r.URL.Path) // Get path *without* prefix
+		// Extract repository path from URL
+		repoPath := config.LocalPath
+		if !strings.HasSuffix(repoPath, "/") {
+			repoPath += "/"
+		}
+
+		// Use the repository prefix + client's request path as the cache key
+		// This ensures files from different repositories with the same path don't conflict
+		repoPrefix := strings.Trim(config.LocalPath, "/")
+		if repoPrefix == "" {
+			repoPrefix = "root"
+		}
+
+		// Create cache key with repository prefix
+		cacheKey := repoPrefix + "/" + strings.TrimPrefix(getRemotePath(config, r.URL.Path), "/")
+		logging.Debug("Using cache key: %s for path: %s (repo: %s)", cacheKey, r.URL.Path, repoPrefix)
+
+		// Get path *without* prefix for upstream requests
+		remotePath := getRemotePath(config, r.URL.Path)
 
 		if useIfModifiedSince && r.Header.Get("If-Modified-Since") != "" {
 			// Use remotePath for validationKey, not r.URL.Path
@@ -545,10 +563,14 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 		content, contentLength, lastModified, err := config.Cache.Get(cacheKey)
 		if err == nil {
 			if config.LogRequests {
-				logging.Info("Cache hit for: %s", r.URL.Path) // Keep original request in log
+				logging.Info("Cache hit for: %s (key: %s)", r.URL.Path, cacheKey) // Keep original request in log
 			}
 			if handleCacheHit(w, r, config, content, contentLength, lastModified, useIfModifiedSince, cacheKey) {
 				return
+			}
+		} else {
+			if config.LogRequests {
+				logging.Info("Cache miss for: %s (key: %s), error: %v", r.URL.Path, cacheKey, err)
 			}
 		}
 
