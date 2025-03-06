@@ -292,7 +292,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 	fileType := utils.GetFilePatternType(r.URL.Path)
 
 	if useIfModifiedSince && fileType == utils.TypeFrequentlyChanging {
-		validationKey := fmt.Sprintf("validation:%s", r.URL.Path)
+		validationKey := fmt.Sprintf("validation:%s", r.URL.Path) // Use r.URL.Path for validationKey
 		isValid, _ := config.ValidationCache.Get(validationKey)
 
 		if !isValid {
@@ -301,7 +301,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 				logging.Error("Error validating with upstream: %v", err)
 			} else {
 				if cacheIsValid {
-					config.ValidationCache.Put(validationKey, time.Now())
+					config.ValidationCache.Put(validationKey, time.Now()) // Use r.URL.Path for validationKey
 
 					if r.Header.Get("If-Modified-Since") != "" {
 						if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
@@ -503,7 +503,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 		cacheKey = strings.TrimPrefix(cacheKey, "/")
 
 		if useIfModifiedSince && r.Header.Get("If-Modified-Since") != "" {
-			validationKey := fmt.Sprintf("validation:%s", r.URL.Path)
+			validationKey := fmt.Sprintf("validation:%s", r.URL.Path) // Use r.URL.Path for validationKey
 			isValid, _ := config.ValidationCache.Get(validationKey)
 			if isValid {
 				if config.LogRequests {
