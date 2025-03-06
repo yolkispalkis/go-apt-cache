@@ -264,10 +264,10 @@ func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders ht
 	return false, nil
 }
 
-func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig, content io.ReadCloser, contentLength int64, lastModified time.Time, useIfModifiedSince bool) bool {
+func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig, content io.ReadCloser, contentLength int64, lastModified time.Time, useIfModifiedSince bool, cacheKey string) bool {
 	defer content.Close()
 
-	cachedHeaders, headerErr := config.HeaderCache.GetHeaders(r.URL.Path)
+	cachedHeaders, headerErr := config.HeaderCache.GetHeaders(cacheKey)
 	if headerErr != nil {
 		logging.Error("No cached headers found for %s: %v", r.URL.Path, headerErr)
 		setBasicHeaders(w, r, nil, lastModified, useIfModifiedSince, config)
@@ -396,7 +396,7 @@ func handleDirectUpstream(w http.ResponseWriter, r *http.Request, config ServerC
 	}
 }
 
-func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig, _ bool) {
+func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig, _ bool, cacheKey string) {
 	path := r.URL.Path
 
 	isFirstRequest := acquireLock(path)
@@ -458,7 +458,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			}
 			return
 		}
-		go updateCache(config, path, buf.Bytes(), lastModifiedTime, resp.Header)
+		go updateCache(config, cacheKey, buf.Bytes(), lastModifiedTime, resp.Header)
 
 	} else {
 		handleDirectUpstream(w, r, config)
@@ -496,6 +496,12 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			return
 		}
 
+		cacheKey := r.URL.Path
+		if config.LocalPath != "/" {
+			cacheKey = strings.TrimPrefix(cacheKey, config.LocalPath)
+		}
+		cacheKey = strings.TrimPrefix(cacheKey, "/")
+
 		if useIfModifiedSince && r.Header.Get("If-Modified-Since") != "" {
 			validationKey := fmt.Sprintf("validation:%s", r.URL.Path)
 			isValid, _ := config.ValidationCache.Get(validationKey)
@@ -508,17 +514,17 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			}
 		}
 
-		content, contentLength, lastModified, err := config.Cache.Get(r.URL.Path)
+		content, contentLength, lastModified, err := config.Cache.Get(cacheKey)
 		if err == nil {
 			if config.LogRequests {
 				logging.Info("Cache hit for: %s", r.URL.Path)
 			}
-			if handleCacheHit(w, r, config, content, contentLength, lastModified, useIfModifiedSince) {
+			if handleCacheHit(w, r, config, content, contentLength, lastModified, useIfModifiedSince, cacheKey) {
 				return
 			}
 		}
 
-		handleCacheMiss(w, r, config, useIfModifiedSince)
+		handleCacheMiss(w, r, config, useIfModifiedSince, cacheKey)
 	}
 }
 
