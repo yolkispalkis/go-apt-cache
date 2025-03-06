@@ -9,16 +9,15 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 )
 
-// CreateDirectory ensures a directory exists
 func CreateDirectory(path string) error {
-	// Create the directory with proper permissions
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", path, err)
 	}
 
-	// Verify the directory was created correctly
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to verify directory creation: %w", err)
@@ -31,9 +30,7 @@ func CreateDirectory(path string) error {
 	return nil
 }
 
-// CreateHTTPClient creates an HTTP client with optimized settings for high traffic
 func CreateHTTPClient(timeoutSeconds int) *http.Client {
-	// Create transport with optimized settings
 	transport := &http.Transport{
 		MaxIdleConns:        1000,
 		MaxIdleConnsPerHost: 200,
@@ -42,27 +39,20 @@ func CreateHTTPClient(timeoutSeconds int) *http.Client {
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
 		TLSHandshakeTimeout: 10 * time.Second,
-		// Optimize TCP connections
 		DialContext: (&net.Dialer{
 			Timeout:   15 * time.Second,
 			KeepAlive: 60 * time.Second,
 			DualStack: true,
 		}).DialContext,
-		// Enable TCP keepalives
-		DisableKeepAlives: false,
-		// Add response header timeout
+		DisableKeepAlives:     false,
 		ResponseHeaderTimeout: 30 * time.Second,
-		// Add write buffer size for faster uploads
-		WriteBufferSize: 64 * 1024,
-		// Add read buffer size for faster downloads
-		ReadBufferSize: 64 * 1024,
+		WriteBufferSize:       64 * 1024,
+		ReadBufferSize:        64 * 1024,
 	}
 
-	// Configure proxy from environment variables
 	proxyFunc := http.ProxyFromEnvironment
 	transport.Proxy = proxyFunc
 
-	// Create client with the transport
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   time.Duration(timeoutSeconds) * time.Second,
@@ -71,19 +61,13 @@ func CreateHTTPClient(timeoutSeconds int) *http.Client {
 	return client
 }
 
-// CreateHTTPClientWithProxy creates an HTTP client with optimized settings and specific proxy configuration
 func CreateHTTPClientWithProxy(timeoutSeconds int, proxyURL string) *http.Client {
-	// Create the base client
 	client := CreateHTTPClient(timeoutSeconds)
 
-	// If proxy URL is provided, configure it
 	if proxyURL != "" {
-		// Parse the proxy URL
 		parsedURL, err := url.Parse(proxyURL)
 		if err == nil {
-			// Get the transport
 			if transport, ok := client.Transport.(*http.Transport); ok {
-				// Set the proxy function
 				transport.Proxy = http.ProxyURL(parsedURL)
 			}
 		}
@@ -92,18 +76,15 @@ func CreateHTTPClientWithProxy(timeoutSeconds int, proxyURL string) *http.Client
 	return client
 }
 
-// NormalizeBasePath ensures a base path starts and ends with a slash
 func NormalizeBasePath(basePath string) string {
 	if basePath == "" {
 		return "/"
 	}
 
-	// Ensure basePath starts with a slash
 	if !strings.HasPrefix(basePath, "/") {
 		basePath = "/" + basePath
 	}
 
-	// Ensure basePath ends with a slash
 	if !strings.HasSuffix(basePath, "/") {
 		basePath = basePath + "/"
 	}
@@ -111,45 +92,35 @@ func NormalizeBasePath(basePath string) string {
 	return basePath
 }
 
-// NormalizeURL ensures a URL has the correct protocol and no trailing slash
 func NormalizeURL(url string) string {
-	// Add protocol if missing
 	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 		url = "http://" + url
 	}
 
-	// Remove trailing slash if present
 	url = strings.TrimSuffix(url, "/")
 
 	return url
 }
 
-// FileType represents different types of repository files
 type FileType int
 
 const (
-	// TypeFrequentlyChanging represents files that change frequently (e.g., metadata)
 	TypeFrequentlyChanging FileType = iota
-	// TypeRarelyChanging represents package files that rarely change
 	TypeRarelyChanging
 )
 
-// FilePattern represents a pattern for matching repository files
 type FilePattern struct {
 	Pattern string
 	Type    FileType
 }
 
-// ContentTypeMapping represents a mapping between file extensions and MIME types
 type ContentTypeMapping struct {
 	Extensions []string
 	MIMEType   string
 }
 
-// Common file patterns in Debian repositories
 var (
 	filePatterns = []FilePattern{
-		// Frequently changing files and critical metadata
 		{Pattern: "InRelease", Type: TypeFrequentlyChanging},
 		{Pattern: "Release.gpg", Type: TypeFrequentlyChanging},
 		{Pattern: "/Release", Type: TypeFrequentlyChanging},
@@ -171,7 +142,6 @@ var (
 		{Pattern: "dep11", Type: TypeFrequentlyChanging},
 		{Pattern: "icons-", Type: TypeFrequentlyChanging},
 
-		// Rarely changing files (lowest priority)
 		{Pattern: ".deb", Type: TypeRarelyChanging},
 		{Pattern: ".udeb", Type: TypeRarelyChanging},
 		{Pattern: ".dsc", Type: TypeRarelyChanging},
@@ -182,7 +152,6 @@ var (
 		{Pattern: ".changes", Type: TypeRarelyChanging},
 	}
 
-	// contentTypes maps file extensions to their MIME types
 	contentTypes = []ContentTypeMapping{
 		{Extensions: []string{".gz", ".gzip"}, MIMEType: "application/gzip"},
 		{Extensions: []string{".bz2"}, MIMEType: "application/x-bzip2"},
@@ -208,23 +177,19 @@ var (
 	}
 )
 
-// GetFilePatternType determines the type of file based on its path
 func GetFilePatternType(path string) FileType {
 	normalizedPath := filepath.ToSlash(path)
 
-	// Directories are considered frequently changing
 	if strings.HasSuffix(normalizedPath, "/") {
 		return TypeFrequentlyChanging
 	}
 
-	// Check patterns in order of priority
 	for _, pattern := range filePatterns {
 		if strings.Contains(normalizedPath, pattern.Pattern) {
 			return pattern.Type
 		}
 	}
 
-	// Check directory-based patterns
 	switch {
 	case strings.Contains(normalizedPath, "/dists/"):
 		return TypeFrequentlyChanging
@@ -235,18 +200,15 @@ func GetFilePatternType(path string) FileType {
 	}
 }
 
-// GetContentType determines the content type based on file extension
 func GetContentType(path string) string {
-	// Get file extension
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext == "" {
+		logging.Warning("Could not determine content type for: %s, no extension", path)
 		return "application/octet-stream"
 	}
 
-	// Remove the leading dot
 	ext = ext[1:]
 
-	// Check for known content types
 	for _, mapping := range contentTypes {
 		for _, extension := range mapping.Extensions {
 			if extension == ext {
@@ -254,12 +216,10 @@ func GetContentType(path string) string {
 			}
 		}
 	}
-
-	// Default content type
+	logging.Warning("Could not determine content type for: %s", path)
 	return "application/octet-stream"
 }
 
-// WrapError wraps an error with a message
 func WrapError(message string, err error) error {
 	if err == nil {
 		return nil

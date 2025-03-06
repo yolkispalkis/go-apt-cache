@@ -2,7 +2,6 @@ package logging
 
 import "strings"
 
-// ParseLogLevel converts a string log level to a LogLevel
 func ParseLogLevel(level string) LogLevel {
 	switch strings.ToLower(level) {
 	case "debug":
@@ -16,6 +15,6 @@ func ParseLogLevel(level string) LogLevel {
 	case "fatal":
 		return FATAL
 	default:
-		return INFO // Default to INFO level
+		return INFO
 	}
 }
