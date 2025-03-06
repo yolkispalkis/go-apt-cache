@@ -425,14 +425,13 @@ func handleDirectUpstream(w http.ResponseWriter, r *http.Request, config ServerC
 }
 
 func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig, _ bool, cacheKey string) {
-	path := r.URL.Path
-
-	isFirstRequest := acquireLock(path)
+	// Use the same cacheKey for locking
+	isFirstRequest := acquireLock(cacheKey)
 
 	if isFirstRequest {
-		defer releaseLock(path)
+		defer releaseLock(cacheKey)
 
-		remotePath := getRemotePath(config, path)
+		remotePath := getRemotePath(config, r.URL.Path)
 		upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
 
 		client := getClient(config)
@@ -479,7 +478,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 				strings.Contains(err.Error(), "connection reset by peer") ||
 				strings.Contains(err.Error(), "broken pipe") {
 				if config.LogRequests {
-					logging.Info("Client disconnected during download: %s", path)
+					logging.Info("Client disconnected during download: %s", cacheKey)
 				}
 			} else {
 				logging.Error("Error streaming response to client: %v", err)
@@ -526,7 +525,8 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			return
 		}
 
-		cacheKey := r.URL.Path                          // Use the full path as the cache key
+		// Use the client's request path as the cache key
+		cacheKey := strings.TrimPrefix(r.URL.Path, "/")
 		remotePath := getRemotePath(config, r.URL.Path) // Get path *without* prefix
 
 		if useIfModifiedSince && r.Header.Get("If-Modified-Since") != "" {
