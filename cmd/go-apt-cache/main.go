@@ -9,7 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,41 +32,31 @@ func (ci *CacheInitializer) Initialize() (storage.Cache, storage.HeaderCache, st
 		return storage.NewNoopCache(), storage.NewNoopHeaderCache(), storage.NewNoopValidationCache(), nil
 	}
 
-	cacheDir := cfg.Cache.Directory
-	if cacheDir == "" {
-		cacheDir = "./cache"
+	cacheDir, err := filepath.Abs(cfg.Cache.Directory)
+	if err != nil {
+		logging.Error("Failed to determine absolute path for cache directory: %v", err)
+		cacheDir = "./cache" // Fallback to default
 	}
 
-	if !filepath.IsAbs(cacheDir) {
-		absPath, err := filepath.Abs(cacheDir)
-		if err == nil {
-			cacheDir = absPath
-		}
-	}
+	logging.Info("Creating cache directory at %s", cacheDir)
 
 	if err := utils.CreateDirectory(cacheDir); err != nil {
 		return nil, nil, nil, utils.WrapError("failed to create cache directory", err)
 	}
 
-	logging.Info("Creating cache directory at %s", cacheDir)
-
 	var cache storage.Cache
 	var headerCache storage.HeaderCache
-	var err error
 
 	if cfg.Cache.LRU {
 		maxSizeBytes, err := utils.ParseSize(cfg.Cache.MaxSize)
 		if err != nil {
-			maxSizeBytes = 1024 * 1024 * 1024
-			logging.Warning("Invalid cache max size '%s', defaulting to 1GB", cfg.Cache.MaxSize)
+			maxSizeBytes = config.DefaultCacheMaxSize
+			logging.Warning("Invalid cache max size '%s' in config, defaulting to %s", cfg.Cache.MaxSize, utils.FormatSize(config.DefaultCacheMaxSize))
 		}
 
 		if cfg.Cache.CleanOnStart {
-			if err := os.RemoveAll(cacheDir); err != nil {
+			if err := storage.CleanCacheDirectory(cacheDir); err != nil {
 				return nil, nil, nil, utils.WrapError("failed to clean cache directory", err)
-			}
-			if err := os.MkdirAll(cacheDir, 0755); err != nil {
-				return nil, nil, nil, utils.WrapError("failed to recreate cache directory", err)
 			}
 		}
 
@@ -81,8 +71,8 @@ func (ci *CacheInitializer) Initialize() (storage.Cache, storage.HeaderCache, st
 		}
 
 		itemCount, currentSize, maxSize := lruCache.GetCacheStats()
-		logging.Info("LRU cache initialized with %d items, current size: %d bytes, max size: %d bytes",
-			itemCount, currentSize, maxSize)
+		logging.Info("LRU cache initialized with %d items, current size: %s, max size: %s",
+			itemCount, utils.FormatSize(currentSize), utils.FormatSize(maxSize))
 		logging.Info("Using LRU disk cache at %s (max size: %s)", cacheDir, cfg.Cache.MaxSize)
 
 		cache = lruCache
@@ -124,9 +114,9 @@ func (ss *ServerSetup) CreateServer() *http.Server {
 	server := &http.Server{
 		Addr:         ss.Config.Server.ListenAddress,
 		Handler:      handler,
-		ReadTimeout:  time.Duration(ss.Config.Server.Timeout) * time.Second,
-		WriteTimeout: time.Duration(ss.Config.Server.Timeout) * time.Second,
-		IdleTimeout:  time.Duration(ss.Config.Server.Timeout*2) * time.Second,
+		ReadTimeout:  time.Duration(ss.Config.Server.ReadTimeout) * time.Second,
+		WriteTimeout: time.Duration(ss.Config.Server.WriteTimeout) * time.Second,
+		IdleTimeout:  time.Duration(ss.Config.Server.IdleTimeout) * time.Second,
 	}
 
 	return server
@@ -206,6 +196,9 @@ func NewConfigManager() *ConfigManager {
 }
 
 func (cm *ConfigManager) LoadConfig() (config.Config, error) {
+	var cfg config.Config
+	var err error
+
 	if cm.CreateConfigFlag {
 		if _, err := os.Stat(cm.ConfigFile); os.IsNotExist(err) {
 			if err := config.CreateDefaultConfigFile(cm.ConfigFile); err != nil {
@@ -217,11 +210,12 @@ func (cm *ConfigManager) LoadConfig() (config.Config, error) {
 		}
 	}
 
-	cfg, err := config.LoadConfig(cm.ConfigFile)
+	cfg, err = config.LoadConfig(cm.ConfigFile)
 	if err != nil {
 		logging.Warning("Error loading config: %v", err)
 		logging.Info("Using default configuration")
 		cfg = config.DefaultConfig()
+		return cfg, fmt.Errorf("error loading config: %w", err)
 	}
 
 	cm.applyCommandLineFlags(&cfg)
@@ -295,72 +289,68 @@ func setupUnixSocket(server *http.Server, socketPath string, serverError chan<- 
 		return nil, fmt.Errorf("failed to create Unix socket listener: %w", err)
 	}
 
-	if err := os.Chmod(socketPath, 0666); err != nil {
+	permissions := server.Handler.(interface{ GetConfig() *config.Config }).GetConfig().Server.UnixSocketPermissions
+	if permissions == 0 {
+		permissions = 0666
+	}
+
+	if err := os.Chmod(socketPath, permissions); err != nil {
 		unixListener.Close()
 		return nil, fmt.Errorf("failed to set permissions on socket file: %w", err)
 	}
 
 	logging.Info("Server listening on Unix socket: %s", socketPath)
 
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		if err := server.Serve(unixListener); err != nil && err != http.ErrServerClosed {
 			logging.Error("Error starting server on Unix socket: %v", err)
 			serverError <- err
 		}
 	}()
 
+	go func() {
+		wg.Wait()
+		close(serverError)
+	}()
+
 	return unixListener, nil
 }
 
-func (sm *ServerManager) StartServer() error {
+func (sm *ServerManager) StartAndWait() error {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	serverError := make(chan error, 1)
 
-	_, ok := sm.Server.Handler.(*http.ServeMux)
-	if !ok {
-		if middleware, ok := sm.Server.Handler.(interface{ GetConfig() *config.Config }); ok {
-			cfg := middleware.GetConfig()
+	var unixListener net.Listener
+	var err error
 
-			if cfg != nil && cfg.Server.UnixSocketPath != "" {
-				_, err := setupUnixSocket(sm.Server, cfg.Server.UnixSocketPath, serverError)
-				if err != nil {
-					return fmt.Errorf("failed to setup Unix socket: %w", err)
-				}
+	if middleware, ok := sm.Server.Handler.(interface{ GetConfig() *config.Config }); ok {
+		if cfg := middleware.GetConfig(); cfg != nil && cfg.Server.UnixSocketPath != "" {
+			unixListener, err = setupUnixSocket(sm.Server, cfg.Server.UnixSocketPath, serverError)
+			if err != nil {
+				return fmt.Errorf("failed to setup Unix socket: %w", err)
+			}
 
-				if cfg.Server.ListenAddress != "" {
-					logging.Info("Server also listening on TCP: %s", sm.Server.Addr)
-				}
-
-				select {
-				case <-stop:
-					logging.Info("Shutting down server...")
-				case err := <-serverError:
-					return err
-				}
-
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-
-				if err := sm.Server.Shutdown(ctx); err != nil {
-					return fmt.Errorf("server shutdown failed: %w", err)
-				}
-
-				if err := os.Remove(cfg.Server.UnixSocketPath); err != nil {
-					logging.Warning("Failed to remove socket file: %v", err)
-				}
-
-				logging.Info("Server gracefully stopped")
-				return nil
+			if cfg.Server.ListenAddress != "" {
+				logging.Info("Server also listening on TCP: %s", sm.Server.Addr)
 			}
 		}
 	}
 
 	go func() {
-		logging.Info("Server listening on %s", sm.Server.Addr)
-		if err := sm.Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logging.Error("Error starting server: %v", err)
+		var err error
+		if unixListener != nil {
+			err = sm.Server.Serve(unixListener)
+		} else {
+			logging.Info("Server listening on %s", sm.Server.Addr)
+			err = sm.Server.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			logging.Error("Server error: %v", err)
 			serverError <- err
 		}
 	}()
@@ -379,15 +369,21 @@ func (sm *ServerManager) StartServer() error {
 		return fmt.Errorf("server shutdown failed: %w", err)
 	}
 
+	if middleware, ok := sm.Server.Handler.(interface{ GetConfig() *config.Config }); ok {
+		if cfg := middleware.GetConfig(); cfg != nil && cfg.Server.UnixSocketPath != "" {
+			if err := os.Remove(cfg.Server.UnixSocketPath); err != nil {
+				logging.Warning("Failed to remove socket file: %v", err)
+			}
+		}
+	}
+
 	logging.Info("Server gracefully stopped")
 	return nil
 }
 
 func main() {
-	configPath := flag.String("config", "config.json", "Path to configuration file")
-	flag.Parse()
-
-	cfg, err := config.LoadConfig(*configPath)
+	configManager := NewConfigManager()
+	cfg, err := configManager.LoadConfig()
 	if err != nil {
 		logging.Fatal("Error loading configuration: %v", err)
 	}
@@ -395,6 +391,7 @@ func main() {
 	if err := setupLogging(cfg); err != nil {
 		logging.Fatal("Error setting up logging: %v", err)
 	}
+	defer logging.Close()
 
 	cacheInitializer := &CacheInitializer{Config: cfg}
 	cache, headerCache, validationCache, err := cacheInitializer.Initialize()
@@ -404,16 +401,23 @@ func main() {
 
 	client := createHTTPClient(cfg)
 
-	server := createServer(cfg, cache, headerCache, validationCache, client)
+	serverSetup := &ServerSetup{
+		Config:          &cfg,
+		Cache:           cache,
+		HeaderCache:     headerCache,
+		ValidationCache: validationCache,
+		HTTPClient:      client,
+	}
 
-	go startServer(server, cfg)
+	server := serverSetup.CreateServer()
 
-	waitForShutdown(server)
+	serverManager := &ServerManager{Server: server}
+	if err := serverManager.StartAndWait(); err != nil {
+		logging.Fatal("Server failed: %v", err)
+	}
 }
 
 func setupLogging(cfg config.Config) error {
-	logging.Info("Setting up logging with level: %s", cfg.Logging.Level)
-
 	logConfig := logging.LogConfig{
 		FilePath:        cfg.Logging.FilePath,
 		DisableTerminal: cfg.Logging.DisableTerminal,
@@ -431,112 +435,4 @@ func createHTTPClient(cfg config.Config) *http.Client {
 	}
 
 	return utils.CreateHTTPClient(timeoutSeconds)
-}
-
-func createServer(cfg config.Config, cache storage.Cache, headerCache storage.HeaderCache, validationCache storage.ValidationCache, client *http.Client) *http.Server {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("OK"))
-	})
-
-	for _, repo := range cfg.Repositories {
-		if !repo.Enabled {
-			logging.Info("Skipping disabled repository: %s", repo.URL)
-			continue
-		}
-
-		basePath := repo.Path
-		if !strings.HasPrefix(basePath, "/") {
-			basePath = "/" + basePath
-		}
-		if !strings.HasSuffix(basePath, "/") {
-			basePath += "/"
-		}
-
-		upstreamURL := repo.URL
-		if !strings.HasSuffix(upstreamURL, "/") {
-			upstreamURL += "/"
-		}
-
-		logging.Info("Setting up mirror for %s at path %s", upstreamURL, basePath)
-
-		handler := handlers.NewRepositoryHandler(
-			upstreamURL,
-			cache,
-			headerCache,
-			validationCache,
-			client,
-			basePath,
-		)
-
-		mux.Handle(basePath, handler)
-	}
-	server := &http.Server{
-		Addr:         cfg.Server.ListenAddress,
-		Handler:      mux, // Используем ServeMux напрямую
-		ReadTimeout:  time.Duration(cfg.Server.Timeout) * time.Second,
-		WriteTimeout: time.Duration(cfg.Server.Timeout) * time.Second,
-		IdleTimeout:  time.Duration(cfg.Server.Timeout*2) * time.Second,
-	}
-
-	return server
-}
-func startServer(server *http.Server, cfg config.Config) {
-	serverError := make(chan error, 1)
-	go func() {
-		if cfg.Server.UnixSocketPath != "" {
-			_, err := setupUnixSocket(server, cfg.Server.UnixSocketPath, serverError)
-			if err != nil {
-				logging.Error("Failed to setup Unix socket: %v", err)
-				serverError <- err
-				return
-			}
-
-			if cfg.Server.ListenAddress != "" {
-				logging.Info("Server also listening on TCP: %s", server.Addr)
-				if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					logging.Error("Error starting server on TCP: %v", err)
-					serverError <- err
-				}
-			}
-		} else {
-			logging.Info("Server listening on: %s", server.Addr)
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				logging.Error("Error starting server: %v", err)
-				serverError <- err
-			}
-		}
-	}()
-	select {
-	case err := <-serverError:
-		logging.Fatal("Server error: %v", err)
-	case <-time.After(500 * time.Millisecond):
-		logging.Info("Server started successfully")
-	}
-}
-
-func waitForShutdown(server *http.Server) {
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	<-stop
-	logging.Info("Shutting down server...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		logging.Error("Server shutdown failed: %v", err)
-	}
-
-	if middleware, ok := server.Handler.(interface{ GetConfig() *config.Config }); ok {
-		if cfg := middleware.GetConfig(); cfg != nil && cfg.Server.UnixSocketPath != "" {
-			if err := os.Remove(cfg.Server.UnixSocketPath); err != nil {
-				logging.Warning("Failed to remove socket file: %v", err)
-			}
-		}
-	}
-
-	logging.Info("Server gracefully stopped")
 }

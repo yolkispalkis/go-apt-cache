@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -35,6 +36,9 @@ var clientCache = struct {
 	sync.RWMutex
 	clients map[int]*http.Client
 }{clients: make(map[int]*http.Client)}
+
+const defaultClientTimeout = 120
+const defaultUserAgent = "Debian APT-HTTP/1.3 (2.2.4)"
 
 func filterAndSetHeaders(w http.ResponseWriter, headers http.Header) {
 	for header, values := range headers {
@@ -88,7 +92,7 @@ func getClient(config ServerConfig) *http.Client {
 		return config.Client
 	}
 
-	timeout := 120
+	timeout := defaultClientTimeout
 
 	clientCache.RLock()
 	client, exists := clientCache.clients[timeout]
@@ -136,7 +140,7 @@ func fetchFromUpstream(config ServerConfig, r *http.Request, upstreamURL string)
 		copyRelevantHeaders(req, r)
 	}
 
-	req.Header.Set("User-Agent", "Debian APT-HTTP/1.3 (2.2.4)")
+	req.Header.Set("User-Agent", defaultUserAgent)
 
 	if r.Header.Get("Accept-Encoding") != "" {
 		req.Header.Set("Accept-Encoding", r.Header.Get("Accept-Encoding"))
@@ -159,6 +163,10 @@ func fetchFromUpstream(config ServerConfig, r *http.Request, upstreamURL string)
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			logging.Error("Timeout fetching from upstream: %v", err)
+			return nil, fmt.Errorf("timeout fetching from upstream: %w", err)
+		}
 		logging.Error("Error fetching from upstream: %v", err)
 		return nil, err
 	}
@@ -196,7 +204,11 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 
 	go func() {
 		defer wg.Done()
-		contentErr = config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified)
+		if len(body) > 0 {
+			contentErr = config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified)
+		} else {
+			contentErr = fmt.Errorf("empty body received for %s", path)
+		}
 	}()
 
 	done := make(chan struct{})
@@ -218,10 +230,8 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 		} else if config.LogRequests {
 			logging.Info("Stored in cache: %s (%d bytes)", path, len(body))
 		}
-		body = nil
 	case <-ctx.Done():
 		logging.Error("Cache update timed out for: %s", path)
-		body = nil
 	}
 }
 
@@ -286,7 +296,7 @@ func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders ht
 		lastModifiedStr = lastModified.Format(http.TimeFormat)
 	}
 	req.Header.Set("If-Modified-Since", lastModifiedStr)
-	req.Header.Set("User-Agent", "Debian APT-HTTP/1.3 (2.2.4)")
+	req.Header.Set("User-Agent", defaultUserAgent)
 
 	if config.LogRequests {
 		logging.Info("Validating cached file with upstream: %s", r.URL.Path)
@@ -436,7 +446,7 @@ func handleHeadRequest(w http.ResponseWriter, r *http.Request, config ServerConf
 	resp, err := fetchFromUpstream(config, r, upstreamURL)
 	if err != nil {
 		logging.Error("HEAD request failed, falling back to GET: %v", err)
-		getFullContent(w, r, config, upstreamURL, path)
+		handleGetRequest(w, r, config, upstreamURL, path)
 		return
 	}
 	defer resp.Body.Close()
@@ -458,8 +468,6 @@ func handleHeadRequest(w http.ResponseWriter, r *http.Request, config ServerConf
 	}
 
 	go updateCache(config, path, body, lastModifiedTime, resp.Header)
-
-	body = nil
 }
 
 func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfig, upstreamURL string, path string) {
@@ -467,7 +475,7 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfi
 
 	getReq, _ := http.NewRequest(http.MethodGet, upstreamURL, nil)
 	copyRelevantHeaders(getReq, r)
-	getReq.Header.Set("User-Agent", "Debian APT-HTTP/1.3 (2.2.4)")
+	getReq.Header.Set("User-Agent", defaultUserAgent)
 
 	getResp, err := client.Do(getReq)
 	if err != nil {
@@ -538,79 +546,6 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request, config ServerConfi
 	bufBytes := buf.Bytes()
 
 	go updateCache(config, path, bufBytes, lastModifiedTime, getResp.Header)
-}
-
-func getFullContent(w http.ResponseWriter, r *http.Request, config ServerConfig, upstreamURL string, path string) {
-	resp, err := fetchFromUpstream(config, r, upstreamURL)
-	if err != nil {
-		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
-		logging.Error("Error fetching from upstream: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotModified {
-		if config.LogRequests {
-			logging.Info("Upstream reports resource not modified: %s", path)
-		}
-
-		validationKey := fmt.Sprintf("validation:%s", path)
-		config.ValidationCache.Put(validationKey, time.Now())
-		if config.LogRequests {
-			logging.Info("Stored validation result in cache for: %s", path)
-		}
-
-		sendNotModified(w, config, r)
-		return
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		logging.Error("Unexpected status code from upstream: %d, URL: %s", resp.StatusCode, upstreamURL)
-
-		filterAndSetHeaders(w, resp.Header)
-
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-		return
-	}
-
-	lastModifiedTime := time.Now()
-	if lastModifiedHeader := resp.Header.Get("Last-Modified"); lastModifiedHeader != "" {
-		if parsedTime, err := time.Parse(http.TimeFormat, lastModifiedHeader); err == nil {
-			lastModifiedTime = parsedTime
-		}
-	}
-
-	filterAndSetHeaders(w, resp.Header)
-
-	if resp.ContentLength > 0 {
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", resp.ContentLength))
-	}
-
-	w.WriteHeader(http.StatusOK)
-
-	var buf bytes.Buffer
-	defer buf.Reset()
-
-	mw := io.MultiWriter(w, &buf)
-
-	_, err = io.Copy(mw, resp.Body)
-	if err != nil {
-		if strings.Contains(err.Error(), "context canceled") ||
-			strings.Contains(err.Error(), "connection reset by peer") ||
-			strings.Contains(err.Error(), "broken pipe") {
-			if config.LogRequests {
-				logging.Info("Client disconnected during download: %s", path)
-			}
-			return
-		} else {
-			logging.Error("Error streaming response to client: %v", err)
-		}
-	}
-
-	bufBytes := buf.Bytes()
-
-	go updateCache(config, path, bufBytes, lastModifiedTime, resp.Header)
 }
 
 func setBasicHeaders(w http.ResponseWriter, r *http.Request, _ http.Header, lastModified time.Time, useIfModifiedSince bool, config ServerConfig) {

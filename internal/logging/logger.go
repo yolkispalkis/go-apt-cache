@@ -64,6 +64,8 @@ const (
 	FATAL
 )
 
+const DefaultLogMaxSize = 10 * 1024 * 1024
+
 func (l LogLevel) String() string {
 	switch l {
 	case DEBUG:
@@ -155,7 +157,7 @@ func (l *Logger) setupFileWriter() error {
 
 	maxSize, err := ParseSize(l.config.MaxSize)
 	if err != nil {
-		maxSize = 10 * 1024 * 1024
+		maxSize = DefaultLogMaxSize
 		Warning("Invalid log max size '%s', defaulting to 10MB", l.config.MaxSize)
 	}
 
@@ -231,7 +233,6 @@ func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Добавляем дату и время
 	now := time.Now().Format("2006-01-02 15:04:05")
 	prefix := fmt.Sprintf("[%s] [%s] ", now, level.String())
 

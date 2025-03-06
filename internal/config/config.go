@@ -3,10 +3,10 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 
-	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/utils"
 )
 
@@ -33,10 +33,14 @@ type LoggingConfig struct {
 }
 
 type ServerConfig struct {
-	ListenAddress  string `json:"listenAddress"`
-	UnixSocketPath string `json:"unixSocketPath"`
-	LogRequests    bool   `json:"logRequests"`
-	Timeout        int    `json:"timeout"`
+	ListenAddress         string      `json:"listenAddress"`
+	UnixSocketPath        string      `json:"unixSocketPath"`
+	UnixSocketPermissions os.FileMode `json:"unixSocketPermissions"`
+	LogRequests           bool        `json:"logRequests"`
+	Timeout               int         `json:"timeout"` // General timeout, kept for backward compatibility
+	ReadTimeout           int         `json:"readTimeout"`
+	WriteTimeout          int         `json:"writeTimeout"`
+	IdleTimeout           int         `json:"idleTimeout"`
 }
 
 type Config struct {
@@ -47,13 +51,28 @@ type Config struct {
 	Version      string        `json:"version"`
 }
 
+const (
+	DefaultListenAddress = ":8080"
+	DefaultCacheMaxSize  = 1024 * 1024 * 1024 // 1GB
+	DefaultReadTimeout   = 30
+	DefaultWriteTimeout  = 60
+	DefaultIdleTimeout   = 120
+	DefaultLogLevel      = "info"
+	DefaultLogMaxSize    = "10MB"
+	DefaultTimeout       = 60
+)
+
 func DefaultConfig() Config {
 	return Config{
 		Server: ServerConfig{
-			ListenAddress:  ":8080",
-			UnixSocketPath: "",
-			LogRequests:    true,
-			Timeout:        30,
+			ListenAddress:         DefaultListenAddress,
+			UnixSocketPath:        "",
+			UnixSocketPermissions: 0666,
+			LogRequests:           true,
+			Timeout:               DefaultTimeout,
+			ReadTimeout:           DefaultReadTimeout,
+			WriteTimeout:          DefaultWriteTimeout,
+			IdleTimeout:           DefaultIdleTimeout,
 		},
 		Cache: CacheConfig{
 			Directory:          "./cache",
@@ -66,8 +85,8 @@ func DefaultConfig() Config {
 		Logging: LoggingConfig{
 			FilePath:        "./logs/go-apt-cache.log",
 			DisableTerminal: false,
-			MaxSize:         "10MB",
-			Level:           "info",
+			MaxSize:         DefaultLogMaxSize,
+			Level:           DefaultLogLevel,
 		},
 		Repositories: []Repository{
 			{
@@ -82,43 +101,17 @@ func DefaultConfig() Config {
 
 func LoadConfig(path string) (Config, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		logging.Warning("Config file %s does not exist", path)
 		return DefaultConfig(), fmt.Errorf("config file %s does not exist", path)
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		logging.Warning("Error reading config file: %v", err)
 		return DefaultConfig(), fmt.Errorf("error reading config file: %w", err)
 	}
 
 	var config Config
 	if err := json.Unmarshal(data, &config); err != nil {
-		logging.Warning("Error parsing config file: %v", err)
 		return DefaultConfig(), fmt.Errorf("error parsing config file: %w", err)
-	}
-
-	if config.Server.Timeout <= 0 {
-		config.Server.Timeout = 30
-	}
-
-	if config.Logging.MaxSize == "" {
-		config.Logging.MaxSize = "10MB"
-	}
-	if config.Logging.Level == "" {
-		config.Logging.Level = "info"
-	}
-
-	var enabledRepos []Repository
-	for _, repo := range config.Repositories {
-		if repo.Enabled {
-			enabledRepos = append(enabledRepos, repo)
-		}
-	}
-	config.Repositories = enabledRepos
-
-	if config.Version == "" {
-		config.Version = "1.0.0"
 	}
 
 	return config, nil
@@ -161,10 +154,18 @@ func ValidateConfig(config Config) error {
 		if config.Cache.Directory == "" {
 			return fmt.Errorf("cache directory not specified")
 		}
+
+		if _, err := utils.ParseSize(config.Cache.MaxSize); err != nil {
+			return fmt.Errorf("invalid cache max size: %s", config.Cache.MaxSize)
+		}
 	}
 
-	if config.Server.ListenAddress == "" {
-		return fmt.Errorf("listen address not specified")
+	if config.Server.ListenAddress == "" && config.Server.UnixSocketPath == "" {
+		return fmt.Errorf("neither listen address nor unix socket path specified")
+	}
+
+	if _, _, err := net.SplitHostPort(config.Server.ListenAddress); config.Server.ListenAddress != "" && err != nil {
+		return fmt.Errorf("invalid listen address: %s", config.Server.ListenAddress)
 	}
 
 	return nil

@@ -2,7 +2,6 @@ package storage
 
 import (
 	"container/list"
-	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,7 +39,7 @@ func (f *FileOperations) EnsureDirectoryExists(relativePath string) error {
 }
 
 func (f *FileOperations) getFilePath(key string, fileType FileType) string {
-	safePath := safeFilename(key)
+	safePath := utils.SafeFilename(key)
 
 	if fileType == CacheFile {
 		safePath += ".filecache"
@@ -500,7 +499,7 @@ func (c *FileHeaderCache) GetHeaders(key string) (http.Header, error) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	filePath := filepath.Join(c.basePath, safeFilename(key)+".headercache")
+	filePath := filepath.Join(c.basePath, utils.SafeFilename(key)+".headercache")
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -523,7 +522,7 @@ func (c *FileHeaderCache) PutHeaders(key string, headers http.Header) error {
 		return fmt.Errorf("failed to marshal headers: %w", err)
 	}
 
-	filePath := filepath.Join(c.basePath, safeFilename(key)+".headercache")
+	filePath := filepath.Join(c.basePath, utils.SafeFilename(key)+".headercache")
 
 	dirPath := filepath.Dir(filePath)
 	if err := utils.CreateDirectory(dirPath); err != nil {
@@ -543,34 +542,23 @@ func (c *FileHeaderCache) PutHeaders(key string, headers http.Header) error {
 	return nil
 }
 
-func safeFilename(key string) string {
-	if len(key) > 255 {
-		hash := md5.Sum([]byte(key))
-		return fmt.Sprintf("%x", hash)
+func CleanCacheDirectory(dirPath string) error {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return fmt.Errorf("failed to read directory: %w", err)
 	}
 
-	key = filepath.ToSlash(key)
-
-	if key == "/" {
-		return "root"
+	for _, entry := range entries {
+		entryPath := filepath.Join(dirPath, entry.Name())
+		if entry.IsDir() {
+			if err := CleanCacheDirectory(entryPath); err != nil {
+				logging.Warning("failed to clean subdirectory %s: %v", entryPath, err)
+			}
+		} else if strings.HasSuffix(entry.Name(), ".filecache") || strings.HasSuffix(entry.Name(), ".headercache") {
+			if err := os.Remove(entryPath); err != nil {
+				logging.Warning("failed to remove file %s: %v", entryPath, err)
+			}
+		}
 	}
-
-	key = strings.TrimPrefix(key, "/")
-
-	components := strings.Split(key, "/")
-
-	for i, component := range components {
-		safe := strings.ReplaceAll(component, ":", "_")
-		safe = strings.ReplaceAll(safe, "?", "_")
-		safe = strings.ReplaceAll(safe, "*", "_")
-		safe = strings.ReplaceAll(safe, "\"", "_")
-		safe = strings.ReplaceAll(safe, "<", "_")
-		safe = strings.ReplaceAll(safe, ">", "_")
-		safe = strings.ReplaceAll(safe, "|", "_")
-		safe = strings.ReplaceAll(safe, "\\", "_")
-
-		components[i] = safe
-	}
-
-	return filepath.Join(components...)
+	return nil
 }

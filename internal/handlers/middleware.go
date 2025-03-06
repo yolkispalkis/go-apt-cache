@@ -44,10 +44,9 @@ func (lm *LoggingMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lm.next.ServeHTTP(lrw, r)
 
 	duration := time.Since(start)
-	// Добавляем дату и время
 	now := time.Now().Format("2006-01-02 15:04:05")
 	logging.Info("%s %s %s %s %d %d %s",
-		now, // Добавили дату и время
+		now,
 		r.RemoteAddr,
 		r.Method,
 		r.URL.Path,
