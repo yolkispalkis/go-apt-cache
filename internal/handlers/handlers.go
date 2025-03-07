@@ -496,6 +496,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 					return
 				}
 			} else {
+				logging.Info("Validation cache: File %s is valid", validationKey)
 				content, _, lastModified, err := config.Cache.Get(cacheKey)
 				if err == nil {
 					if handleCacheHit(w, r, config, content, lastModified, cacheKey) {
