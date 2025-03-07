@@ -482,6 +482,7 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 					}
 					if cacheIsValid {
 						config.ValidationCache.Put(validationKey, time.Now())
+						logging.Info("Validation cache: Updated for %s", validationKey)
 						if handleCacheHit(w, r, config, content, lastModified, cacheKey) {
 							return
 						}
