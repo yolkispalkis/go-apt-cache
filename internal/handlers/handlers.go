@@ -122,8 +122,13 @@ func getRemotePath(config ServerConfig, localPath string) string {
 	remotePath := strings.TrimPrefix(normalizedPath, strings.Trim(config.LocalPath, "/"))
 	remotePath = strings.TrimPrefix(remotePath, "/")
 
-	// Restore trailing slash if original path had it
-	if endsWithSlash {
+	// Handle empty path
+	if remotePath == "" && endsWithSlash {
+		return "/"
+	}
+
+	// Restore trailing slash if original path had it and we have a non-empty path
+	if endsWithSlash && remotePath != "" {
 		remotePath = remotePath + "/"
 	}
 
@@ -143,11 +148,16 @@ func getCacheKey(config ServerConfig, localPath string) string {
 	// Get remote path without repository prefix
 	remotePath := getRemotePath(config, localPath)
 
+	// Handle empty path
+	if remotePath == "/" {
+		return repoPrefix + "/"
+	}
+
 	// Combine them ensuring single slash between parts
 	key := repoPrefix + "/" + remotePath
 
-	// Restore trailing slash if original path had it
-	if endsWithSlash && !strings.HasSuffix(key, "/") {
+	// Restore trailing slash if original path had it and we have a non-empty path
+	if endsWithSlash && remotePath != "" && !strings.HasSuffix(key, "/") {
 		key = key + "/"
 	}
 
