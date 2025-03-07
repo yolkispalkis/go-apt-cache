@@ -472,6 +472,12 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			return
 		}
 
+		// Directly handle directory requests without caching
+		if strings.HasSuffix(r.URL.Path, "/") {
+			handleDirectUpstream(w, r, config)
+			return
+		}
+
 		cacheKey := getCacheKey(config, r.URL.Path)
 		logging.Debug("Using cache key: %s for path: %s (repo: %s)",
 			cacheKey, r.URL.Path, strings.Trim(config.LocalPath, "/"))
