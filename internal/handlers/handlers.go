@@ -110,6 +110,9 @@ func getClient(config ServerConfig) *http.Client {
 }
 
 func getRemotePath(config ServerConfig, localPath string) string {
+	// Save if path ends with slash
+	endsWithSlash := strings.HasSuffix(localPath, "/")
+
 	// Normalize path by removing multiple slashes and ensuring consistent format
 	normalizedPath := strings.Join(strings.FieldsFunc(localPath, func(r rune) bool {
 		return r == '/'
@@ -119,10 +122,18 @@ func getRemotePath(config ServerConfig, localPath string) string {
 	remotePath := strings.TrimPrefix(normalizedPath, strings.Trim(config.LocalPath, "/"))
 	remotePath = strings.TrimPrefix(remotePath, "/")
 
+	// Restore trailing slash if original path had it
+	if endsWithSlash {
+		remotePath = remotePath + "/"
+	}
+
 	return remotePath
 }
 
 func getCacheKey(config ServerConfig, localPath string) string {
+	// Save if path ends with slash
+	endsWithSlash := strings.HasSuffix(localPath, "/")
+
 	// Get repository prefix
 	repoPrefix := strings.Trim(config.LocalPath, "/")
 	if repoPrefix == "" {
@@ -133,7 +144,14 @@ func getCacheKey(config ServerConfig, localPath string) string {
 	remotePath := getRemotePath(config, localPath)
 
 	// Combine them ensuring single slash between parts
-	return repoPrefix + "/" + remotePath
+	key := repoPrefix + "/" + remotePath
+
+	// Restore trailing slash if original path had it
+	if endsWithSlash && !strings.HasSuffix(key, "/") {
+		key = key + "/"
+	}
+
+	return key
 }
 
 func updateCache(config ServerConfig, path string, body []byte, lastModified time.Time, headers http.Header) {
@@ -418,8 +436,14 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 
 func handleDirectUpstream(w http.ResponseWriter, r *http.Request, config ServerConfig) {
 	path := r.URL.Path
+	if path == "" {
+		path = "/"
+	}
+
 	remotePath := getRemotePath(config, path)
 	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
+
+	logging.Debug("Direct upstream request: %s → %s", path, upstreamURL)
 
 	client := getClient(config)
 	req, err := http.NewRequest(r.Method, upstreamURL, nil)
@@ -472,8 +496,9 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			return
 		}
 
-		// Directly handle directory requests without caching
-		if strings.HasSuffix(r.URL.Path, "/") {
+		// Check if this is a directory request (either root or ends with /)
+		if r.URL.Path == "" || r.URL.Path == "/" || strings.HasSuffix(r.URL.Path, "/") {
+			logging.Info("Directory request detected, bypassing cache: %s", r.URL.Path)
 			handleDirectUpstream(w, r, config)
 			return
 		}
