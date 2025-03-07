@@ -406,7 +406,9 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 
 		logging.Debug("handleCacheMiss: Successfully fetched content for %s, storing in cache", cacheKey)
 		go updateCache(config, cacheKey, buf.Bytes(), lastModifiedTime, resp.Header)
-		go config.ValidationCache.Put(fmt.Sprintf("validation:%s", cacheKey), time.Now())
+		validationKey := fmt.Sprintf("validation:%s", cacheKey)
+		go config.ValidationCache.Put(validationKey, time.Now())
+		logging.Debug("Cache validation: Updated key %s", validationKey)
 		buf.Reset()
 
 	} else {
@@ -475,12 +477,13 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			cacheKey, r.URL.Path, strings.Trim(config.LocalPath, "/"))
 
 		validationKey := fmt.Sprintf("validation:%s", cacheKey)
+		logging.Debug("Using validation key: %s", validationKey)
 
 		fileType := utils.GetFilePatternType(r.URL.Path)
 		if fileType == utils.TypeFrequentlyChanging {
-			isValid, _ := config.ValidationCache.Get(validationKey)
+			isValid, lastValidated := config.ValidationCache.Get(validationKey)
 			if isValid {
-				logging.Info("Validation cache: File %s is valid", validationKey)
+				logging.Info("Validation cache: File %s is valid (last validated: %v)", validationKey, lastValidated)
 				content, _, lastModified, err := config.Cache.Get(cacheKey)
 				if err == nil {
 					if handleCacheHit(w, r, config, content, lastModified, cacheKey) {
