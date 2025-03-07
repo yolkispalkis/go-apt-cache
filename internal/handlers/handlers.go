@@ -110,6 +110,11 @@ func getClient(config ServerConfig) *http.Client {
 }
 
 func getRemotePath(config ServerConfig, localPath string) string {
+	// Handle empty or root path
+	if localPath == "" || localPath == "/" {
+		return "/"
+	}
+
 	// Save if path ends with slash
 	endsWithSlash := strings.HasSuffix(localPath, "/")
 
@@ -119,16 +124,20 @@ func getRemotePath(config ServerConfig, localPath string) string {
 	}), "/")
 
 	// Remove repository prefix
-	remotePath := strings.TrimPrefix(normalizedPath, strings.Trim(config.LocalPath, "/"))
+	repoPrefix := strings.Trim(config.LocalPath, "/")
+	remotePath := strings.TrimPrefix(normalizedPath, repoPrefix)
 	remotePath = strings.TrimPrefix(remotePath, "/")
 
-	// Handle empty path
-	if remotePath == "" && endsWithSlash {
-		return "/"
+	// Handle empty path after prefix removal
+	if remotePath == "" {
+		if endsWithSlash {
+			return "/"
+		}
+		return ""
 	}
 
-	// Restore trailing slash if original path had it and we have a non-empty path
-	if endsWithSlash && remotePath != "" {
+	// Restore trailing slash if original path had it
+	if endsWithSlash {
 		remotePath = remotePath + "/"
 	}
 
@@ -451,12 +460,22 @@ func handleDirectUpstream(w http.ResponseWriter, r *http.Request, config ServerC
 	}
 
 	remotePath := getRemotePath(config, path)
-	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
 
-	logging.Debug("Direct upstream request: %s → %s", path, upstreamURL)
+	// Remove trailing slash from upstream URL if it exists
+	upstreamURL := strings.TrimSuffix(config.UpstreamURL, "/")
+
+	// Ensure remotePath starts with slash if not empty
+	if remotePath != "" && !strings.HasPrefix(remotePath, "/") {
+		remotePath = "/" + remotePath
+	}
+
+	// Combine URLs ensuring single slash between parts
+	fullURL := upstreamURL + remotePath
+
+	logging.Debug("Direct upstream request: %s → %s", path, fullURL)
 
 	client := getClient(config)
-	req, err := http.NewRequest(r.Method, upstreamURL, nil)
+	req, err := http.NewRequest(r.Method, fullURL, nil)
 	if err != nil {
 		http.Error(w, "Error creating request to upstream", http.StatusInternalServerError)
 		logging.Error("Error creating request to upstream: %v", err)
