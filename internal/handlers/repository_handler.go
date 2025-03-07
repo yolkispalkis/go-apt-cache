@@ -3,6 +3,7 @@ package handlers
 import (
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/storage"
@@ -29,6 +30,7 @@ func NewRepositoryHandler(
 	)
 
 	config.LocalPath = localPath
+	config.ValidationCache.SetTTL(time.Duration(config.Config.Cache.ValidationCacheTTL) * time.Second)
 
 	return &RepositoryHandler{
 		config: config,
@@ -43,13 +45,11 @@ func (rh *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	logging.Info("Repository handler processing: %s", requestPath)
 
-	// Extract repository name from localPath
 	repoName := strings.Trim(rh.config.LocalPath, "/")
 	if repoName == "" {
 		repoName = "root"
 	}
 
-	// Prepend repository name to the request path for logging
 	logging.Info("Repository: %s, Path: %s", repoName, requestPath)
 
 	handler := HandleRequest(rh.config, true)

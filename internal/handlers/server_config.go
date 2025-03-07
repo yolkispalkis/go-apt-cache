@@ -15,7 +15,7 @@ type ServerConfig struct {
 	ValidationCache storage.ValidationCache
 	Client          *http.Client
 	LogRequests     bool
-	Config          *config.Config
+	Config          *config.Config // Keep the global config for access to other settings
 }
 
 func NewServerConfig() ServerConfig {
@@ -24,11 +24,12 @@ func NewServerConfig() ServerConfig {
 	}
 }
 
+// NewServerConfigFromGlobalConfig is a helper to create a ServerConfig from the global config.
 func NewServerConfigFromGlobalConfig(cfg *config.Config, client *http.Client) ServerConfig {
 	return ServerConfig{
 		LogRequests: cfg.Server.LogRequests,
 		Client:      client,
-		Config:      cfg,
+		Config:      cfg, // Store the global config here.
 	}
 }
 
@@ -46,5 +47,6 @@ func NewRepositoryServerConfig(
 		ValidationCache: validationCache,
 		Client:          client,
 		LogRequests:     true,
+		Config:          &config.Config{}, // Initialize Config field
 	}
 }

@@ -116,21 +116,6 @@ func getRemotePath(config ServerConfig, localPath string) string {
 	return remotePath
 }
 
-func copyRelevantHeaders(upstreamReq *http.Request, originalReq *http.Request) {
-	relevantHeaders := []string{
-		"If-Modified-Since",
-		"If-None-Match",
-		"Range",
-		"Cache-Control",
-	}
-
-	for _, header := range relevantHeaders {
-		if value := originalReq.Header.Get(header); value != "" {
-			upstreamReq.Header.Set(header, value)
-		}
-	}
-}
-
 func updateCache(config ServerConfig, path string, body []byte, lastModified time.Time, headers http.Header) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -199,13 +184,6 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 	}
 }
 
-func sendNotModified(w http.ResponseWriter, config ServerConfig, r *http.Request) {
-	if config.LogRequests {
-		logging.Info("Response: Not modified %s", r.URL.Path)
-	}
-	w.WriteHeader(http.StatusNotModified)
-}
-
 func checkAndHandleIfModifiedSince(w http.ResponseWriter, r *http.Request, lastModifiedStr string, lastModifiedTime time.Time, config ServerConfig) bool {
 	ifModifiedSince := r.Header.Get("If-Modified-Since")
 	if ifModifiedSince == "" {
@@ -219,8 +197,8 @@ func checkAndHandleIfModifiedSince(w http.ResponseWriter, r *http.Request, lastM
 		}
 		return false
 	}
-
 	var lastModifiedTimeToCheck time.Time
+
 	if lastModifiedStr != "" {
 		lastModifiedTimeToCheck, err = time.Parse(http.TimeFormat, lastModifiedStr)
 		if err != nil {
@@ -238,16 +216,7 @@ func checkAndHandleIfModifiedSince(w http.ResponseWriter, r *http.Request, lastM
 	return false
 }
 
-func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders http.Header, lastModified time.Time) (bool, error) {
-	fileType := utils.GetFilePatternType(r.URL.Path)
-
-	if fileType == utils.TypeRarelyChanging {
-		if config.LogRequests {
-			logging.Info("Skipping upstream validation for rarely changing file: %s", r.URL.Path)
-		}
-		return true, nil
-	}
-
+func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders http.Header, cacheKey string) (bool, error) {
 	remotePath := getRemotePath(config, r.URL.Path)
 	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
 	req, err := http.NewRequest(http.MethodHead, upstreamURL, nil)
@@ -256,15 +225,25 @@ func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders ht
 	}
 
 	lastModifiedStr := cachedHeaders.Get("Last-Modified")
-	if lastModifiedStr == "" {
-		lastModifiedStr = lastModified.Format(http.TimeFormat)
+	if lastModifiedStr != "" {
+		req.Header.Set("If-Modified-Since", lastModifiedStr)
 	}
-	req.Header.Set("If-Modified-Since", lastModifiedStr)
+	etag := cachedHeaders.Get("ETag")
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+
 	req.Header.Set("User-Agent", defaultUserAgent)
 
 	logging.Debug("Validation: Checking %s", r.URL.Path)
 	logging.Debug("Validation: Upstream URL=%s", upstreamURL)
-	logging.Debug("Validation: If-Modified-Since=%s", lastModifiedStr)
+
+	if lastModifiedStr != "" {
+		logging.Debug("Validation: If-Modified-Since=%s", lastModifiedStr)
+	}
+	if etag != "" {
+		logging.Debug("Validation: If-None-Match=%s", etag)
+	}
 
 	if config.LogRequests {
 		logging.Info("Validation: Checking cached file with upstream: %s", r.URL.Path)
@@ -284,77 +263,49 @@ func validateWithUpstream(config ServerConfig, r *http.Request, cachedHeaders ht
 		if config.LogRequests {
 			logging.Info("Validation: Cache is valid according to upstream: %s", r.URL.Path)
 		}
+		mergedHeaders := mergeHeaders(cachedHeaders, resp.Header)
+		config.HeaderCache.PutHeaders(cacheKey, mergedHeaders)
 		return true, nil
 	}
 
-	return false, nil
+	if resp.StatusCode == http.StatusOK {
+		mergedHeaders := mergeHeaders(cachedHeaders, resp.Header)
+		config.HeaderCache.PutHeaders(cacheKey, mergedHeaders)
+		return false, nil
+	}
+
+	return false, fmt.Errorf("unexpected upstream response: %d", resp.StatusCode)
 }
 
-func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig, content io.ReadCloser, contentLength int64, lastModified time.Time, useIfModifiedSince bool, cacheKey string) bool {
+func mergeHeaders(cachedHeaders, upstreamHeaders http.Header) http.Header {
+	merged := make(http.Header)
+
+	for k, v := range cachedHeaders {
+		merged[k] = v
+	}
+
+	for k, v := range upstreamHeaders {
+		if allowedResponseHeaders[http.CanonicalHeaderKey(k)] {
+			merged[k] = v
+		}
+	}
+	return merged
+}
+
+func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig, content io.ReadCloser, lastModified time.Time, cacheKey string) bool {
 	defer content.Close()
 
 	cachedHeaders, headerErr := config.HeaderCache.GetHeaders(cacheKey)
 	if headerErr != nil {
 		logging.Error("No cached headers found for %s: %v", cacheKey, headerErr)
-		setBasicHeaders(w, r, nil, lastModified, useIfModifiedSince, config)
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
+		return false
 
-		if r.Method == http.MethodHead {
-			w.WriteHeader(http.StatusOK)
-			return true
-		}
-		_, err := io.Copy(w, content)
-		if err != nil {
-			logging.Error("Error writing response: %v", err)
-		}
-		return true
 	}
 
 	lastModifiedStr := cachedHeaders.Get("Last-Modified")
-	if useIfModifiedSince && checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
+
+	if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
 		return true
-	}
-
-	fileType := utils.GetFilePatternType(r.URL.Path)
-
-	if fileType == utils.TypeFrequentlyChanging && useIfModifiedSince {
-		validationKey := fmt.Sprintf("validation:%s", r.URL.Path)
-		isValid, _ := config.ValidationCache.Get(validationKey)
-		logging.Debug("Cache hit: Validation check for %s (isValid=%v)", r.URL.Path, isValid)
-
-		if !isValid {
-			cacheIsValid, err := validateWithUpstream(config, r, cachedHeaders, lastModified)
-			if err != nil {
-				logging.Error("Error validating with upstream: %v", err)
-				return false
-			}
-			if cacheIsValid {
-				config.ValidationCache.Put(validationKey, time.Now())
-
-				if r.Header.Get("If-Modified-Since") != "" {
-					if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
-						return true
-					}
-				}
-			} else {
-				if config.LogRequests {
-					logging.Info("Content modified on upstream, invalidating cache: %s", r.URL.Path)
-				}
-				return false
-			}
-		} else {
-			if r.Header.Get("If-Modified-Since") != "" {
-				if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
-					return true
-				}
-			}
-		}
-	} else if fileType == utils.TypeRarelyChanging {
-		if r.Header.Get("If-Modified-Since") != "" {
-			if checkAndHandleIfModifiedSince(w, r, lastModifiedStr, lastModified, config) {
-				return true
-			}
-		}
 	}
 
 	filterAndSetHeaders(w, cachedHeaders)
@@ -377,54 +328,7 @@ func handleCacheHit(w http.ResponseWriter, r *http.Request, config ServerConfig,
 	return true
 }
 
-func handleDirectUpstream(w http.ResponseWriter, r *http.Request, config ServerConfig) {
-	path := r.URL.Path
-	remotePath := getRemotePath(config, path)
-	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
-
-	client := getClient(config)
-	req, err := http.NewRequest(r.Method, upstreamURL, nil)
-	if err != nil {
-		http.Error(w, "Error creating request to upstream", http.StatusInternalServerError)
-		logging.Error("Error creating request to upstream: %v", err)
-		return
-	}
-	copyRelevantHeaders(req, r)
-	req.Header.Set("User-Agent", defaultUserAgent)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
-		logging.Error("Error fetching content from upstream: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	filterAndSetHeaders(w, resp.Header)
-	if resp.StatusCode == http.StatusNotModified {
-		sendNotModified(w, config, r)
-		return
-	}
-	w.WriteHeader(resp.StatusCode)
-
-	if r.Method != http.MethodHead {
-		_, err = io.Copy(w, resp.Body)
-		if err != nil {
-			if strings.Contains(err.Error(), "context canceled") ||
-				strings.Contains(err.Error(), "connection reset by peer") ||
-				strings.Contains(err.Error(), "broken pipe") {
-				if config.LogRequests {
-					logging.Info("Client disconnected during download: %s", path)
-				}
-			} else {
-				logging.Error("Error streaming response to client: %v", err)
-			}
-		}
-	}
-}
-
-func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig, _ bool, cacheKey string) {
-	// Use the same cacheKey for locking
+func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig, cacheKey string) {
 	isFirstRequest := acquireLock(cacheKey)
 
 	if isFirstRequest {
@@ -437,7 +341,6 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 
 		client := getClient(config)
 		req, _ := http.NewRequest(r.Method, upstreamURL, nil)
-		copyRelevantHeaders(req, r)
 		req.Header.Set("User-Agent", defaultUserAgent)
 
 		resp, err := client.Do(req)
@@ -447,12 +350,6 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			return
 		}
 		defer resp.Body.Close()
-
-		if resp.StatusCode == http.StatusNotModified {
-			filterAndSetHeaders(w, resp.Header)
-			sendNotModified(w, config, r)
-			return
-		}
 
 		if r.Method == http.MethodHead {
 			filterAndSetHeaders(w, resp.Header)
@@ -486,33 +383,60 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			}
 			return
 		}
+
 		logging.Debug("handleCacheMiss: Successfully fetched content for %s, storing in cache", cacheKey)
 		go updateCache(config, cacheKey, buf.Bytes(), lastModifiedTime, resp.Header)
-		buf.Reset() // Clear the buffer after use
+		go config.ValidationCache.Put(fmt.Sprintf("validation:%s", remotePath), time.Now())
+		buf.Reset()
 
 	} else {
 		handleDirectUpstream(w, r, config)
 	}
 }
 
-func setBasicHeaders(w http.ResponseWriter, r *http.Request, _ http.Header, lastModified time.Time, useIfModifiedSince bool, config ServerConfig) {
-	if strings.HasSuffix(r.URL.Path, "/") {
-		w.Header().Set("Content-Type", "text/html")
-	} else {
-		if w.Header().Get("Content-Type") == "" {
-			contentType := utils.GetContentType(r.URL.Path)
-			if contentType != "" {
-				w.Header().Set("Content-Type", contentType)
+func handleDirectUpstream(w http.ResponseWriter, r *http.Request, config ServerConfig) {
+	path := r.URL.Path
+	remotePath := getRemotePath(config, path)
+	upstreamURL := fmt.Sprintf("%s%s", config.UpstreamURL, remotePath)
+
+	client := getClient(config)
+	req, err := http.NewRequest(r.Method, upstreamURL, nil)
+	if err != nil {
+		http.Error(w, "Error creating request to upstream", http.StatusInternalServerError)
+		logging.Error("Error creating request to upstream: %v", err)
+		return
+	}
+
+	req.Header.Set("User-Agent", defaultUserAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+		logging.Error("Error fetching content from upstream: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	filterAndSetHeaders(w, resp.Header)
+	if resp.StatusCode == http.StatusNotModified {
+		sendNotModified(w, config, r)
+		return
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	if r.Method != http.MethodHead {
+		_, err = io.Copy(w, resp.Body)
+		if err != nil {
+			if strings.Contains(err.Error(), "context canceled") ||
+				strings.Contains(err.Error(), "connection reset by peer") ||
+				strings.Contains(err.Error(), "broken pipe") {
+				if config.LogRequests {
+					logging.Info("Client disconnected during download: %s", path)
+				}
 			} else {
-				logging.Warning("Could not determine content type for: %s", r.URL.Path)
-				w.Header().Set("Content-Type", "application/octet-stream")
+				logging.Error("Error streaming response to client: %v", err)
 			}
 		}
-	}
-	w.Header().Set("Last-Modified", lastModified.Format(http.TimeFormat))
-
-	if useIfModifiedSince && checkAndHandleIfModifiedSince(w, r, "", lastModified, config) {
-		return
 	}
 }
 
@@ -526,54 +450,72 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			return
 		}
 
-		// Extract repository path from URL
 		repoPath := config.LocalPath
 		if !strings.HasSuffix(repoPath, "/") {
 			repoPath += "/"
 		}
 
-		// Use the repository prefix + client's request path as the cache key
-		// This ensures files from different repositories with the same path don't conflict
 		repoPrefix := strings.Trim(config.LocalPath, "/")
 		if repoPrefix == "" {
 			repoPrefix = "root"
 		}
 
-		// Create cache key with repository prefix
 		cacheKey := repoPrefix + "/" + strings.TrimPrefix(getRemotePath(config, r.URL.Path), "/")
 		logging.Debug("Using cache key: %s for path: %s (repo: %s)", cacheKey, r.URL.Path, repoPrefix)
 
-		// Get path *without* prefix for upstream requests
 		remotePath := getRemotePath(config, r.URL.Path)
+		validationKey := fmt.Sprintf("validation:%s", remotePath)
 
-		if useIfModifiedSince && r.Header.Get("If-Modified-Since") != "" {
-			// Use remotePath for validationKey, not r.URL.Path
-			validationKey := fmt.Sprintf("validation:%s", remotePath)
+		fileType := utils.GetFilePatternType(r.URL.Path)
+		if fileType == utils.TypeFrequentlyChanging {
 			isValid, _ := config.ValidationCache.Get(validationKey)
-			if isValid {
-				if config.LogRequests {
-					logging.Info("Validation: Using cached result for %s", r.URL.Path)
-				}
-				sendNotModified(w, config, r)
-				return
-			}
-		}
+			if !isValid {
+				cachedHeaders, headerErr := config.HeaderCache.GetHeaders(cacheKey)
+				content, _, lastModified, err := config.Cache.Get(cacheKey)
 
-		content, contentLength, lastModified, err := config.Cache.Get(cacheKey)
-		if err == nil {
-			if config.LogRequests {
-				logging.Info("Cache hit: %s [key: %s]", r.URL.Path, cacheKey)
-			}
-			if handleCacheHit(w, r, config, content, contentLength, lastModified, useIfModifiedSince, cacheKey) {
-				return
+				if headerErr == nil && err == nil {
+					cacheIsValid, validationErr := validateWithUpstream(config, r, cachedHeaders, cacheKey)
+					if validationErr != nil {
+						logging.Error("Error validating with upstream: %v", validationErr)
+						handleCacheMiss(w, r, config, cacheKey)
+						return
+					}
+					if cacheIsValid {
+						config.ValidationCache.Put(validationKey, time.Now())
+						if handleCacheHit(w, r, config, content, lastModified, cacheKey) {
+							return
+						}
+
+					} else {
+						handleCacheMiss(w, r, config, cacheKey)
+						return
+					}
+				} else {
+					handleCacheMiss(w, r, config, cacheKey)
+					return
+				}
+			} else {
+				content, _, lastModified, err := config.Cache.Get(cacheKey)
+				if err == nil {
+					if handleCacheHit(w, r, config, content, lastModified, cacheKey) {
+						return
+					}
+				} else {
+					handleCacheMiss(w, r, config, cacheKey)
+					return
+				}
 			}
 		} else {
-			if config.LogRequests {
-				logging.Info("Cache miss: %s [key: %s] - %v", r.URL.Path, cacheKey, err)
+			content, _, lastModified, err := config.Cache.Get(cacheKey)
+			if err == nil {
+				if handleCacheHit(w, r, config, content, lastModified, cacheKey) {
+					return
+				}
+			} else {
+				handleCacheMiss(w, r, config, cacheKey)
+				return
 			}
 		}
-
-		handleCacheMiss(w, r, config, useIfModifiedSince, cacheKey)
 	}
 }
 
@@ -586,4 +528,11 @@ func HandleCacheableRequest(config ServerConfig) http.HandlerFunc {
 		fileType := utils.GetFilePatternType(r.URL.Path)
 		HandleRequest(config, fileType == utils.TypeFrequentlyChanging)(w, r)
 	}
+}
+
+func sendNotModified(w http.ResponseWriter, config ServerConfig, r *http.Request) {
+	if config.LogRequests {
+		logging.Info("Response: Not modified %s", r.URL.Path)
+	}
+	w.WriteHeader(http.StatusNotModified)
 }
