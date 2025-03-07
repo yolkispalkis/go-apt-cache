@@ -110,10 +110,30 @@ func getClient(config ServerConfig) *http.Client {
 }
 
 func getRemotePath(config ServerConfig, localPath string) string {
-	remotePath := strings.TrimPrefix(localPath, config.LocalPath)
+	// Normalize path by removing multiple slashes and ensuring consistent format
+	normalizedPath := strings.Join(strings.FieldsFunc(localPath, func(r rune) bool {
+		return r == '/'
+	}), "/")
+
+	// Remove repository prefix
+	remotePath := strings.TrimPrefix(normalizedPath, strings.Trim(config.LocalPath, "/"))
 	remotePath = strings.TrimPrefix(remotePath, "/")
 
 	return remotePath
+}
+
+func getCacheKey(config ServerConfig, localPath string) string {
+	// Get repository prefix
+	repoPrefix := strings.Trim(config.LocalPath, "/")
+	if repoPrefix == "" {
+		repoPrefix = "root"
+	}
+
+	// Get remote path without repository prefix
+	remotePath := getRemotePath(config, localPath)
+
+	// Combine them ensuring single slash between parts
+	return repoPrefix + "/" + remotePath
 }
 
 func updateCache(config ServerConfig, path string, body []byte, lastModified time.Time, headers http.Header) {
@@ -386,7 +406,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 
 		logging.Debug("handleCacheMiss: Successfully fetched content for %s, storing in cache", cacheKey)
 		go updateCache(config, cacheKey, buf.Bytes(), lastModifiedTime, resp.Header)
-		go config.ValidationCache.Put(fmt.Sprintf("validation:%s", remotePath), time.Now())
+		go config.ValidationCache.Put(fmt.Sprintf("validation:%s", cacheKey), time.Now())
 		buf.Reset()
 
 	} else {
@@ -450,21 +470,11 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 			return
 		}
 
-		repoPath := config.LocalPath
-		if !strings.HasSuffix(repoPath, "/") {
-			repoPath += "/"
-		}
+		cacheKey := getCacheKey(config, r.URL.Path)
+		logging.Debug("Using cache key: %s for path: %s (repo: %s)",
+			cacheKey, r.URL.Path, strings.Trim(config.LocalPath, "/"))
 
-		repoPrefix := strings.Trim(config.LocalPath, "/")
-		if repoPrefix == "" {
-			repoPrefix = "root"
-		}
-
-		cacheKey := repoPrefix + "/" + strings.TrimPrefix(getRemotePath(config, r.URL.Path), "/")
-		logging.Debug("Using cache key: %s for path: %s (repo: %s)", cacheKey, r.URL.Path, repoPrefix)
-
-		remotePath := getRemotePath(config, r.URL.Path)
-		validationKey := fmt.Sprintf("validation:%s", remotePath)
+		validationKey := fmt.Sprintf("validation:%s", cacheKey)
 
 		fileType := utils.GetFilePatternType(r.URL.Path)
 		if fileType == utils.TypeFrequentlyChanging {

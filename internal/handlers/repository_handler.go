@@ -45,12 +45,14 @@ func (rh *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	logging.Info("Repository handler processing: %s", requestPath)
 
+	// Use the same path handling logic as in handlers.go
+	cacheKey := getCacheKey(rh.config, requestPath)
 	repoName := strings.Trim(rh.config.LocalPath, "/")
 	if repoName == "" {
 		repoName = "root"
 	}
 
-	logging.Info("Repository: %s, Path: %s", repoName, requestPath)
+	logging.Info("Repository: %s, Path: %s, Cache key: %s", repoName, requestPath, cacheKey)
 
 	handler := HandleRequest(rh.config, true)
 	handler(w, r)

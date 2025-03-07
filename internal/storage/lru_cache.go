@@ -39,7 +39,17 @@ func (f *FileOperations) EnsureDirectoryExists(relativePath string) error {
 }
 
 func (f *FileOperations) getFilePath(key string, fileType FileType) string {
-	safePath := utils.SafeFilename(key)
+	// Normalize path by removing multiple slashes and ensuring consistent format
+	normalizedKey := strings.Join(strings.FieldsFunc(key, func(r rune) bool {
+		return r == '/'
+	}), "/")
+
+	// Convert to safe filename while preserving directory structure
+	parts := strings.Split(normalizedKey, "/")
+	for i, part := range parts {
+		parts[i] = utils.SafeFilename(part)
+	}
+	safePath := strings.Join(parts, string(os.PathSeparator))
 
 	if fileType == CacheFile {
 		safePath += ".filecache"
