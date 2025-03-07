@@ -478,20 +478,25 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 					}
 				}
 			}
-			cachedHeaders, headerErr := config.HeaderCache.GetHeaders(cacheKey)
-			content, _, lastModified, err := config.Cache.Get(cacheKey)
+			if !isValid {
+				cachedHeaders, headerErr := config.HeaderCache.GetHeaders(cacheKey)
+				content, _, lastModified, err := config.Cache.Get(cacheKey)
 
-			if headerErr == nil && err == nil {
-				cacheIsValid, validationErr := validateWithUpstream(config, r, cachedHeaders, cacheKey)
-				if validationErr != nil {
-					logging.Error("Error validating with upstream: %v", validationErr)
-					handleCacheMiss(w, r, config, cacheKey)
-					return
-				}
-				if cacheIsValid {
-					config.ValidationCache.Put(validationKey, time.Now())
-					logging.Info("Validation cache: Updated for %s", validationKey)
-					if handleCacheHit(w, r, config, content, lastModified, cacheKey) {
+				if headerErr == nil && err == nil {
+					cacheIsValid, validationErr := validateWithUpstream(config, r, cachedHeaders, cacheKey)
+					if validationErr != nil {
+						logging.Error("Error validating with upstream: %v", validationErr)
+						handleCacheMiss(w, r, config, cacheKey)
+						return
+					}
+					if cacheIsValid {
+						config.ValidationCache.Put(validationKey, time.Now())
+						logging.Info("Validation cache: Updated for %s", validationKey)
+						if handleCacheHit(w, r, config, content, lastModified, cacheKey) {
+							return
+						}
+					} else {
+						handleCacheMiss(w, r, config, cacheKey)
 						return
 					}
 				} else {
@@ -499,8 +504,14 @@ func HandleRequest(config ServerConfig, useIfModifiedSince bool) http.HandlerFun
 					return
 				}
 			} else {
-				handleCacheMiss(w, r, config, cacheKey)
-				return
+				content, _, lastModified, err := config.Cache.Get(cacheKey)
+				if err == nil {
+					if handleCacheHit(w, r, config, content, lastModified, cacheKey) {
+						return
+					}
+				} else {
+					handleCacheMiss(w, r, config, cacheKey)
+				}
 			}
 
 		} else {
