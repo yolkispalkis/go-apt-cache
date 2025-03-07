@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/storage"
 )
@@ -20,6 +21,7 @@ func NewRepositoryHandler(
 	validationCache storage.ValidationCache,
 	client *http.Client,
 	localPath string,
+	globalConfig *config.Config,
 ) http.Handler {
 	config := NewRepositoryServerConfig(
 		upstreamURL,
@@ -27,10 +29,11 @@ func NewRepositoryHandler(
 		headerCache,
 		validationCache,
 		client,
+		globalConfig,
 	)
 
 	config.LocalPath = localPath
-	config.ValidationCache.SetTTL(time.Duration(config.Config.Cache.ValidationCacheTTL) * time.Second)
+	config.ValidationCache.SetTTL(time.Duration(globalConfig.Cache.ValidationCacheTTL) * time.Second)
 
 	return &RepositoryHandler{
 		config: config,

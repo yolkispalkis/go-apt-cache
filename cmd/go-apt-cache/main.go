@@ -141,6 +141,7 @@ func (ss *ServerSetup) registerRepositoryHandlers(mux *http.ServeMux) {
 			ss.ValidationCache,
 			ss.HTTPClient,
 			basePath,
+			ss.Config,
 		)
 
 		mux.Handle(basePath, http.StripPrefix(basePath, handler))

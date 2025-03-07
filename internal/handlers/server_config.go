@@ -39,6 +39,7 @@ func NewRepositoryServerConfig(
 	headerCache storage.HeaderCache,
 	validationCache storage.ValidationCache,
 	client *http.Client,
+	globalConfig *config.Config,
 ) ServerConfig {
 	return ServerConfig{
 		UpstreamURL:     upstreamURL,
@@ -47,6 +48,6 @@ func NewRepositoryServerConfig(
 		ValidationCache: validationCache,
 		Client:          client,
 		LogRequests:     true,
-		Config:          &config.Config{}, // Initialize Config field
+		Config:          globalConfig,
 	}
 }

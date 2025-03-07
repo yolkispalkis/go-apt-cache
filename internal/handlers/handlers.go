@@ -405,10 +405,10 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		}
 
 		logging.Debug("handleCacheMiss: Successfully fetched content for %s, storing in cache", cacheKey)
-		go updateCache(config, cacheKey, buf.Bytes(), lastModifiedTime, resp.Header)
 		validationKey := fmt.Sprintf("validation:%s", cacheKey)
-		go config.ValidationCache.Put(validationKey, time.Now())
+		config.ValidationCache.Put(validationKey, time.Now())
 		logging.Debug("Cache validation: Updated key %s", validationKey)
+		go updateCache(config, cacheKey, buf.Bytes(), lastModifiedTime, resp.Header)
 		buf.Reset()
 
 	} else {
