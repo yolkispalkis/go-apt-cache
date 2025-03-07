@@ -247,24 +247,30 @@ func cleanDirectory(dirPath string) error {
 }
 
 func (c *LRUCache) initialize() error {
+	logging.Debug("Initializing LRU cache from directory: %s", c.basePath)
 	return filepath.Walk(c.basePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			logging.Error("Error walking path %s: %v", path, err)
 			return err
 		}
 
 		if info.IsDir() {
+			logging.Debug("Skipping directory: %s", path)
 			return nil
 		}
 
 		if strings.HasSuffix(path, ".headercache") {
+			logging.Debug("Skipping header cache file: %s", path)
 			return nil
 		}
 
 		if !strings.HasSuffix(path, ".filecache") {
+			logging.Debug("Skipping non-cache file: %s", path)
 			return nil
 		}
 
 		if strings.HasSuffix(path, ".tmp") {
+			logging.Debug("Removing temporary file: %s", path)
 			if err := os.Remove(path); err != nil {
 				logging.Warning("failed to remove temporary file %s: %v", path, err)
 			}
@@ -273,17 +279,17 @@ func (c *LRUCache) initialize() error {
 
 		relPath, err := filepath.Rel(c.basePath, path)
 		if err != nil {
+			logging.Error("Error getting relative path for %s: %v", path, err)
 			return err
 		}
 
+		// Convert Windows path separators to forward slashes
 		key := filepath.ToSlash(relPath)
 
+		// Remove .filecache suffix
 		key = strings.TrimSuffix(key, ".filecache")
 
-		if strings.Contains(key, "/") {
-			key = "/" + key
-		}
-
+		// Do not add leading slash as it's not used in request keys
 		item := &cacheItem{
 			key:          key,
 			size:         info.Size(),
@@ -292,6 +298,8 @@ func (c *LRUCache) initialize() error {
 		element := c.lruList.PushFront(item)
 		c.items[key] = element
 		c.currentSize += info.Size()
+
+		logging.Debug("Added cache item: key=%s, size=%d bytes, lastModified=%v", key, info.Size(), info.ModTime())
 
 		return nil
 	})
