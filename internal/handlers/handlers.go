@@ -14,6 +14,13 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/utils"
 )
 
+// BufferPool is a pool of bytes.Buffer objects
+var BufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
 var requestLock = struct {
 	sync.RWMutex
 	inProgress map[string]*cacheRequest
@@ -414,8 +421,13 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			return
 		}
 
-		var buf bytes.Buffer
-		mw := io.MultiWriter(w, &buf)
+		// Get a buffer from the pool to store the response
+		buf := BufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer BufferPool.Put(buf)
+
+		// Create a multi-writer to write to both the response and our buffer
+		multiWriter := io.MultiWriter(w, buf)
 
 		lastModifiedTime := time.Now()
 		if lastModifiedHeader := resp.Header.Get("Last-Modified"); lastModifiedHeader != "" {
@@ -427,17 +439,8 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		filterAndSetHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
 
-		_, err = io.Copy(mw, resp.Body)
-		if err != nil {
-			if strings.Contains(err.Error(), "context canceled") ||
-				strings.Contains(err.Error(), "connection reset by peer") ||
-				strings.Contains(err.Error(), "broken pipe") {
-				if config.LogRequests {
-					logging.Info("Client disconnected during download: %s", cacheKey)
-				}
-			} else {
-				logging.Error("Error streaming response to client: %v", err)
-			}
+		if _, err := io.Copy(multiWriter, resp.Body); err != nil {
+			logging.Error("Error copying response body: %v", err)
 			return
 		}
 
