@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -238,6 +239,8 @@ func updateCache(config ServerConfig, path string, body []byte, lastModified tim
 				logging.Info("Cache: Stored headers for %s", path)
 				logging.Info("Cache: Stored content for %s (%d bytes)", path, len(body))
 			}
+			body = nil   // Clear the body to help garbage collection
+			runtime.GC() // Force garbage collection after file operations
 		}
 	case <-ctx.Done():
 		logging.Error("Cache update: Timed out for %s", path)
@@ -450,6 +453,7 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		logging.Debug("Cache validation: Updated key %s", validationKey)
 		go updateCache(config, cacheKey, buf.Bytes(), lastModifiedTime, resp.Header)
 		buf.Reset()
+		runtime.GC() // Force garbage collection after file operations
 
 	} else {
 		handleDirectUpstream(w, r, config)
