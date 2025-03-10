@@ -392,54 +392,27 @@ func (c *LRUCache) Put(key string, content io.Reader, contentLength int64, lastM
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	tempFilePath := filePath + ".tmp"
-	file, err := os.Create(tempFilePath)
+	// Вместо создания временного файла, сразу создаем целевой файл
+	file, err := os.Create(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to create temporary file: %w", err)
+		return fmt.Errorf("failed to create cache file: %w", err)
 	}
+	defer file.Close()
 
 	written, err := io.Copy(file, content)
 	if err != nil {
-		file.Close()
-		os.Remove(tempFilePath)
-		return fmt.Errorf("failed to write file: %w", err)
-	}
-
-	if err := file.Close(); err != nil {
-		os.Remove(tempFilePath)
-		return fmt.Errorf("failed to close file: %w", err)
+		os.Remove(filePath)
+		return fmt.Errorf("failed to write to cache file: %w", err)
 	}
 
 	if contentLength > 0 && written != contentLength {
-		os.Remove(tempFilePath)
+		os.Remove(filePath) // Удаляем неполный файл.
 		return fmt.Errorf("file size validation failed: expected %d bytes, got %d bytes", contentLength, written)
 	}
 
-	validateFile, err := os.Open(tempFilePath)
-	if err != nil {
-		os.Remove(tempFilePath)
-		return fmt.Errorf("file validation failed - cannot open file: %w", err)
-	}
-
-	fileInfo, err := validateFile.Stat()
-	validateFile.Close()
-	if err != nil {
-		os.Remove(tempFilePath)
-		return fmt.Errorf("file validation failed - cannot stat file: %w", err)
-	}
-
-	if fileInfo.Size() != written {
-		os.Remove(tempFilePath)
-		return fmt.Errorf("file validation failed - file size mismatch: expected %d bytes, got %d bytes", written, fileInfo.Size())
-	}
-
-	if err := os.Chtimes(tempFilePath, lastModified, lastModified); err != nil {
+	// выставляем lastModified
+	if err := os.Chtimes(filePath, lastModified, lastModified); err != nil {
 		logging.Warning("failed to set file modification time: %v", err)
-	}
-
-	if err := os.Rename(tempFilePath, filePath); err != nil {
-		os.Remove(tempFilePath)
-		return fmt.Errorf("failed to rename temporary file: %w", err)
 	}
 
 	c.mutex.Lock()
@@ -447,7 +420,7 @@ func (c *LRUCache) Put(key string, content io.Reader, contentLength int64, lastM
 
 	if element, exists := c.items[key]; exists {
 		item := element.Value.(*cacheItem)
-		c.currentSize -= item.size
+		c.currentSize -= item.size // вычитаем старый размер
 		item.size = written
 		item.lastModified = lastModified
 		c.lruList.MoveToFront(element)
@@ -461,8 +434,7 @@ func (c *LRUCache) Put(key string, content io.Reader, contentLength int64, lastM
 		c.items[key] = element
 	}
 
-	c.currentSize += written
-
+	c.currentSize += written // прибавляем новый
 	return nil
 }
 

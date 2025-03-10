@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -181,76 +180,6 @@ func getCacheKey(config ServerConfig, localPath string) string {
 	return key
 }
 
-func updateCache(config ServerConfig, path string, body []byte, lastModified time.Time, headers http.Header) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	errChan := make(chan error, 2)
-
-	go func() {
-		defer wg.Done()
-		logging.Debug("Cache update: Storing headers for %s", path)
-		if err := config.HeaderCache.PutHeaders(path, headers); err != nil {
-			logging.Error("Cache update: Error storing headers - %v", err)
-			errChan <- fmt.Errorf("header error: %w", err)
-			return
-		}
-		logging.Debug("Cache update: Headers stored successfully for %s", path)
-	}()
-
-	go func() {
-		defer wg.Done()
-		logging.Debug("Cache update: Storing content for %s (%d bytes)", path, len(body))
-		if len(body) > 0 {
-			if err := config.Cache.Put(path, bytes.NewReader(body), int64(len(body)), lastModified); err != nil {
-				logging.Error("Cache update: Error storing content - %v", err)
-				errChan <- fmt.Errorf("content error: %w", err)
-				return
-			}
-			logging.Debug("Cache update: Content stored successfully for %s", path)
-		} else {
-			err := fmt.Errorf("empty body received for %s", path)
-			logging.Error("Cache update: %v", err)
-			errChan <- err
-		}
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		select {
-		case err := <-errChan:
-			logging.Error("Cache update: Error during update - %v", err)
-			_ = config.HeaderCache.PutHeaders(path, http.Header{})
-			if delErr := config.Cache.Put(path, bytes.NewReader([]byte{}), 0, time.Time{}); delErr != nil {
-				logging.Error("Cache update: Failed to clear cache - %v", delErr)
-			}
-
-		default:
-			if config.LogRequests {
-				logging.Info("Cache: Stored headers for %s", path)
-				logging.Info("Cache: Stored content for %s (%d bytes)", path, len(body))
-			}
-			body = nil   // Clear the body to help garbage collection
-			runtime.GC() // Force garbage collection after file operations
-		}
-	case <-ctx.Done():
-		logging.Error("Cache update: Timed out for %s", path)
-		_ = config.HeaderCache.PutHeaders(path, http.Header{})
-		if delErr := config.Cache.Put(path, bytes.NewReader([]byte{}), 0, time.Time{}); delErr != nil {
-			logging.Error("Cache update: Failed to clear cache - %v", delErr)
-		}
-	}
-}
-
 func checkAndHandleIfModifiedSince(w http.ResponseWriter, r *http.Request, lastModifiedStr string, lastModifiedTime time.Time, config ServerConfig) bool {
 	ifModifiedSince := r.Header.Get("If-Modified-Since")
 	if ifModifiedSince == "" {
@@ -424,14 +353,6 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 			return
 		}
 
-		// Get a buffer from the pool to store the response
-		buf := BufferPool.Get().(*bytes.Buffer)
-		buf.Reset()
-		defer BufferPool.Put(buf)
-
-		// Create a multi-writer to write to both the response and our buffer
-		multiWriter := io.MultiWriter(w, buf)
-
 		lastModifiedTime := time.Now()
 		if lastModifiedHeader := resp.Header.Get("Last-Modified"); lastModifiedHeader != "" {
 			if parsedTime, err := time.Parse(http.TimeFormat, lastModifiedHeader); err == nil {
@@ -442,22 +363,51 @@ func handleCacheMiss(w http.ResponseWriter, r *http.Request, config ServerConfig
 		filterAndSetHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
 
-		if _, err := io.Copy(multiWriter, resp.Body); err != nil {
+		// Создаем pipe
+		pr, pw := io.Pipe()
+
+		// Горутина для записи в кэш
+		go func() {
+			defer pw.Close()
+			logging.Debug("handleCacheMiss: Storing content for %s", cacheKey)
+			err := config.Cache.Put(cacheKey, pr, resp.ContentLength, lastModifiedTime) // Передаем pr (pipe reader)
+			if err != nil {
+				logging.Error("Cache update: Error storing content - %v", err)
+				// Обработка ошибок при записи в кэш, возможно, стоит удалить неполный файл
+			} else {
+				logging.Debug("Cache update: Content stored successfully for %s", cacheKey)
+
+				// обновляем ValidationCache после успешной записи в кеш
+				validationKey := fmt.Sprintf("validation:%s", cacheKey)
+				config.ValidationCache.Put(validationKey, time.Now())
+				logging.Debug("Cache validation: Updated key %s", validationKey)
+			}
+
+			go updateHeaders(config, cacheKey, resp.Header) // вынес в отдельную горутину, чтобы не блокировать запись
+			runtime.GC()                                    // Force garbage collection after file operations
+		}()
+
+		// Копируем данные из upstream в pipe writer, который одновременно передает данные в кэш и клиенту
+		_, err = io.Copy(io.MultiWriter(w, pw), resp.Body)
+		if err != nil {
 			logging.Error("Error copying response body: %v", err)
+			// нужно закрыть pw с ошибкой, чтобы остановить запись в кеш
+			pw.CloseWithError(err)
 			return
 		}
-
-		logging.Debug("handleCacheMiss: Successfully fetched content for %s, storing in cache", cacheKey)
-		validationKey := fmt.Sprintf("validation:%s", cacheKey)
-		config.ValidationCache.Put(validationKey, time.Now())
-		logging.Debug("Cache validation: Updated key %s", validationKey)
-		go updateCache(config, cacheKey, buf.Bytes(), lastModifiedTime, resp.Header)
-		buf.Reset()
-		runtime.GC() // Force garbage collection after file operations
 
 	} else {
 		handleDirectUpstream(w, r, config)
 	}
+}
+
+func updateHeaders(config ServerConfig, path string, headers http.Header) {
+	logging.Debug("Cache update: Storing headers for %s", path)
+	if err := config.HeaderCache.PutHeaders(path, headers); err != nil {
+		logging.Error("Cache update: Error storing headers - %v", err)
+		return
+	}
+	logging.Debug("Cache update: Headers stored successfully for %s", path)
 }
 
 func handleDirectUpstream(w http.ResponseWriter, r *http.Request, config ServerConfig) {
