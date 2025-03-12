@@ -5,47 +5,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/yolkispalkis/go-apt-cache/internal/common"
 )
-
-func ParseSize(sizeStr string) (int64, error) {
-	if sizeStr == "" {
-		return 0, nil
-	}
-
-	re := regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT]?B)?$`)
-	matches := re.FindStringSubmatch(strings.ToUpper(sizeStr))
-
-	if matches == nil {
-		return 0, fmt.Errorf("invalid size format: %s", sizeStr)
-	}
-
-	sizeValue, err := strconv.ParseFloat(matches[1], 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid size value: %s", matches[1])
-	}
-
-	var multiplier float64 = 1
-	switch matches[2] {
-	case "KB", "K":
-		multiplier = 1024
-	case "MB", "M":
-		multiplier = 1024 * 1024
-	case "GB", "G":
-		multiplier = 1024 * 1024 * 1024
-	case "TB", "T":
-		multiplier = 1024 * 1024 * 1024 * 1024
-	case "B", "":
-	default:
-		return 0, fmt.Errorf("unknown size unit: %s", matches[2])
-	}
-
-	return int64(sizeValue * multiplier), nil
-}
 
 type LogConfig struct {
 	FilePath        string
@@ -155,7 +119,7 @@ func (l *Logger) setupFileWriter() error {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
 
-	maxSize, err := ParseSize(l.config.MaxSize)
+	maxSize, err := common.ParseSize(l.config.MaxSize)
 	if err != nil {
 		maxSize = DefaultLogMaxSize
 		Warning("Invalid log max size '%s', defaulting to 10MB", l.config.MaxSize)

@@ -76,19 +76,19 @@ func NewMemoryValidationCache(ttl time.Duration) *MemoryValidationCache {
 
 func (c *MemoryValidationCache) Get(key string) (bool, time.Time) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	lastValidated, exists := c.cache[key]
+	c.mu.RUnlock()
+
 	if !exists {
 		return false, time.Time{}
 	}
 
 	if time.Since(lastValidated) > c.ttl {
-		go func(k string) {
-			c.mu.Lock()
-			delete(c.cache, k)
-			c.mu.Unlock()
-		}(key)
+		c.mu.Lock()
+		if lv, ok := c.cache[key]; ok && time.Since(lv) > c.ttl {
+			delete(c.cache, key)
+		}
+		c.mu.Unlock()
 		return false, lastValidated
 	}
 

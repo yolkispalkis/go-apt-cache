@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yolkispalkis/go-apt-cache/internal/common"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/handlers"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
@@ -48,10 +49,10 @@ func (ci *CacheInitializer) Initialize() (storage.Cache, storage.HeaderCache, st
 	var headerCache storage.HeaderCache
 
 	if cfg.Cache.LRU {
-		maxSizeBytes, err := utils.ParseSize(cfg.Cache.MaxSize)
+		maxSizeBytes, err := common.ParseSize(cfg.Cache.MaxSize)
 		if err != nil {
 			maxSizeBytes = config.DefaultCacheMaxSize
-			logging.Warning("Invalid cache max size '%s' in config, defaulting to %s", cfg.Cache.MaxSize, utils.FormatSize(config.DefaultCacheMaxSize))
+			logging.Warning("Invalid cache max size '%s' in config, defaulting to %s", cfg.Cache.MaxSize, common.FormatSize(config.DefaultCacheMaxSize))
 		}
 
 		if cfg.Cache.CleanOnStart {
@@ -72,7 +73,7 @@ func (ci *CacheInitializer) Initialize() (storage.Cache, storage.HeaderCache, st
 
 		itemCount, currentSize, maxSize := lruCache.GetCacheStats()
 		logging.Info("LRU cache initialized with %d items, current size: %s, max size: %s",
-			itemCount, utils.FormatSize(currentSize), utils.FormatSize(maxSize))
+			itemCount, common.FormatSize(currentSize), common.FormatSize(maxSize))
 		logging.Info("Using LRU disk cache at %s (max size: %s)", cacheDir, cfg.Cache.MaxSize)
 
 		cache = lruCache

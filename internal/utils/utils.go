@@ -252,6 +252,9 @@ func SafeFilename(key string) string {
 			if component == "" {
 				continue
 			}
+			if component == "." || component == ".." {
+				component = "_"
+			}
 			safe := strings.ReplaceAll(component, ":", "_")
 			safe = strings.ReplaceAll(safe, "?", "_")
 			safe = strings.ReplaceAll(safe, "*", "_")

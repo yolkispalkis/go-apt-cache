@@ -1,4 +1,4 @@
-FROM golang:latest AS builder
+FROM golang:1.20 AS builder
 
 WORKDIR /app
 
@@ -15,7 +15,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o apt-cache ./cmd/go-apt-cache
 
 # Create a minimal runtime image
-FROM alpine:latest
+FROM alpine:3.17
 
 WORKDIR /app
 

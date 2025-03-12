@@ -33,7 +33,11 @@ func NewRepositoryHandler(
 	)
 
 	config.LocalPath = localPath
-	config.ValidationCache.SetTTL(time.Duration(globalConfig.Cache.ValidationCacheTTL) * time.Second)
+	ttl := time.Duration(globalConfig.Cache.ValidationCacheTTL) * time.Second
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	config.ValidationCache.SetTTL(ttl)
 
 	return &RepositoryHandler{
 		config: config,

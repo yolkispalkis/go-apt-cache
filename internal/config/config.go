@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/yolkispalkis/go-apt-cache/internal/common"
 	"github.com/yolkispalkis/go-apt-cache/internal/utils"
 )
 
@@ -90,7 +91,7 @@ func DefaultConfig() Config {
 		},
 		Repositories: []Repository{
 			{
-				URL:     "http://archive.ubuntu.com/ubuntu",
+				URL:     "https://archive.ubuntu.com/ubuntu",
 				Path:    "/",
 				Enabled: true,
 			},
@@ -155,7 +156,7 @@ func ValidateConfig(config Config) error {
 			return fmt.Errorf("cache directory not specified")
 		}
 
-		if _, err := utils.ParseSize(config.Cache.MaxSize); err != nil {
+		if _, err := common.ParseSize(config.Cache.MaxSize); err != nil {
 			return fmt.Errorf("invalid cache max size: %s", config.Cache.MaxSize)
 		}
 	}

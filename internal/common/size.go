@@ -1,4 +1,4 @@
-package utils
+package common
 
 import (
 	"fmt"
@@ -7,14 +7,14 @@ import (
 	"strings"
 )
 
+// ParseSize converts a human-readable size string to an integer number of bytes.
 func ParseSize(sizeStr string) (int64, error) {
 	if sizeStr == "" {
 		return 0, nil
 	}
 
-	re := regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT]?B)?$`)
+	re := regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?B)?$`)
 	matches := re.FindStringSubmatch(strings.ToUpper(sizeStr))
-
 	if matches == nil {
 		return 0, fmt.Errorf("invalid size format: %s", sizeStr)
 	}
@@ -34,7 +34,8 @@ func ParseSize(sizeStr string) (int64, error) {
 		multiplier = 1024 * 1024 * 1024
 	case "TB", "T":
 		multiplier = 1024 * 1024 * 1024 * 1024
-	case "B", "":
+	case "B", "BYTES", "":
+		// multiplier remains 1
 	default:
 		return 0, fmt.Errorf("unknown size unit: %s", matches[2])
 	}
@@ -42,19 +43,21 @@ func ParseSize(sizeStr string) (int64, error) {
 	return int64(sizeValue * multiplier), nil
 }
 
+// FormatSize returns a human-readable string representation of size in bytes.
 func FormatSize(sizeBytes int64) string {
 	const unit = 1024
 	if sizeBytes < unit {
 		return fmt.Sprintf("%d B", sizeBytes)
 	}
-	div, exp := int64(unit), 0
+	d, exp := int64(unit), 0
 	for n := sizeBytes / unit; n >= unit; n /= unit {
-		div *= unit
+		d *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %cB", float64(sizeBytes)/float64(div), "KMGT"[exp])
+	return fmt.Sprintf("%.1f %cB", float64(sizeBytes)/float64(d), "KMGT"[exp])
 }
 
+// ConvertSizeWithUnit converts a given size with unit to bytes.
 func ConvertSizeWithUnit(size int64, unit string) int64 {
 	switch strings.ToUpper(unit) {
 	case "KB", "K":

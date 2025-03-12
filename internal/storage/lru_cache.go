@@ -95,6 +95,11 @@ func (f *FileOperations) writeFileWithTemp(filePath string, data []byte) error {
 		return fmt.Errorf("failed to write temporary file: %w", err)
 	}
 
+	if _, err := os.Stat(filePath); err == nil {
+		if err := os.Remove(filePath); err != nil {
+			return fmt.Errorf("failed to remove existing file: %w", err)
+		}
+	}
 	if err := os.Rename(tempFilePath, filePath); err != nil {
 		return fmt.Errorf("failed to rename temporary file: %w", err)
 	}
@@ -112,26 +117,30 @@ func (f *FileOperations) WriteCacheFile(key string, data []byte) error {
 	return f.writeFileWithTemp(filePath, data)
 }
 
-func (f *FileOperations) FileExists(key string) bool {
-	filePath := f.GetFilePath(key)
+// Added helper functions to reduce duplicate code in file operations
+func (f *FileOperations) existsAtPath(filePath string) bool {
 	_, err := os.Stat(filePath)
 	return err == nil
+}
+
+func (f *FileOperations) removeAtPath(filePath string) error {
+	return os.Remove(filePath)
+}
+
+func (f *FileOperations) FileExists(key string) bool {
+	return f.existsAtPath(f.GetFilePath(key))
 }
 
 func (f *FileOperations) CacheFileExists(key string) bool {
-	filePath := f.GetCacheFilePath(key)
-	_, err := os.Stat(filePath)
-	return err == nil
+	return f.existsAtPath(f.GetCacheFilePath(key))
 }
 
 func (f *FileOperations) DeleteFile(key string) error {
-	filePath := f.GetFilePath(key)
-	return os.Remove(filePath)
+	return f.removeAtPath(f.GetFilePath(key))
 }
 
 func (f *FileOperations) DeleteCacheFile(key string) error {
-	filePath := f.GetCacheFilePath(key)
-	return os.Remove(filePath)
+	return f.removeAtPath(f.GetCacheFilePath(key))
 }
 
 type LRUCacheOptions struct {
