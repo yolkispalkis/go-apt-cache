@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+export PATH=$PATH:/usr/local/go/bin
+
 # Параметры пакета
 PKG_NAME="go-apt-proxy"
 PKG_VERSION="1.0.0"
