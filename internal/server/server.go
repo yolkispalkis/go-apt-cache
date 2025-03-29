@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -236,7 +237,29 @@ func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Last-Modified", cacheModTime.UTC().Format(http.TimeFormat))
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", cacheSize))
-		w.Header().Set("Content-Type", util.GetContentType(filePath))
+
+		// Проверим содержимое файла, чтобы определить, является ли он HTML
+		if !strings.HasSuffix(filePath, ".html") && !strings.HasSuffix(filePath, ".htm") {
+			// Создаем буфер для проверки начала файла
+			peekBuf := make([]byte, 512)
+			n, err := io.ReadAtLeast(cacheReader, peekBuf, 1)
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				logging.Error("Failed to read content for MIME detection from cache: %v", err)
+			} else {
+				// Проверяем на HTML-содержимое
+				contentType := http.DetectContentType(peekBuf[:n])
+				if strings.HasPrefix(contentType, "text/html") {
+					w.Header().Set("Content-Type", contentType)
+				} else {
+					w.Header().Set("Content-Type", util.GetContentType(filePath))
+				}
+
+				// Перестраиваем reader, чтобы включить уже прочитанные байты
+				cacheReader = io.NopCloser(io.MultiReader(bytes.NewReader(peekBuf[:n]), cacheReader))
+			}
+		} else {
+			w.Header().Set("Content-Type", util.GetContentType(filePath))
+		}
 
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusOK)
@@ -245,8 +268,18 @@ func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		readSeeker, ok := cacheReader.(io.ReadSeeker)
 		if !ok {
-			logging.Error("Cache reader for %s does not implement io.ReadSeeker", cacheKey)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			// Если после наших манипуляций cacheReader больше не ReadSeeker,
+			// нам нужно считать весь контент и отправить его напрямую
+			body, err := io.ReadAll(cacheReader)
+			if err != nil {
+				logging.Error("Failed to read cached content: %v", err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+			_, err = w.Write(body)
+			if err != nil {
+				logging.Error("Failed to write response: %v", err)
+			}
 			return
 		}
 
@@ -354,7 +387,34 @@ document.addEventListener('DOMContentLoaded', function() {
 	h.cacheManager.PutValidation(cacheKey, time.Now())
 
 	util.CopyRelevantHeaders(w.Header(), fetchResult.Header)
-	w.Header().Set("Content-Type", util.GetContentType(filePath))
+
+	// Проверяем Content-Type из заголовков ответа upstream
+	upstreamContentType := fetchResult.Header.Get("Content-Type")
+	if strings.HasPrefix(upstreamContentType, "text/html") {
+		// Если upstream уже отдает HTML, используем его Content-Type
+		w.Header().Set("Content-Type", upstreamContentType)
+	} else {
+		// Пытаемся определить Content-Type по содержимому, если похоже на HTML
+		// Создаем буфер для чтения первых байтов контента
+		peekBuf := make([]byte, 512)
+		n, err := io.ReadAtLeast(fetchResult.Body, peekBuf, 1)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			logging.Error("Failed to read content for MIME detection: %v", err)
+		} else {
+			// Проверяем, похоже ли на HTML
+			contentType := http.DetectContentType(peekBuf[:n])
+			if strings.HasPrefix(contentType, "text/html") {
+				w.Header().Set("Content-Type", contentType)
+			} else {
+				// Иначе используем определение типа по расширению файла
+				w.Header().Set("Content-Type", util.GetContentType(filePath))
+			}
+
+			// Создаем новый reader, который сначала вернет уже прочитанные байты, а затем остальное содержимое
+			fetchResult.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peekBuf[:n]), fetchResult.Body))
+		}
+	}
+
 	if cl := fetchResult.Header.Get("Content-Length"); cl != "" {
 		w.Header().Set("Content-Length", cl)
 	}
