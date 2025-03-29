@@ -1,338 +1,124 @@
+// internal/logging/logger.go
 package logging
 
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
-	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
-	"time"
+
+	"gopkg.in/natefinch/lumberjack.v2"
+
+	"github.com/yolkispalkis/go-apt-cache/internal/config"
 )
 
-func ParseSize(sizeStr string) (int64, error) {
-	if sizeStr == "" {
-		return 0, nil
-	}
-
-	re := regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT]?B)?$`)
-	matches := re.FindStringSubmatch(strings.ToUpper(sizeStr))
-
-	if matches == nil {
-		return 0, fmt.Errorf("invalid size format: %s", sizeStr)
-	}
-
-	sizeValue, err := strconv.ParseFloat(matches[1], 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid size value: %s", matches[1])
-	}
-
-	var multiplier float64 = 1
-	switch matches[2] {
-	case "KB", "K":
-		multiplier = 1024
-	case "MB", "M":
-		multiplier = 1024 * 1024
-	case "GB", "G":
-		multiplier = 1024 * 1024 * 1024
-	case "TB", "T":
-		multiplier = 1024 * 1024 * 1024 * 1024
-	case "B", "":
-	default:
-		return 0, fmt.Errorf("unknown size unit: %s", matches[2])
-	}
-
-	return int64(sizeValue * multiplier), nil
-}
-
-type LogConfig struct {
-	FilePath        string
-	DisableTerminal bool
-	MaxSize         string
-	Level           LogLevel
-}
-
-type LogLevel int
-
-const (
-	DEBUG LogLevel = iota
-	INFO
-	WARNING
-	ERROR
-	FATAL
+var (
+	logger  *slog.Logger
+	once    sync.Once
+	logSync func() error // Function to sync file logger if used
 )
 
-const DefaultLogMaxSize = 10 * 1024 * 1024
+// Setup initializes the global logger based on config.
+func Setup(cfg config.LoggingConfig) error {
+	var setupErr error
+	once.Do(func() {
+		var writers []io.Writer
 
-func (l LogLevel) String() string {
-	switch l {
-	case DEBUG:
-		return "DEBUG"
-	case INFO:
-		return "INFO"
-	case WARNING:
-		return "WARN"
-	case ERROR:
-		return "ERROR"
-	case FATAL:
-		return "FATAL"
+		// File Writer (using lumberjack for rotation)
+		if cfg.FilePath != "" {
+			lj := &lumberjack.Logger{
+				Filename:   cfg.FilePath,
+				MaxSize:    cfg.MaxSizeMB, // megabytes
+				MaxBackups: cfg.MaxBackups,
+				MaxAge:     cfg.MaxAgeDays, //days
+				Compress:   cfg.Compress,   // disabled by default
+				LocalTime:  true,           // Use local time for timestamps in filenames
+			}
+			writers = append(writers, lj)
+			logSync = lj.Close // Assign lumberjack's Close for syncing/closing
+			fmt.Printf("Logging to file: %s (Max Size: %dMB, Max Backups: %d, Max Age: %d days, Compress: %t)\n",
+				cfg.FilePath, cfg.MaxSizeMB, cfg.MaxBackups, cfg.MaxAgeDays, cfg.Compress)
+		} else {
+			logSync = func() error { return nil } // No-op sync if no file
+		}
+
+		// Terminal Writer
+		if !cfg.DisableTerminal {
+			writers = append(writers, os.Stdout)
+		}
+
+		if len(writers) == 0 {
+			// Should not happen if config validation passes, but safety first
+			writers = append(writers, io.Discard)
+			fmt.Println("Warning: No log outputs configured, logging is disabled.")
+		}
+
+		multiWriter := io.MultiWriter(writers...)
+
+		level := parseLevel(cfg.Level)
+
+		opts := &slog.HandlerOptions{
+			Level:     level,
+			AddSource: level <= slog.LevelDebug, // Only add source if debug level
+		}
+
+		// Use TextHandler for more human-readable logs, JSONHandler for machine parsing
+		handler := slog.NewTextHandler(multiWriter, opts)
+		// handler := slog.NewJSONHandler(multiWriter, opts)
+
+		logger = slog.New(handler)
+		slog.SetDefault(logger) // Set as default for convenience
+		logger.Info("Logger initialized", "level", level.String())
+	})
+	return setupErr
+}
+
+func parseLevel(levelStr string) slog.Level {
+	switch strings.ToLower(levelStr) {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
 	default:
-		return "UNKNOWN"
+		fmt.Printf("Warning: Unknown log level %q, defaulting to INFO.\n", levelStr)
+		return slog.LevelInfo
 	}
 }
 
-type Logger struct {
-	config     LogConfig
-	mu         sync.Mutex
-	file       *os.File
-	fileWriter io.Writer
-	writers    []io.Writer
-	logger     *loggerImpl
-}
-
-type loggerImpl struct {
-	out io.Writer
-	mu  sync.Mutex
-}
-
-func (l *loggerImpl) Print(v ...interface{}) {
-	l.Output(2, fmt.Sprint(v...))
-}
-
-func (l *loggerImpl) Printf(format string, v ...interface{}) {
-	l.Output(2, fmt.Sprintf(format, v...))
-}
-
-func (l *loggerImpl) Output(calldepth int, s string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	_, err := l.out.Write([]byte(s + "\n"))
-	return err
-}
-
-func NewLogger(config LogConfig) (*Logger, error) {
-	logger := &Logger{
-		config: config,
-	}
-
-	var writers []io.Writer
-
-	if !config.DisableTerminal {
-		writers = append(writers, os.Stdout)
-	}
-
-	if config.FilePath != "" {
-		if err := logger.setupFileWriter(); err != nil {
-			return nil, fmt.Errorf("failed to setup file writer: %w", err)
-		}
-		writers = append(writers, logger.fileWriter)
-	}
-
-	var writer io.Writer
-	if len(writers) > 0 {
-		writer = io.MultiWriter(writers...)
-	} else {
-		writer = io.Discard
-	}
-
-	logger.logger = &loggerImpl{out: writer}
-	logger.writers = writers
-
-	return logger, nil
-}
-
-func (l *Logger) setupFileWriter() error {
-	dir := filepath.Dir(l.config.FilePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create log directory: %w", err)
-	}
-
-	file, err := os.OpenFile(l.config.FilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open log file: %w", err)
-	}
-
-	maxSize, err := ParseSize(l.config.MaxSize)
-	if err != nil {
-		maxSize = DefaultLogMaxSize
-		Warning("Invalid log max size '%s', defaulting to 10MB", l.config.MaxSize)
-	}
-
-	l.file = file
-	l.fileWriter = &sizeConstrainedWriter{
-		file:        file,
-		maxSize:     maxSize,
-		currentSize: 0,
-		logger:      l,
-	}
-
-	return nil
-}
-
-func (l *Logger) rotateLogFile() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.file != nil {
-		l.file.Close()
-	}
-
-	backupName := fmt.Sprintf("%s.%s", l.config.FilePath, time.Now().Format("20060102-150405"))
-	if err := os.Rename(l.config.FilePath, backupName); err != nil {
-		if !os.IsNotExist(err) {
-			Error("Failed to rotate log file: %v", err)
-		}
-	}
-
-	file, err := os.OpenFile(l.config.FilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open new log file after rotation: %w", err)
-	}
-
-	l.file = file
-
-	for i, w := range l.writers {
-		if sw, ok := w.(*sizeConstrainedWriter); ok {
-			sw.file = file
-			sw.currentSize = 0
-			l.writers[i] = sw
-			l.fileWriter = sw
-			break
-		}
-	}
-
-	var writer io.Writer
-	if len(l.writers) > 0 {
-		writer = io.MultiWriter(l.writers...)
-	} else {
-		writer = io.Discard
-	}
-	l.logger = &loggerImpl{out: writer}
-
-	return nil
-}
-
-func (l *Logger) Close() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.file != nil {
-		return l.file.Close()
+// Sync flushes any buffered log entries (useful mainly for file logging).
+func Sync() error {
+	if logSync != nil {
+		return logSync()
 	}
 	return nil
 }
 
-func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
-	if level < l.config.Level {
-		return
-	}
+// --- Convenience functions (using default logger) ---
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	now := time.Now().Format("2006-01-02 15:04:05")
-	prefix := fmt.Sprintf("[%s] [%s] ", now, level.String())
-
-	var message string
-	if format == "" {
-		message = fmt.Sprint(args...)
-	} else {
-		message = fmt.Sprintf(format, args...)
-	}
-	l.logger.Output(2, prefix+message)
+func Debug(msg string, args ...any) {
+	slog.Debug(msg, args...)
 }
 
-func (l *Logger) Debug(format string, args ...interface{}) {
-	l.log(DEBUG, format, args...)
+func Info(msg string, args ...any) {
+	slog.Info(msg, args...)
 }
 
-func (l *Logger) Info(format string, args ...interface{}) {
-	l.log(INFO, format, args...)
+func Warn(msg string, args ...any) {
+	slog.Warn(msg, args...)
 }
 
-func (l *Logger) Warning(format string, args ...interface{}) {
-	l.log(WARNING, format, args...)
+func Error(msg string, args ...any) {
+	slog.Error(msg, args...)
 }
 
-func (l *Logger) Error(format string, args ...interface{}) {
-	l.log(ERROR, format, args...)
-}
-
-func (l *Logger) Fatal(format string, args ...interface{}) {
-	l.log(FATAL, format, args...)
-	os.Exit(1)
-}
-
-type sizeConstrainedWriter struct {
-	file        *os.File
-	maxSize     int64
-	currentSize int64
-	logger      *Logger
-}
-
-func (w *sizeConstrainedWriter) Write(p []byte) (n int, err error) {
-	if w.maxSize > 0 && w.currentSize+int64(len(p)) > w.maxSize {
-		if err := w.logger.rotateLogFile(); err != nil {
-			return 0, err
-		}
-		w.currentSize = 0
-	}
-
-	n, err = w.file.Write(p)
-	w.currentSize += int64(n)
-	return n, err
-}
-
-var DefaultLogger *Logger
-
-func Initialize(config LogConfig) error {
-	logger, err := NewLogger(config)
-	if err != nil {
-		return err
-	}
-	DefaultLogger = logger
-	return nil
-}
-
-func Debug(format string, args ...interface{}) {
-	if DefaultLogger != nil {
-		DefaultLogger.Debug(format, args...)
-	}
-}
-
-func Info(format string, args ...interface{}) {
-	if DefaultLogger != nil {
-		DefaultLogger.Info(format, args...)
-	}
-}
-
-func Warning(format string, args ...interface{}) {
-	if DefaultLogger != nil {
-		DefaultLogger.Warning(format, args...)
-	}
-}
-
-func Error(format string, args ...interface{}) {
-	if DefaultLogger != nil {
-		DefaultLogger.Error(format, args...)
-	}
-}
-
-func Fatal(format string, args ...interface{}) {
-	if DefaultLogger != nil {
-		DefaultLogger.Fatal(format, args...)
-	} else {
-		fmt.Printf("FATAL: "+format+"\n", args...)
-		os.Exit(1)
-	}
-}
-
-func Close() error {
-	if DefaultLogger != nil {
-		return DefaultLogger.Close()
-	}
-	return nil
+// ErrorE is a helper to log an error object along with a message.
+func ErrorE(msg string, err error, args ...any) {
+	allArgs := append([]any{"error", err}, args...)
+	slog.Error(msg, allArgs...)
 }
