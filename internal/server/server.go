@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
@@ -449,7 +450,15 @@ document.addEventListener('DOMContentLoaded', function() {
 	_ = pw.Close()
 
 	if copyErr != nil {
-		logging.Warn("Error copying response to client for %s: %v", cacheKey, copyErr)
+		// Проверяем, является ли ошибка типа "broken pipe" или связана с обрывом соединения
+		if strings.Contains(copyErr.Error(), "broken pipe") ||
+			strings.Contains(copyErr.Error(), "connection reset") ||
+			errors.Is(copyErr, syscall.EPIPE) ||
+			errors.Is(copyErr, syscall.ECONNRESET) {
+			logging.ErrorE("Failed to write response", copyErr)
+		} else {
+			logging.Warn("Error copying response to client for %s: %v", cacheKey, copyErr)
+		}
 	}
 
 	select {

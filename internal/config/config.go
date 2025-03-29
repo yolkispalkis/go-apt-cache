@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
@@ -90,21 +91,11 @@ type CacheConfig struct {
 	ValidationTTL Duration `json:"validationTTL"`
 }
 
-type LoggingConfig struct {
-	Level           string `json:"level"`
-	FilePath        string `json:"filePath"`
-	DisableTerminal bool   `json:"disableTerminal"`
-	MaxSizeMB       int    `json:"maxSizeMB"`
-	MaxBackups      int    `json:"maxBackups"`
-	MaxAgeDays      int    `json:"maxAgeDays"`
-	Compress        bool   `json:"compress"`
-}
-
 type Config struct {
-	Server       ServerConfig  `json:"server"`
-	Cache        CacheConfig   `json:"cache"`
-	Logging      LoggingConfig `json:"logging"`
-	Repositories []Repository  `json:"repositories"`
+	Server       ServerConfig          `json:"server"`
+	Cache        CacheConfig           `json:"cache"`
+	Logging      logging.LoggingConfig `json:"logging"`
+	Repositories []Repository          `json:"repositories"`
 }
 
 // Default creates a default configuration instance.
@@ -127,7 +118,7 @@ func Default() *Config {
 			CleanOnStart:  false,
 			ValidationTTL: Duration(5 * time.Minute),
 		},
-		Logging: LoggingConfig{
+		Logging: logging.LoggingConfig{
 			Level:           "info",
 			FilePath:        "./logs/apt_cache.log",
 			DisableTerminal: false,
