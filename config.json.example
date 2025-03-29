@@ -1,0 +1,50 @@
+{
+  "server": {
+    "listenAddress": ":8080",
+    "unixSocketPath": "",
+    "unixSocketPermissions": "660",
+    "requestTimeout": "60s",
+    "shutdownTimeout": "15s",
+    "idleTimeout": "120s",
+    "readHeaderTimeout": "10s",
+    "maxConcurrentFetches": 10
+  },
+  "cache": {
+    "directory": "./cache_data",
+    "maxSize": "10GB",
+    "enabled": true,
+    "cleanOnStart": false,
+    "validationTTL": "5m"
+  },
+  "logging": {
+    "level": "info",
+    "filePath": "./logs/apt_cache.log",
+    "disableTerminal": false,
+    "maxSizeMB": 100,
+    "maxBackups": 3,
+    "maxAgeDays": 7,
+    "compress": true
+  },
+  "repositories": [
+    {
+      "name": "ubuntu",
+      "url": "http://archive.ubuntu.com/ubuntu",
+      "enabled": true
+    },
+    {
+      "name": "debian",
+      "url": "http://deb.debian.org/debian",
+      "enabled": false
+    },
+    {
+      "name": "security",
+      "url": "http://security.ubuntu.com/ubuntu",
+      "enabled": false
+    },
+    {
+      "name": "ppa-example",
+      "url": "http://ppa.launchpadcontent.net/example/ppa/ubuntu",
+      "enabled": false
+    }
+  ]
+} 
