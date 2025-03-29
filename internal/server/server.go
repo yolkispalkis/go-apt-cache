@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -33,6 +32,7 @@ func New(
 ) (*Server, error) {
 	mux := http.NewServeMux()
 
+	// Handler for the root path "/"
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -59,6 +59,7 @@ func New(
 				if !repo.Enabled {
 					continue
 				}
+				// Script to dynamically update the host in the example sources.list line
 				fmt.Fprintf(w, `
     <div class="repo">
       <h2>%s</h2>
@@ -92,12 +93,14 @@ func New(
 </html>`, cacheStats.ItemCount, util.FormatSize(cacheStats.CurrentSize), util.FormatSize(cacheStats.MaxSize))
 			return
 		}
+		// Handle other root-level paths like /status or non-repository paths
 		if r.URL.Path != "/status" && !strings.HasPrefix(r.URL.Path, "/") {
 			http.NotFound(w, r)
 			return
 		}
 	})
 
+	// Handler for /status
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
@@ -110,28 +113,32 @@ func New(
 		fmt.Fprintf(w, "Cache Size: %s / %s\n", util.FormatSize(cacheStats.CurrentSize), util.FormatSize(cacheStats.MaxSize))
 	})
 
+	// Register handlers for each enabled repository
 	for _, repo := range cfg.Repositories {
 		if !repo.Enabled {
 			logging.Info("Skipping disabled repository: %s", repo.Name)
 			continue
 		}
 
-		pathPrefix := "/" + repo.Name + "/"
-
+		// Ensure path prefix includes the trailing slash for StripPrefix
+		pathPrefix := "/" + strings.Trim(repo.Name, "/") + "/"
 		repoHandler := NewRepositoryHandler(repo, cfg.Server, cacheManager, fetcher)
 
 		mux.Handle(pathPrefix, http.StripPrefix(pathPrefix, repoHandler))
 		logging.Info("Registered handler for repository %q at path %s (Upstream: %s)", repo.Name, pathPrefix, repo.URL)
 	}
 
+	// Apply middleware
 	var handler http.Handler = mux
 	handler = LoggingMiddleware(handler)
 	handler = RecoveryMiddleware(handler)
 
+	// Configure the HTTP server
 	httpServer := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.Duration(),
 		IdleTimeout:       cfg.Server.IdleTimeout.Duration(),
+		// Add other timeouts like WriteTimeout if needed
 	}
 
 	return &Server{
@@ -163,18 +170,25 @@ func NewRepositoryHandler(
 	}
 }
 
+// ServeHTTP handles requests for a specific repository.
 func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Only allow GET and HEAD requests
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
 
+	// filePath is relative to the repository root (e.g., "dists/stable/Release")
 	filePath := strings.TrimPrefix(r.URL.Path, "/")
-	if filePath == "" {
-		if strings.HasSuffix(r.URL.Path, "/") {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			host := r.Host
-			fmt.Fprintf(w, `<!DOCTYPE html>
+	// isDirRequest checks if the original request path ended with a slash
+	isDirRequest := strings.HasSuffix(r.URL.Path, "/") || r.URL.Path == ""
+
+	// Handle request for the repository root (e.g., /ubuntu/)
+	if filePath == "" && isDirRequest {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		host := r.Host
+		// Display a simple info page for the repository root
+		fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
@@ -210,282 +224,227 @@ func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
   <p><a href="/">← Вернуться на главную страницу</a></p>
 </body>
 </html>`, h.repoConfig.Name, h.repoConfig.Name, h.repoConfig.URL, h.repoConfig.URL, h.repoConfig.Name, h.repoConfig.Name, host, h.repoConfig.Name, h.repoConfig.Name)
-			return
-		}
+		return
 	}
 
+	// Construct cache key and upstream URL
 	cacheKey := h.repoConfig.Name + "/" + filePath
-	upstreamURL := h.repoConfig.URL + "/" + filePath
+	upstreamURL := strings.TrimSuffix(h.repoConfig.URL, "/") + "/" + filePath
 
-	useValidationCache := true
-	if useValidationCache {
-		validationTime, ok := h.cacheManager.GetValidation(cacheKey)
-		if ok {
-			if h.checkClientCacheHeaders(w, r, validationTime) {
-				return
-			}
+	// Check validation cache first (quick check for recent fetches)
+	validationTime, ok := h.cacheManager.GetValidation(cacheKey)
+	if ok {
+		if h.checkClientCacheHeaders(w, r, validationTime) {
+			return // Respond with 304 Not Modified based on validation cache time
 		}
 	}
 
+	// --- Cache Hit Handling ---
 	cacheReader, cacheSize, cacheModTime, err := h.cacheManager.Get(r.Context(), cacheKey)
 	if err == nil {
 		defer cacheReader.Close()
 		logging.Debug("Cache hit for key: %s", cacheKey)
 
 		if h.checkClientCacheHeaders(w, r, cacheModTime) {
-			return
+			return // Respond with 304 Not Modified based on actual file modTime
 		}
 
+		// Set basic headers from cache metadata
 		w.Header().Set("Last-Modified", cacheModTime.UTC().Format(http.TimeFormat))
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", cacheSize))
-
-		// Проверим содержимое файла, чтобы определить, является ли он HTML
-		if !strings.HasSuffix(filePath, ".html") && !strings.HasSuffix(filePath, ".htm") {
-			// Создаем буфер для проверки начала файла
-			peekBuf := make([]byte, 512)
-			n, err := io.ReadAtLeast(cacheReader, peekBuf, 1)
-			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-				logging.Error("Failed to read content for MIME detection from cache: %v", err)
-			} else {
-				// Проверяем на HTML-содержимое
-				contentType := http.DetectContentType(peekBuf[:n])
-				if strings.HasPrefix(contentType, "text/html") {
-					w.Header().Set("Content-Type", contentType)
-				} else {
-					w.Header().Set("Content-Type", util.GetContentType(filePath))
-				}
-
-				// Перестраиваем reader, чтобы включить уже прочитанные байты
-				cacheReader = io.NopCloser(io.MultiReader(bytes.NewReader(peekBuf[:n]), cacheReader))
-			}
-		} else {
-			w.Header().Set("Content-Type", util.GetContentType(filePath))
-		}
+		// Determine Content-Type primarily by file extension
+		w.Header().Set("Content-Type", util.GetContentType(filePath))
 
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
+		// Try to use http.ServeContent for Range request support if reader is seekable
 		readSeeker, ok := cacheReader.(io.ReadSeeker)
-		if !ok {
-			// Если после наших манипуляций cacheReader больше не ReadSeeker,
-			// нам нужно считать весь контент и отправить его напрямую
-			body, err := io.ReadAll(cacheReader)
-			if err != nil {
-				logging.Error("Failed to read cached content: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-				return
+		if ok {
+			http.ServeContent(w, r, filePath, cacheModTime, readSeeker)
+		} else {
+			// Fallback if not seekable (less likely for file cache but possible)
+			logging.Warn("Cache reader for %s is not a ReadSeeker, serving via io.Copy", cacheKey)
+			w.WriteHeader(http.StatusOK) // Ensure status is set before writing body
+			_, copyErr := io.Copy(w, cacheReader)
+			if copyErr != nil && !isClientDisconnectedError(copyErr) {
+				logging.ErrorE("Failed to write response body from cache", copyErr, "key", cacheKey)
 			}
-			_, err = w.Write(body)
-			if err != nil {
-				logging.Error("Failed to write response: %v", err)
-			}
-			return
 		}
-
-		http.ServeContent(w, r, filePath, cacheModTime, readSeeker)
-		return
+		return // Done handling cache hit
 	}
 
+	// Handle errors other than "not found" during cache access
 	if !errors.Is(err, os.ErrNotExist) {
 		logging.Error("Error reading from cache for key %s: %v", cacheKey, err)
 		http.Error(w, "Internal Cache Error", http.StatusInternalServerError)
 		return
 	}
 
-	// Если файла нет в кеше и это потенциально index.html
-	if strings.HasSuffix(r.URL.Path, "/") && (filePath == "" || strings.HasSuffix(filePath, "/")) {
-		// Попробуем загрузить index.html
-		indexFilePath := filePath
-		if !strings.HasSuffix(indexFilePath, "/") {
-			indexFilePath += "/"
-		}
-		indexFilePath += "index.html"
-
-		indexCacheKey := h.repoConfig.Name + "/" + indexFilePath
-		indexUpstreamURL := h.repoConfig.URL + "/" + indexFilePath
-
-		fetchResult, err := h.fetcher.Fetch(r.Context(), indexCacheKey, indexUpstreamURL, r.Header)
-		if err == nil {
-			// Нашли index.html, устанавливаем правильный тип контента
-			defer fetchResult.Body.Close()
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-			// Сохраняем в кэш
-			// Сразу читаем содержимое для манипуляций
-			body, err := io.ReadAll(fetchResult.Body)
-			if err != nil {
-				logging.Error("Failed to read HTML content: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-				return
-			}
-
-			// Сохраняем в кэш
-			go func() {
-				bodyReader := strings.NewReader(string(body))
-				modTimeToUse := fetchResult.ModTime
-				if modTimeToUse.IsZero() {
-					modTimeToUse = time.Now()
-				}
-				err := h.cacheManager.Put(context.Background(), indexCacheKey, io.NopCloser(bodyReader), int64(len(body)), modTimeToUse)
-				if err != nil {
-					logging.Error("Failed to write index.html %s to cache: %v", indexCacheKey, err)
-				}
-			}()
-
-			// Добавляем JavaScript в HTML-контент для корректного отображения URL за реверс-прокси
-			contentType := fetchResult.Header.Get("Content-Type")
-			if strings.HasPrefix(contentType, "text/html") {
-				htmlContent := string(body)
-
-				// Проверяем, есть ли </body> тег для вставки перед ним
-				bodyCloseIndex := strings.LastIndex(htmlContent, "</body>")
-				if bodyCloseIndex != -1 {
-					jsCode := `<script>
-document.addEventListener('DOMContentLoaded', function() {
-  // Найти все ссылки на apt репозитории и заменить их на динамические URL
-  var links = document.querySelectorAll("a[href*='http://'], a[href*='https://']");
-  var baseUrl = window.location.protocol + '//' + window.location.host;
-  
-  links.forEach(function(link) {
-    // Обновляем только релевантные apt-ссылки
-    if (link.textContent.includes('deb ') && link.textContent.includes('/ubuntu/')) {
-      var repoPath = window.location.pathname.replace(/\/$/, '');
-      link.textContent = link.textContent.replace(/deb (https?:\/\/)[^\/]+(\/[^\/]+\/)/, 'deb ' + baseUrl + repoPath + '/');
-    }
-  });
-});
-</script>`
-
-					htmlContent = htmlContent[:bodyCloseIndex] + jsCode + htmlContent[bodyCloseIndex:]
-				}
-
-				w.Write([]byte(htmlContent))
-			} else {
-				w.Write(body)
-			}
-			return
-		}
-	}
-
+	// --- Cache Miss Handling ---
 	logging.Debug("Cache miss for key: %s, fetching from upstream: %s", cacheKey, upstreamURL)
 
+	// Fetch from upstream, passing client's conditional headers
 	fetchResult, err := h.fetcher.Fetch(r.Context(), cacheKey, upstreamURL, r.Header)
 	if err != nil {
 		logging.Error("Failed to fetch %s (key %s) from upstream: %v", upstreamURL, cacheKey, err)
 		if errors.Is(err, fetch.ErrNotFound) {
+			// If original request looked like a directory, don't try index.html here,
+			// just return 404 for the original path. Upstream index pages aren't proxied directly.
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		} else if errors.Is(err, fetch.ErrUpstreamNotModified) {
+			// Upstream says not modified based on *client's* If-Modified-Since.
+			// Update our validation cache and return 304 to the client.
+			h.cacheManager.PutValidation(cacheKey, time.Now())
 			w.WriteHeader(http.StatusNotModified)
 		} else {
+			// Other upstream errors (5xx, timeout, etc.)
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		}
 		return
 	}
 	defer fetchResult.Body.Close()
 
+	// Mark validation time now that we have a successful fetch
 	h.cacheManager.PutValidation(cacheKey, time.Now())
 
+	// Copy relevant headers (Content-Length, ETag, Cache-Control etc.) from upstream response
 	util.CopyRelevantHeaders(w.Header(), fetchResult.Header)
 
-	// Проверяем Content-Type из заголовков ответа upstream
+	// Determine Content-Type: prioritize specific upstream header, fallback to extension
 	upstreamContentType := fetchResult.Header.Get("Content-Type")
-	if strings.HasPrefix(upstreamContentType, "text/html") {
-		// Если upstream уже отдает HTML, используем его Content-Type
+	if upstreamContentType != "" && upstreamContentType != "application/octet-stream" {
 		w.Header().Set("Content-Type", upstreamContentType)
 	} else {
-		// Пытаемся определить Content-Type по содержимому, если похоже на HTML
-		// Создаем буфер для чтения первых байтов контента
-		peekBuf := make([]byte, 512)
-		n, err := io.ReadAtLeast(fetchResult.Body, peekBuf, 1)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			logging.Error("Failed to read content for MIME detection: %v", err)
-		} else {
-			// Проверяем, похоже ли на HTML
-			contentType := http.DetectContentType(peekBuf[:n])
-			if strings.HasPrefix(contentType, "text/html") {
-				w.Header().Set("Content-Type", contentType)
-			} else {
-				// Иначе используем определение типа по расширению файла
-				w.Header().Set("Content-Type", util.GetContentType(filePath))
-			}
-
-			// Создаем новый reader, который сначала вернет уже прочитанные байты, а затем остальное содержимое
-			fetchResult.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peekBuf[:n]), fetchResult.Body))
-		}
+		// Fallback to extension-based detection if upstream type is missing or generic
+		w.Header().Set("Content-Type", util.GetContentType(filePath))
+	}
+	// Ensure Last-Modified is set if upstream provided it (CopyRelevantHeaders should handle this)
+	if _, ok := w.Header()["Last-Modified"]; !ok && !fetchResult.ModTime.IsZero() {
+		w.Header().Set("Last-Modified", fetchResult.ModTime.UTC().Format(http.TimeFormat))
 	}
 
-	if cl := fetchResult.Header.Get("Content-Length"); cl != "" {
-		w.Header().Set("Content-Length", cl)
-	}
-
+	// Use Pipe and TeeReader to write to cache and client simultaneously
 	pr, pw := io.Pipe()
 	cacheErrChan := make(chan error, 1)
 
+	// Goroutine to save the fetched content to cache via the pipe reader
 	go func() {
 		defer close(cacheErrChan)
 		modTimeToUse := fetchResult.ModTime
 		if modTimeToUse.IsZero() {
+			// Use current time if upstream didn't provide Last-Modified
+			// This affects the Last-Modified header on subsequent cache hits
 			modTimeToUse = time.Now()
 		}
+		// Pass fetchResult.Size (-1 if unknown) to Put for potential size check
 		err := h.cacheManager.Put(context.Background(), cacheKey, pr, fetchResult.Size, modTimeToUse)
 		if err != nil {
+			// Log error, but don't propagate to client response
 			logging.Error("Failed to write key %s to cache: %v", cacheKey, err)
 		}
-		cacheErrChan <- err
+		cacheErrChan <- err // Signal completion, even if error occurred
 	}()
 
+	// TeeReader reads from upstream (fetchResult.Body) and writes to the pipe writer (pw)
 	teeReader := io.TeeReader(fetchResult.Body, pw)
 
+	// Write headers and status code *before* writing body
 	w.WriteHeader(fetchResult.StatusCode)
 
+	// Skip body copy for HEAD requests
 	if r.Method == http.MethodHead {
-		pw.Close()
+		pw.Close() // Close pipe writer, nothing to cache body
+		// Wait briefly for caching goroutine (likely completes instantly as pipe is closed)
+		select {
+		case <-cacheErrChan:
+		case <-time.After(100 * time.Millisecond):
+		}
 		return
 	}
 
+	// Copy response body from teeReader to the client (http.ResponseWriter)
 	_, copyErr := io.Copy(w, teeReader)
 
-	_ = pw.Close()
-
-	if copyErr != nil {
-		// Проверяем, является ли ошибка типа "broken pipe" или связана с обрывом соединения
-		if strings.Contains(copyErr.Error(), "broken pipe") ||
-			strings.Contains(copyErr.Error(), "connection reset") ||
-			errors.Is(copyErr, syscall.EPIPE) ||
-			errors.Is(copyErr, syscall.ECONNRESET) {
-			logging.ErrorE("Failed to write response", copyErr)
-		} else {
-			logging.Warn("Error copying response to client for %s: %v", cacheKey, copyErr)
-		}
+	// Close the pipe writer *after* copying is done or failed
+	// This signals EOF to the reader side (cacheManager.Put)
+	pipeCloseErr := pw.Close() // Check error on close as well
+	if pipeCloseErr != nil && !errors.Is(pipeCloseErr, io.ErrClosedPipe) {
+		logging.Warn("Error closing pipe writer for %s: %v", cacheKey, pipeCloseErr)
 	}
 
+	// Handle client disconnection errors gracefully during copy
+	if copyErr != nil && !isClientDisconnectedError(copyErr) {
+		logging.Warn("Error copying response to client for %s: %v", cacheKey, copyErr)
+	}
+
+	// Wait for caching goroutine to finish
 	select {
-	case cacheErr := <-cacheErrChan:
-		if cacheErr != nil {
-			logging.Error("Error writing to cache for %s: %v", cacheKey, cacheErr)
+	case cacheWriteErr := <-cacheErrChan:
+		if cacheWriteErr != nil {
+			// Error already logged in the goroutine
+			logging.Warn("Cache write finished with error for %s", cacheKey)
+		} else {
+			logging.Debug("Cache write finished successfully for %s", cacheKey)
 		}
-	case <-time.After(500 * time.Millisecond):
-		logging.Warn("Cache write for %s is taking longer than expected", cacheKey)
+	case <-time.After(30 * time.Second): // Increased timeout for potentially large files
+		logging.Warn("Cache write for %s did not complete within timeout", cacheKey)
+		// Consider canceling the Put context if cacheManager supports it?
 	}
 }
 
+// checkClientCacheHeaders checks If-Modified-Since and returns true if 304 should be sent.
 func (h *RepositoryHandler) checkClientCacheHeaders(w http.ResponseWriter, r *http.Request, modTime time.Time) bool {
 	if modTime.IsZero() {
-		return false
+		return false // Cannot validate without modTime
 	}
 
 	ifims := r.Header.Get("If-Modified-Since")
 	if ifims != "" {
 		if t, err := http.ParseTime(ifims); err == nil {
+			// Truncate to second precision for comparison as per RFC 7232
 			modTimeTruncated := modTime.Truncate(time.Second)
-			if !modTimeTruncated.After(t.Truncate(time.Second)) {
+			clientTimeTruncated := t.Truncate(time.Second)
+
+			// If the cached time is not after the client's time, it's not modified
+			// Use !After for correct comparison including equality
+			if !modTimeTruncated.After(clientTimeTruncated) {
 				w.WriteHeader(http.StatusNotModified)
 				return true
 			}
+		} else {
+			logging.Warn("Could not parse If-Modified-Since header '%s': %v", ifims, err)
 		}
 	}
 
+	// ETag handling could be added here if needed, checking If-None-Match
+
+	return false
+}
+
+// isClientDisconnectedError checks if an error indicates the client disconnected.
+func isClientDisconnectedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for common client disconnection errors across different OS
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	// Check for context cancellation (might happen if client closes connection)
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	// Check for specific net/http error strings (less reliable but common)
+	errStr := err.Error()
+	if strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "connection reset by peer") ||
+		strings.Contains(errStr, "client disconnected") ||
+		// Go 1.17+ specific error on tls connection close:
+		strings.Contains(errStr, "tls: user canceled") {
+		return true
+	}
 	return false
 }
