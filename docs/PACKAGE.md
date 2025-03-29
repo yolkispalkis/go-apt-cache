@@ -54,6 +54,7 @@ sudo apt-get install -f
 - Конфигурация: `/etc/go-apt-proxy/config.json`
 - Файлы кеша: `/var/cache/go-apt-proxy/`
 - Лог-файлы: `/var/log/go-apt-proxy/`
+- Файлы сокета: `/var/run/go-apt-proxy/`
 - Systemd сервис: `/etc/systemd/system/go-apt-proxy.service`
 - Конфигурация APT: `/etc/apt/apt.conf.d/01proxy`
 
@@ -69,6 +70,14 @@ sudo nano /etc/go-apt-proxy/config.json
 
 ```bash
 sudo systemctl restart go-apt-proxy
+```
+
+### Использование Unix сокета
+
+В конфигурации по умолчанию настроен Unix сокет по пути `/var/run/go-apt-proxy/apt-proxy.sock`. Чтобы использовать его вместо HTTP, измените файл `/etc/apt/apt.conf.d/01proxy`:
+
+```
+Acquire::http::Proxy "http://unix:/var/run/go-apt-proxy/apt-proxy.sock";
 ```
 
 ### Управление сервисом
@@ -136,15 +145,16 @@ sudo df -h /var/cache/go-apt-proxy
 
 ### Проблемы с правами доступа
 
-Проверьте, что пользователь `apt-proxy` имеет права на запись в директории кеша и логов:
+Проверьте, что пользователь `apt-proxy` имеет права на запись в директории кеша, логов и сокетов:
 
 ```bash
-sudo ls -la /var/cache/go-apt-proxy /var/log/go-apt-proxy
+sudo ls -la /var/cache/go-apt-proxy /var/log/go-apt-proxy /var/run/go-apt-proxy
 ```
 
 При необходимости исправьте права доступа:
 
 ```bash
-sudo chown -R apt-proxy:apt-proxy /var/cache/go-apt-proxy /var/log/go-apt-proxy
+sudo chown -R apt-proxy:apt-proxy /var/cache/go-apt-proxy /var/log/go-apt-proxy /var/run/go-apt-proxy
 sudo chmod 750 /var/cache/go-apt-proxy /var/log/go-apt-proxy
+sudo chmod 755 /var/run/go-apt-proxy
 ``` 

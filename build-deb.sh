@@ -28,8 +28,59 @@ mkdir -p "${DEBIAN_DIR}" "${BIN_DIR}" "${CONFIG_DIR}" "${SYSTEMD_DIR}" "${CACHE_
 echo "Сборка go-apt-proxy..."
 go build -o "${BIN_DIR}/${PKG_NAME}" main.go
 
-# Копирование конфигурационного файла
-cp config.json.example "${CONFIG_DIR}/config.json"
+# Создание модифицированного конфигурационного файла с правильными путями
+cat > "${CONFIG_DIR}/config.json" << EOF
+{
+  "server": {
+    "listenAddress": ":8080",
+    "unixSocketPath": "/var/run/go-apt-proxy/apt-proxy.sock",
+    "unixSocketPermissions": "660",
+    "requestTimeout": "60s",
+    "shutdownTimeout": "15s",
+    "idleTimeout": "120s",
+    "readHeaderTimeout": "10s",
+    "maxConcurrentFetches": 10
+  },
+  "cache": {
+    "directory": "/var/cache/go-apt-proxy",
+    "maxSize": "10GB",
+    "enabled": true,
+    "cleanOnStart": false,
+    "validationTTL": "5m"
+  },
+  "logging": {
+    "level": "info",
+    "filePath": "/var/log/go-apt-proxy/apt_cache.log",
+    "disableTerminal": false,
+    "maxSizeMB": 100,
+    "maxBackups": 3,
+    "maxAgeDays": 7,
+    "compress": true
+  },
+  "repositories": [
+    {
+      "name": "ubuntu",
+      "url": "http://archive.ubuntu.com/ubuntu",
+      "enabled": true
+    },
+    {
+      "name": "debian",
+      "url": "http://deb.debian.org/debian",
+      "enabled": false
+    },
+    {
+      "name": "security",
+      "url": "http://security.ubuntu.com/ubuntu",
+      "enabled": false
+    },
+    {
+      "name": "ppa-example",
+      "url": "http://ppa.launchpadcontent.net/example/ppa/ubuntu",
+      "enabled": false
+    }
+  ]
+}
+EOF
 
 # Настройка прав доступа
 chmod 755 "${BIN_DIR}/${PKG_NAME}"
@@ -78,9 +129,13 @@ if ! getent passwd apt-proxy > /dev/null; then
     adduser --system --group --no-create-home --home /var/cache/go-apt-proxy apt-proxy
 fi
 
+# Создание дополнительных директорий
+mkdir -p /var/run/go-apt-proxy
+
 # Установка прав доступа
-chown -R apt-proxy:apt-proxy /var/cache/go-apt-proxy /var/log/go-apt-proxy
+chown -R apt-proxy:apt-proxy /var/cache/go-apt-proxy /var/log/go-apt-proxy /var/run/go-apt-proxy
 chmod 750 /var/cache/go-apt-proxy /var/log/go-apt-proxy
+chmod 755 /var/run/go-apt-proxy
 
 # Перезагрузка systemd и включение сервиса
 systemctl daemon-reload
@@ -131,6 +186,7 @@ if [ "\$1" = "purge" ]; then
     # Удаление кеша и логов
     rm -rf /var/cache/go-apt-proxy
     rm -rf /var/log/go-apt-proxy
+    rm -rf /var/run/go-apt-proxy
 
     # Удаление пользователя
     if getent passwd apt-proxy > /dev/null; then
