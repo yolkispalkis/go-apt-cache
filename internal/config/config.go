@@ -1,4 +1,3 @@
-// internal/config/config.go
 package config
 
 import (
@@ -67,7 +66,7 @@ func (fm FileMode) FileMode() os.FileMode {
 }
 
 type Repository struct {
-	Name    string `json:"name"` // Unique name for the repository
+	Name    string `json:"name"`
 	URL     string `json:"url"`
 	Enabled bool   `json:"enabled"`
 }
@@ -80,20 +79,19 @@ type ServerConfig struct {
 	ShutdownTimeout       Duration `json:"shutdownTimeout"`
 	IdleTimeout           Duration `json:"idleTimeout"`
 	ReadHeaderTimeout     Duration `json:"readHeaderTimeout"`
-	MaxConcurrentFetches  int      `json:"maxConcurrentFetches"` // Max concurrent fetches from upstream per repo
+	MaxConcurrentFetches  int      `json:"maxConcurrentFetches"`
 }
 
 type CacheConfig struct {
-	Directory    string `json:"directory"`
-	MaxSize      string `json:"maxSize"`
-	Enabled      bool   `json:"enabled"`
-	CleanOnStart bool   `json:"cleanOnStart"`
-	// TTL for caching upstream HEAD validation responses (e.g., 304 Not Modified)
+	Directory     string   `json:"directory"`
+	MaxSize       string   `json:"maxSize"`
+	Enabled       bool     `json:"enabled"`
+	CleanOnStart  bool     `json:"cleanOnStart"`
 	ValidationTTL Duration `json:"validationTTL"`
 }
 
 type LoggingConfig struct {
-	Level           string `json:"level"` // debug, info, warn, error
+	Level           string `json:"level"`
 	FilePath        string `json:"filePath"`
 	DisableTerminal bool   `json:"disableTerminal"`
 	MaxSizeMB       int    `json:"maxSizeMB"`
@@ -114,7 +112,7 @@ func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
 			ListenAddress:         ":8080",
-			UnixSocketPath:        "", // Disabled by default
+			UnixSocketPath:        "",
 			UnixSocketPermissions: 0660,
 			RequestTimeout:        Duration(60 * time.Second),
 			ShutdownTimeout:       Duration(15 * time.Second),
@@ -140,14 +138,14 @@ func Default() *Config {
 		},
 		Repositories: []Repository{
 			{
-				Name:    "ubuntu", // Must be unique and path-safe
+				Name:    "ubuntu",
 				URL:     "http://archive.ubuntu.com/ubuntu",
 				Enabled: true,
 			},
 			{
 				Name:    "debian",
 				URL:     "http://deb.debian.org/debian",
-				Enabled: false, // Example of a disabled repo
+				Enabled: false,
 			},
 		},
 	}
@@ -158,12 +156,9 @@ func Load(filePath string) (*Config, error) {
 	filePath = util.CleanPath(filePath)
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		// If file not found, maybe return default config with a warning?
-		// Or let the caller handle os.ErrNotExist specifically if needed.
 		return nil, fmt.Errorf("failed to read config file %s: %w", filePath, err)
 	}
 
-	// Start with defaults and overwrite with file values
 	cfg := Default()
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", filePath, err)
@@ -195,14 +190,11 @@ func Save(cfg *Config, filePath string) error {
 func EnsureDefaultConfig(filePath string) error {
 	filePath = util.CleanPath(filePath)
 	if _, err := os.Stat(filePath); err == nil {
-		// File exists
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		// Other error checking stat
 		return fmt.Errorf("failed to check config file %s: %w", filePath, err)
 	}
 
-	// File does not exist, create default
 	fmt.Printf("Config file not found at %s, creating default.\n", filePath)
 	return Save(Default(), filePath)
 }
@@ -251,15 +243,16 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("repository %d must have a name", i)
 		}
 		if !util.IsPathSafe(repo.Name) {
-			return fmt.Errorf("repository name %q is not safe for use in paths", repo.Name)
+			return fmt.Errorf("repository name %q contains unsafe characters", repo.Name)
 		}
 		if repo.URL == "" {
 			return fmt.Errorf("repository %q must have a URL", repo.Name)
 		}
 		if _, exists := repoNames[repo.Name]; exists {
-			return fmt.Errorf("duplicate repository name found: %q", repo.Name)
+			return fmt.Errorf("duplicate repository name %q", repo.Name)
 		}
 		repoNames[repo.Name] = struct{}{}
+
 		if repo.Enabled {
 			hasEnabledRepo = true
 		}
@@ -268,8 +261,6 @@ func Validate(cfg *Config) error {
 	if !hasEnabledRepo {
 		return errors.New("at least one repository must be enabled")
 	}
-
-	// Validate logging level? (Let logger handle unknown levels)
 
 	return nil
 }

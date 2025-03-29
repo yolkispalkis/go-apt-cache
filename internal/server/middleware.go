@@ -26,6 +26,10 @@ func (w *responseWriterInterceptor) Write(b []byte) (int, error) {
 	return n, err
 }
 
+func (w *responseWriterInterceptor) Status() int {
+	return w.statusCode
+}
+
 // LoggingMiddleware logs request details.
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

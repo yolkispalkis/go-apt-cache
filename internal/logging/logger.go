@@ -17,7 +17,7 @@ import (
 var (
 	logger  *slog.Logger
 	once    sync.Once
-	logSync func() error // Function to sync file logger if used
+	logSync func() error
 )
 
 // Setup initializes the global logger based on config.
@@ -26,31 +26,28 @@ func Setup(cfg config.LoggingConfig) error {
 	once.Do(func() {
 		var writers []io.Writer
 
-		// File Writer (using lumberjack for rotation)
 		if cfg.FilePath != "" {
 			lj := &lumberjack.Logger{
 				Filename:   cfg.FilePath,
-				MaxSize:    cfg.MaxSizeMB, // megabytes
+				MaxSize:    cfg.MaxSizeMB,
 				MaxBackups: cfg.MaxBackups,
-				MaxAge:     cfg.MaxAgeDays, //days
-				Compress:   cfg.Compress,   // disabled by default
-				LocalTime:  true,           // Use local time for timestamps in filenames
+				MaxAge:     cfg.MaxAgeDays,
+				Compress:   cfg.Compress,
+				LocalTime:  true,
 			}
 			writers = append(writers, lj)
-			logSync = lj.Close // Assign lumberjack's Close for syncing/closing
+			logSync = lj.Close
 			fmt.Printf("Logging to file: %s (Max Size: %dMB, Max Backups: %d, Max Age: %d days, Compress: %t)\n",
 				cfg.FilePath, cfg.MaxSizeMB, cfg.MaxBackups, cfg.MaxAgeDays, cfg.Compress)
 		} else {
-			logSync = func() error { return nil } // No-op sync if no file
+			logSync = func() error { return nil }
 		}
 
-		// Terminal Writer
 		if !cfg.DisableTerminal {
 			writers = append(writers, os.Stdout)
 		}
 
 		if len(writers) == 0 {
-			// Should not happen if config validation passes, but safety first
 			writers = append(writers, io.Discard)
 			fmt.Println("Warning: No log outputs configured, logging is disabled.")
 		}
@@ -61,15 +58,13 @@ func Setup(cfg config.LoggingConfig) error {
 
 		opts := &slog.HandlerOptions{
 			Level:     level,
-			AddSource: level <= slog.LevelDebug, // Only add source if debug level
+			AddSource: level <= slog.LevelDebug,
 		}
 
-		// Use TextHandler for more human-readable logs, JSONHandler for machine parsing
 		handler := slog.NewTextHandler(multiWriter, opts)
-		// handler := slog.NewJSONHandler(multiWriter, opts)
 
 		logger = slog.New(handler)
-		slog.SetDefault(logger) // Set as default for convenience
+		slog.SetDefault(logger)
 		logger.Info("Logger initialized", "level", level.String())
 	})
 	return setupErr
@@ -102,23 +97,43 @@ func Sync() error {
 // --- Convenience functions (using default logger) ---
 
 func Debug(msg string, args ...any) {
-	slog.Debug(msg, args...)
+	if len(args) > 0 && strings.Contains(msg, "%") {
+		slog.Debug(fmt.Sprintf(msg, args...))
+	} else {
+		slog.Debug(msg, args...)
+	}
 }
 
 func Info(msg string, args ...any) {
-	slog.Info(msg, args...)
+	if len(args) > 0 && strings.Contains(msg, "%") {
+		slog.Info(fmt.Sprintf(msg, args...))
+	} else {
+		slog.Info(msg, args...)
+	}
 }
 
 func Warn(msg string, args ...any) {
-	slog.Warn(msg, args...)
+	if len(args) > 0 && strings.Contains(msg, "%") {
+		slog.Warn(fmt.Sprintf(msg, args...))
+	} else {
+		slog.Warn(msg, args...)
+	}
 }
 
 func Error(msg string, args ...any) {
-	slog.Error(msg, args...)
+	if len(args) > 0 && strings.Contains(msg, "%") {
+		slog.Error(fmt.Sprintf(msg, args...))
+	} else {
+		slog.Error(msg, args...)
+	}
 }
 
-// ErrorE is a helper to log an error object along with a message.
 func ErrorE(msg string, err error, args ...any) {
-	allArgs := append([]any{"error", err}, args...)
-	slog.Error(msg, allArgs...)
+	if len(args) > 0 && strings.Contains(msg, "%") {
+		formattedMsg := fmt.Sprintf(msg, args...)
+		slog.Error(formattedMsg, "error", err)
+	} else {
+		allArgs := append([]any{"error", err}, args...)
+		slog.Error(msg, allArgs...)
+	}
 }
