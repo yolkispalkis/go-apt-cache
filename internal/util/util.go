@@ -141,6 +141,8 @@ func GetContentType(filePath string) string {
 			mimeType = "text/plain; charset=utf-8"
 		case ".changes":
 			mimeType = "text/plain; charset=utf-8"
+		case ".html", ".htm":
+			mimeType = "text/html; charset=utf-8"
 		case ".gz":
 			baseExt := filepath.Ext(strings.TrimSuffix(filePath, ext))
 			baseMime := mime.TypeByExtension(baseExt)

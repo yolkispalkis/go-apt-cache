@@ -31,6 +31,71 @@ func New(
 ) (*Server, error) {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			host := r.Host
+			fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Go APT Proxy</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+    h1 { color: #333; }
+    .repo { margin-bottom: 20px; border: 1px solid #ddd; padding: 15px; border-radius: 5px; }
+    .repo h2 { margin-top: 0; color: #0066cc; }
+    .status { margin-top: 30px; padding: 10px; background-color: #f8f8f8; border-radius: 5px; }
+  </style>
+</head>
+<body>
+  <h1>Go APT Proxy</h1>
+  <p>Активные репозитории:</p>
+  <div class="repos">`)
+
+			for _, repo := range cfg.Repositories {
+				if !repo.Enabled {
+					continue
+				}
+				fmt.Fprintf(w, `
+    <div class="repo">
+      <h2>%s</h2>
+      <p>Upstream URL: <a href="%s">%s</a></p>
+      <p>Локальный URL: <a href="/%s/">/%s/</a></p>
+      <p>Строка для sources.list: <code id="aptUrl-%s">deb http://%s/%s/ release main</code></p>
+      <script>
+        document.addEventListener('DOMContentLoaded', function() {
+          var baseUrl = window.location.protocol + '//' + window.location.host;
+          var repoName = '%s';
+          var aptUrlId = 'aptUrl-%s';
+          var aptUrl = document.getElementById(aptUrlId);
+          if (aptUrl) {
+            aptUrl.textContent = 'deb ' + baseUrl + '/' + repoName + '/ release main';
+          }
+        });
+      </script>
+    </div>`, repo.Name, repo.URL, repo.URL, repo.Name, repo.Name, repo.Name, host, repo.Name, repo.Name, repo.Name)
+			}
+
+			cacheStats := cacheManager.Stats()
+			fmt.Fprintf(w, `
+  </div>
+  <div class="status">
+    <h3>Статус кеша:</h3>
+    <p>Количество элементов: %d</p>
+    <p>Размер кеша: %s / %s</p>
+    <p><a href="/status">Подробная информация о статусе</a></p>
+  </div>
+</body>
+</html>`, cacheStats.ItemCount, util.FormatSize(cacheStats.CurrentSize), util.FormatSize(cacheStats.MaxSize))
+			return
+		}
+		if r.URL.Path != "/status" && !strings.HasPrefix(r.URL.Path, "/") {
+			http.NotFound(w, r)
+			return
+		}
+	})
+
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
@@ -41,7 +106,6 @@ func New(
 		cacheStats := cacheManager.Stats()
 		fmt.Fprintf(w, "Cache Items: %d\n", cacheStats.ItemCount)
 		fmt.Fprintf(w, "Cache Size: %s / %s\n", util.FormatSize(cacheStats.CurrentSize), util.FormatSize(cacheStats.MaxSize))
-
 	})
 
 	for _, repo := range cfg.Repositories {
@@ -106,7 +170,44 @@ func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	filePath := strings.TrimPrefix(r.URL.Path, "/")
 	if filePath == "" {
 		if strings.HasSuffix(r.URL.Path, "/") {
-			http.Error(w, "Directory listing not supported", http.StatusForbidden)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			host := r.Host
+			fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>%s Repository - Go APT Proxy</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+    h1 { color: #333; }
+    .repo-info { margin-bottom: 20px; border: 1px solid #ddd; padding: 15px; border-radius: 5px; }
+    .repo-info h2 { margin-top: 0; color: #0066cc; }
+    .note { margin-top: 30px; padding: 10px; background-color: #f8f8f8; border-radius: 5px; }
+  </style>
+</head>
+<body>
+  <h1>%s Repository</h1>
+  <div class="repo-info">
+    <h2>Repository Information</h2>
+    <p>Upstream URL: <a href="%s">%s</a></p>
+    <p>Local URL: <a href="/%s/">/%s/</a></p>
+  </div>
+  <div class="note">
+    <p>Это прокси-кеш для репозитория APT. Используйте этот URL в вашем sources.list:</p>
+    <pre id="aptUrl">deb http://%s/%s/ release main</pre>
+    <script>
+      document.addEventListener('DOMContentLoaded', function() {
+        var baseUrl = window.location.protocol + '//' + window.location.host;
+        var repoName = '%s';
+        var aptUrl = document.getElementById('aptUrl');
+        aptUrl.textContent = 'deb ' + baseUrl + '/' + repoName + '/ release main';
+      });
+    </script>
+    <p>Замените "release" и "main" соответствующими значениями для вашего дистрибутива.</p>
+  </div>
+  <p><a href="/">← Вернуться на главную страницу</a></p>
+</body>
+</html>`, h.repoConfig.Name, h.repoConfig.Name, h.repoConfig.URL, h.repoConfig.URL, h.repoConfig.Name, h.repoConfig.Name, host, h.repoConfig.Name, h.repoConfig.Name)
 			return
 		}
 	}
@@ -157,6 +258,81 @@ func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		logging.Error("Error reading from cache for key %s: %v", cacheKey, err)
 		http.Error(w, "Internal Cache Error", http.StatusInternalServerError)
 		return
+	}
+
+	// Если файла нет в кеше и это потенциально index.html
+	if strings.HasSuffix(r.URL.Path, "/") && (filePath == "" || strings.HasSuffix(filePath, "/")) {
+		// Попробуем загрузить index.html
+		indexFilePath := filePath
+		if !strings.HasSuffix(indexFilePath, "/") {
+			indexFilePath += "/"
+		}
+		indexFilePath += "index.html"
+
+		indexCacheKey := h.repoConfig.Name + "/" + indexFilePath
+		indexUpstreamURL := h.repoConfig.URL + "/" + indexFilePath
+
+		fetchResult, err := h.fetcher.Fetch(r.Context(), indexCacheKey, indexUpstreamURL, r.Header)
+		if err == nil {
+			// Нашли index.html, устанавливаем правильный тип контента
+			defer fetchResult.Body.Close()
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+			// Сохраняем в кэш
+			// Сразу читаем содержимое для манипуляций
+			body, err := io.ReadAll(fetchResult.Body)
+			if err != nil {
+				logging.Error("Failed to read HTML content: %v", err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+
+			// Сохраняем в кэш
+			go func() {
+				bodyReader := strings.NewReader(string(body))
+				modTimeToUse := fetchResult.ModTime
+				if modTimeToUse.IsZero() {
+					modTimeToUse = time.Now()
+				}
+				err := h.cacheManager.Put(context.Background(), indexCacheKey, io.NopCloser(bodyReader), int64(len(body)), modTimeToUse)
+				if err != nil {
+					logging.Error("Failed to write index.html %s to cache: %v", indexCacheKey, err)
+				}
+			}()
+
+			// Добавляем JavaScript в HTML-контент для корректного отображения URL за реверс-прокси
+			contentType := fetchResult.Header.Get("Content-Type")
+			if strings.HasPrefix(contentType, "text/html") {
+				htmlContent := string(body)
+
+				// Проверяем, есть ли </body> тег для вставки перед ним
+				bodyCloseIndex := strings.LastIndex(htmlContent, "</body>")
+				if bodyCloseIndex != -1 {
+					jsCode := `<script>
+document.addEventListener('DOMContentLoaded', function() {
+  // Найти все ссылки на apt репозитории и заменить их на динамические URL
+  var links = document.querySelectorAll("a[href*='http://'], a[href*='https://']");
+  var baseUrl = window.location.protocol + '//' + window.location.host;
+  
+  links.forEach(function(link) {
+    // Обновляем только релевантные apt-ссылки
+    if (link.textContent.includes('deb ') && link.textContent.includes('/ubuntu/')) {
+      var repoPath = window.location.pathname.replace(/\/$/, '');
+      link.textContent = link.textContent.replace(/deb (https?:\/\/)[^\/]+(\/[^\/]+\/)/, 'deb ' + baseUrl + repoPath + '/');
+    }
+  });
+});
+</script>`
+
+					htmlContent = htmlContent[:bodyCloseIndex] + jsCode + htmlContent[bodyCloseIndex:]
+				}
+
+				w.Write([]byte(htmlContent))
+			} else {
+				w.Write(body)
+			}
+			return
+		}
 	}
 
 	logging.Debug("Cache miss for key: %s, fetching from upstream: %s", cacheKey, upstreamURL)
