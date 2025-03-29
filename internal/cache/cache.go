@@ -110,6 +110,10 @@ func (c *DiskLRUCache) getFilePath(key string) string {
 	safeRepoName := util.SanitizeFilename(repoName)
 	safeFilePath := util.SanitizePath(filePath)
 
+	if strings.HasSuffix(key, "/") || (filePath == "" && len(parts) == 1) {
+		return filepath.Join(c.baseDir, safeRepoName+".html")
+	}
+
 	fullPath := filepath.Join(c.baseDir, safeRepoName, safeFilePath)
 
 	return fullPath
@@ -264,6 +268,33 @@ func (c *DiskLRUCache) Put(ctx context.Context, key string, reader io.Reader, ex
 
 	filePath := c.getFilePath(key)
 	dirPath := filepath.Dir(filePath)
+
+	// Проверяем, существует ли потенциальный HTML-файл, который может мешать созданию директории
+	parts := strings.SplitN(key, "/", 2)
+	repoName := parts[0]
+	safeRepoName := util.SanitizeFilename(repoName)
+	htmlFilePath := filepath.Join(c.baseDir, safeRepoName+".html")
+
+	// Если создаем файл в подкаталоге, но существует .html файл с тем же именем, что и каталог
+	if strings.Contains(key, "/") && len(parts) > 1 {
+		if fileInfo, err := os.Stat(htmlFilePath); err == nil && !fileInfo.IsDir() {
+			logging.Warn("HTML index file %s exists, removing it to create directory structure", htmlFilePath)
+			if err := os.Remove(htmlFilePath); err != nil {
+				return fmt.Errorf("failed to remove HTML index file %s: %w", htmlFilePath, err)
+			}
+		}
+	}
+
+	// Проверяем, существует ли dirPath
+	if fileInfo, err := os.Stat(dirPath); err == nil {
+		// Путь существует, но не директория
+		if !fileInfo.IsDir() {
+			logging.Warn("Path %s exists but is not a directory, removing it", dirPath)
+			if err := os.Remove(dirPath); err != nil {
+				return fmt.Errorf("failed to remove file at directory path %s: %w", dirPath, err)
+			}
+		}
+	}
 
 	if err := os.MkdirAll(dirPath, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s for cache item: %w", dirPath, err)

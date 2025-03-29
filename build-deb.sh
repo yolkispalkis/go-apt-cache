@@ -26,6 +26,9 @@ rm -rf "${BUILD_DIR}"
 # Создание структуры директорий
 mkdir -p "${DEBIAN_DIR}" "${BIN_DIR}" "${CONFIG_DIR}" "${SYSTEMD_DIR}" "${CACHE_DIR}" "${LOG_DIR}"
 
+# Установка прав на директорию с логами сразу при создании
+chmod 750 "${LOG_DIR}"
+
 # Сборка приложения
 echo "Сборка go-apt-proxy..."
 go build -o "${BIN_DIR}/${PKG_NAME}" main.go
@@ -99,6 +102,7 @@ ExecStart=/usr/local/bin/go-apt-proxy -config /etc/go-apt-proxy/config.json
 Restart=on-failure
 User=apt-proxy
 Group=apt-proxy
+SupplementaryGroups=adm
 WorkingDirectory=/var/cache/go-apt-proxy
 
 # Настройки безопасности
@@ -135,9 +139,11 @@ fi
 mkdir -p /var/run/go-apt-proxy
 
 # Установка прав доступа
-chown -R apt-proxy:apt-proxy /var/cache/go-apt-proxy /var/log/go-apt-proxy /var/run/go-apt-proxy
-chmod 750 /var/cache/go-apt-proxy /var/log/go-apt-proxy
+chown -R apt-proxy:apt-proxy /var/cache/go-apt-proxy /var/run/go-apt-proxy
+chown -R apt-proxy:adm /var/log/go-apt-proxy
+chmod 750 /var/cache/go-apt-proxy
 chmod 755 /var/run/go-apt-proxy
+chmod 750 /var/log/go-apt-proxy
 
 # Перезагрузка systemd и включение сервиса
 systemctl daemon-reload
