@@ -1,10 +1,10 @@
-// internal/logging/logger.go
 package logging
 
 import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,7 +17,6 @@ var (
 	logSync func() error
 )
 
-// Уровни логирования
 const (
 	LevelDebug = "debug"
 	LevelInfo  = "info"
@@ -25,7 +24,6 @@ const (
 	LevelError = "error"
 )
 
-// LoggingConfig содержит настройки логирования
 type LoggingConfig struct {
 	Level           string
 	FilePath        string
@@ -36,12 +34,9 @@ type LoggingConfig struct {
 	Compress        bool
 }
 
-// Setup инициализирует глобальный логгер на основе конфигурации
 func Setup(cfg LoggingConfig) error {
-	// Настройка вывода логов
 	var writers []io.Writer
 
-	// Файловый лог
 	if cfg.FilePath != "" {
 		lj := &lumberjack.Logger{
 			Filename:   cfg.FilePath,
@@ -59,33 +54,57 @@ func Setup(cfg LoggingConfig) error {
 		logSync = func() error { return nil }
 	}
 
-	// Консольный вывод
+	zerolog.CallerMarshalFunc = func(pc uintptr, file string, line int) string {
+		short := file
+
+		projectName := "go-apt-cache/"
+		idx := strings.Index(file, projectName)
+		if idx != -1 {
+
+			short = file[idx+len(projectName):]
+		} else {
+
+			dir := filepath.Dir(file)
+			base := filepath.Base(file)
+			grandDir := filepath.Base(dir)
+			if grandDir != "." && grandDir != "/" && grandDir != "" {
+				short = filepath.Join(grandDir, base)
+			} else {
+				short = base
+			}
+		}
+		return fmt.Sprintf("%s:%d", short, line)
+	}
+
 	if !cfg.DisableTerminal {
 		consoleWriter := zerolog.ConsoleWriter{
 			Out:        os.Stdout,
 			TimeFormat: time.RFC3339,
 			NoColor:    false,
+
+			FormatCaller: func(i interface{}) string {
+				if s, ok := i.(string); ok {
+
+					return "[" + s + "]"
+				}
+				return fmt.Sprintf("[%v]", i)
+			},
 		}
 		writers = append(writers, consoleWriter)
 	}
 
-	// Проверка наличия выводов
 	if len(writers) == 0 {
 		writers = append(writers, io.Discard)
-		fmt.Println("Warning: No log outputs configured, logging is disabled.")
+		fmt.Println("Warning: No log outputs configured (file or terminal), logging is effectively disabled.")
 	}
 
-	// Настройка уровня логирования
 	level := parseLevel(cfg.Level)
 	zerolog.SetGlobalLevel(level)
 
-	// Настройка вывода
 	multi := zerolog.MultiLevelWriter(writers...)
 
-	// Форматирование для консоли
 	zerolog.TimeFieldFormat = time.RFC3339
 
-	// Установка глобального логгера
 	log.Logger = zerolog.New(multi).With().Timestamp().Caller().Logger()
 
 	log.Info().Msgf("Logger initialized with level: %s", cfg.Level)
@@ -109,7 +128,6 @@ func parseLevel(levelStr string) zerolog.Level {
 	}
 }
 
-// Sync сбрасывает буферизованные записи лога
 func Sync() error {
 	if logSync != nil {
 		return logSync()
@@ -117,69 +135,82 @@ func Sync() error {
 	return nil
 }
 
-// --- Вспомогательные функции ---
+func argsToMap(args []any) map[string]interface{} {
+	fields := make(map[string]interface{})
+	for i := 0; i < len(args); {
+		key, keyOk := args[i].(string)
+		if !keyOk || i+1 >= len(args) {
+
+			i++
+			continue
+		}
+		fields[key] = args[i+1]
+		i += 2
+	}
+	return fields
+}
 
 func Debug(msg string, args ...any) {
-	if len(args) > 0 && strings.Contains(msg, "%") {
-		log.Debug().Msgf(msg, args...)
-	} else if len(args) > 0 {
-		log.Debug().Fields(argsToMap(args)).Msg(msg)
+	event := log.Debug()
+	if len(args) > 0 {
+		if strings.Contains(msg, "%") {
+			event.Msgf(msg, args...)
+		} else {
+			event.Fields(argsToMap(args)).Msg(msg)
+		}
 	} else {
-		log.Debug().Msg(msg)
+		event.Msg(msg)
 	}
 }
 
 func Info(msg string, args ...any) {
-	if len(args) > 0 && strings.Contains(msg, "%") {
-		log.Info().Msgf(msg, args...)
-	} else if len(args) > 0 {
-		log.Info().Fields(argsToMap(args)).Msg(msg)
+	event := log.Info()
+	if len(args) > 0 {
+		if strings.Contains(msg, "%") {
+			event.Msgf(msg, args...)
+		} else {
+			event.Fields(argsToMap(args)).Msg(msg)
+		}
 	} else {
-		log.Info().Msg(msg)
+		event.Msg(msg)
 	}
 }
 
 func Warn(msg string, args ...any) {
-	if len(args) > 0 && strings.Contains(msg, "%") {
-		log.Warn().Msgf(msg, args...)
-	} else if len(args) > 0 {
-		log.Warn().Fields(argsToMap(args)).Msg(msg)
+	event := log.Warn()
+	if len(args) > 0 {
+		if strings.Contains(msg, "%") {
+			event.Msgf(msg, args...)
+		} else {
+			event.Fields(argsToMap(args)).Msg(msg)
+		}
 	} else {
-		log.Warn().Msg(msg)
+		event.Msg(msg)
 	}
 }
 
 func Error(msg string, args ...any) {
-	if len(args) > 0 && strings.Contains(msg, "%") {
-		log.Error().Msgf(msg, args...)
-	} else if len(args) > 0 {
-		log.Error().Fields(argsToMap(args)).Msg(msg)
+	event := log.Error()
+	if len(args) > 0 {
+		if strings.Contains(msg, "%") {
+			event.Msgf(msg, args...)
+		} else {
+			event.Fields(argsToMap(args)).Msg(msg)
+		}
 	} else {
-		log.Error().Msg(msg)
+		event.Msg(msg)
 	}
 }
 
 func ErrorE(msg string, err error, args ...any) {
-	if len(args) > 0 && strings.Contains(msg, "%") {
-		log.Error().Err(err).Msgf(msg, args...)
-	} else if len(args) > 0 {
-		log.Error().Err(err).Fields(argsToMap(args)).Msg(msg)
-	} else {
-		log.Error().Err(err).Msg(msg)
-	}
-}
-
-// argsToMap преобразует аргументы вида [key1, val1, key2, val2] в map[string]interface{}
-func argsToMap(args []any) map[string]interface{} {
-	result := make(map[string]interface{})
-
-	for i := 0; i < len(args); i += 2 {
-		if i+1 < len(args) {
-			if key, ok := args[i].(string); ok {
-				result[key] = args[i+1]
-			}
+	event := log.Error().Err(err)
+	if len(args) > 0 {
+		if strings.Contains(msg, "%") {
+			event.Msgf(msg, args...)
+		} else {
+			event.Fields(argsToMap(args)).Msg(msg)
 		}
+	} else {
+		event.Msg(msg)
 	}
-
-	return result
 }
