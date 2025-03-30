@@ -2,7 +2,6 @@ package util
 
 import (
 	"fmt"
-
 	"mime"
 	"net/http"
 	"path/filepath"
@@ -69,7 +68,8 @@ func ParseSize(sizeStr string) (int64, error) {
 	byteSize := int64(sizeValue * multiplier)
 
 	if sizeValue > 0 && byteSize <= 0 {
-		return 0, fmt.Errorf("size value resulted in overflow: %q", sizeStr)
+
+		return 0, fmt.Errorf("size value resulted in non-positive result or potential overflow: %q", sizeStr)
 	}
 
 	return byteSize, nil
@@ -78,6 +78,7 @@ func ParseSize(sizeStr string) (int64, error) {
 func FormatSize(sizeBytes int64) string {
 	const unit = 1024
 	if sizeBytes < 0 {
+
 		return fmt.Sprintf("%d B", sizeBytes)
 	}
 	if sizeBytes < unit {
@@ -102,9 +103,11 @@ func CleanPathDir(path string) string {
 }
 
 func IsPathSafe(component string) bool {
+
 	if component == "" || component == "." || component == ".." {
 		return false
 	}
+
 	return safePathRegex.MatchString(component)
 }
 
@@ -121,7 +124,6 @@ func SanitizeFilename(name string) string {
 	if sanitized == "" {
 		return "_"
 	}
-
 	return sanitized
 }
 
@@ -138,7 +140,7 @@ func SanitizePath(path string) string {
 		}
 
 		if part == "." || part == ".." {
-			logging.Warn("Path traversal component detected and removed: %q in path %q", part, path)
+			logging.Warn("Path traversal component detected and removed", "component", part, "original_path", path)
 			continue
 		}
 
@@ -147,7 +149,8 @@ func SanitizePath(path string) string {
 		if sanitizedPart != "" {
 			sanitizedParts = append(sanitizedParts, sanitizedPart)
 		} else {
-			logging.Warn("Path component %q became empty after sanitization in path %q", part, path)
+
+			logging.Warn("Path component became empty after sanitization", "original_component", part, "original_path", path)
 		}
 	}
 
@@ -160,7 +163,7 @@ func GetContentType(filePath string) string {
 	mimeType := mime.TypeByExtension(ext)
 
 	if mimeType == "" || strings.HasPrefix(mimeType, "application/octet-stream") {
-
+		originalMime := mimeType
 		switch strings.ToLower(ext) {
 		case ".deb", ".udeb":
 			mimeType = "application/vnd.debian.binary-package"
@@ -170,14 +173,7 @@ func GetContentType(filePath string) string {
 			mimeType = "text/plain; charset=utf-8"
 		case ".gz":
 
-			baseExt := filepath.Ext(strings.TrimSuffix(filePath, ext))
-			baseMime := mime.TypeByExtension(baseExt)
-			if baseMime != "" && !strings.HasPrefix(baseMime, "application/octet-stream") {
-
-				mimeType = "application/gzip"
-			} else {
-				mimeType = "application/gzip"
-			}
+			mimeType = "application/gzip"
 		case ".bz2":
 			mimeType = "application/x-bzip2"
 		case ".xz":
@@ -186,7 +182,7 @@ func GetContentType(filePath string) string {
 			mimeType = "text/x-diff; charset=utf-8"
 		case ".html", ".htm":
 			mimeType = "text/html; charset=utf-8"
-		case ".txt", ".text", ".log":
+		case ".txt", ".text", ".log", "release", "inrelease":
 			mimeType = "text/plain; charset=utf-8"
 		case ".json":
 			mimeType = "application/json"
@@ -200,9 +196,11 @@ func GetContentType(filePath string) string {
 			if mimeType == "" {
 				mimeType = "application/octet-stream"
 			}
+
 		}
-		if mimeType != "application/octet-stream" {
-			logging.Debug("MIME type for extension %q (path %q) determined by custom rule: %s", ext, filePath, mimeType)
+
+		if mimeType != originalMime && mimeType != "application/octet-stream" {
+			logging.Debug("MIME type determined by custom rule", "extension", ext, "path", filePath, "mime_type", mimeType)
 		}
 	}
 	return mimeType
@@ -213,13 +211,16 @@ var cacheRelevantHeaders = map[string]bool{
 	"Expires":       true,
 	"ETag":          true,
 	"Accept-Ranges": true,
-	"Content-Type":  true,
+
+	"Content-Type": true,
 }
 
 func SelectCacheHeaders(dst, src http.Header) {
 	for h, values := range src {
 		canonicalH := http.CanonicalHeaderKey(h)
+
 		if cacheRelevantHeaders[canonicalH] {
+
 			if len(values) > 0 {
 
 				dst[canonicalH] = append([]string(nil), values...)
@@ -229,23 +230,31 @@ func SelectCacheHeaders(dst, src http.Header) {
 }
 
 func ApplyCacheHeaders(dst http.Header, srcCacheMetaHeaders http.Header) {
+
 	for h, values := range srcCacheMetaHeaders {
 		canonicalH := http.CanonicalHeaderKey(h)
 
 		switch canonicalH {
-		case "Content-Length", "Content-Type", "Last-Modified", "Date", "Connection", "Transfer-Encoding":
+		case "Content-Length", "Content-Type", "Last-Modified", "Date", "Connection", "Transfer-Encoding", "Content-Encoding":
+
 			continue
 		}
 
 		if len(values) > 0 {
 
 			dst[canonicalH] = append([]string(nil), values...)
-			logging.Debug("Applying header from cache metadata: %s: %v", canonicalH, values)
+
+			if canonicalH != "Content-Type" {
+				logging.Debug("Applying header from cache metadata", "header", canonicalH, "value", values)
+			}
 		}
 	}
 }
 
 func FormatDuration(d time.Duration) string {
+	if d < time.Microsecond {
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	}
 	if d < time.Millisecond {
 
 		return fmt.Sprintf("%dµs", d.Microseconds())

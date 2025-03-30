@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	logSync func() error
+	logSync func() error = func() error { return nil }
 )
 
 const (
@@ -48,6 +48,7 @@ func Setup(cfg LoggingConfig) error {
 		}
 		writers = append(writers, lj)
 		logSync = lj.Close
+
 		fmt.Printf("Logging to file: %s (Max Size: %dMB, Max Backups: %d, Max Age: %d days, Compress: %t)\n",
 			cfg.FilePath, cfg.MaxSizeMB, cfg.MaxBackups, cfg.MaxAgeDays, cfg.Compress)
 	} else {
@@ -56,7 +57,6 @@ func Setup(cfg LoggingConfig) error {
 
 	zerolog.CallerMarshalFunc = func(pc uintptr, file string, line int) string {
 		short := file
-
 		projectName := "go-apt-cache/"
 		idx := strings.Index(file, projectName)
 		if idx != -1 {
@@ -103,7 +103,7 @@ func Setup(cfg LoggingConfig) error {
 
 	multi := zerolog.MultiLevelWriter(writers...)
 
-	zerolog.TimeFieldFormat = time.RFC3339
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs
 
 	log.Logger = zerolog.New(multi).With().Timestamp().Caller().Logger()
 
@@ -114,103 +114,61 @@ func Setup(cfg LoggingConfig) error {
 
 func parseLevel(levelStr string) zerolog.Level {
 	switch strings.ToLower(levelStr) {
-	case "debug":
+	case LevelDebug:
 		return zerolog.DebugLevel
-	case "info":
+	case LevelInfo:
 		return zerolog.InfoLevel
-	case "warn", "warning":
+	case LevelWarn, "warning":
 		return zerolog.WarnLevel
-	case "error":
+	case LevelError:
 		return zerolog.ErrorLevel
 	default:
+
 		fmt.Printf("Warning: Unknown log level %q, defaulting to INFO.\n", levelStr)
 		return zerolog.InfoLevel
 	}
 }
 
 func Sync() error {
-	if logSync != nil {
-		return logSync()
-	}
-	return nil
+
+	return logSync()
 }
 
 func argsToMap(args []any) map[string]interface{} {
 	fields := make(map[string]interface{})
-	for i := 0; i < len(args); {
-		key, keyOk := args[i].(string)
-		if !keyOk || i+1 >= len(args) {
+	if len(args)%2 != 0 {
 
-			i++
+		log.Warn().Msg("Odd number of arguments provided for key-value logging, ignoring last argument.")
+		args = args[:len(args)-1]
+	}
+	for i := 0; i < len(args); i += 2 {
+		key, keyOk := args[i].(string)
+		if !keyOk {
+
+			log.Warn().Interface("invalid_key_type_arg", args[i]).Int("arg_index", i).Msg("Non-string key provided for key-value logging, skipping pair.")
 			continue
 		}
 		fields[key] = args[i+1]
-		i += 2
 	}
 	return fields
 }
 
 func Debug(msg string, args ...any) {
-	event := log.Debug()
-	if len(args) > 0 {
-		if strings.Contains(msg, "%") {
-			event.Msgf(msg, args...)
-		} else {
-			event.Fields(argsToMap(args)).Msg(msg)
-		}
-	} else {
-		event.Msg(msg)
-	}
+	log.Debug().Fields(argsToMap(args)).Msg(msg)
 }
 
 func Info(msg string, args ...any) {
-	event := log.Info()
-	if len(args) > 0 {
-		if strings.Contains(msg, "%") {
-			event.Msgf(msg, args...)
-		} else {
-			event.Fields(argsToMap(args)).Msg(msg)
-		}
-	} else {
-		event.Msg(msg)
-	}
+	log.Info().Fields(argsToMap(args)).Msg(msg)
 }
 
 func Warn(msg string, args ...any) {
-	event := log.Warn()
-	if len(args) > 0 {
-		if strings.Contains(msg, "%") {
-			event.Msgf(msg, args...)
-		} else {
-			event.Fields(argsToMap(args)).Msg(msg)
-		}
-	} else {
-		event.Msg(msg)
-	}
+	log.Warn().Fields(argsToMap(args)).Msg(msg)
 }
 
 func Error(msg string, args ...any) {
-	event := log.Error()
-	if len(args) > 0 {
-		if strings.Contains(msg, "%") {
-			event.Msgf(msg, args...)
-		} else {
-			event.Fields(argsToMap(args)).Msg(msg)
-		}
-	} else {
-		event.Msg(msg)
-	}
+	log.Error().Fields(argsToMap(args)).Msg(msg)
 }
 
 func ErrorE(msg string, err error, args ...any) {
-	event := log.Error().Err(err)
-	if len(args) > 0 {
-		if strings.Contains(msg, "%") {
-			event.Msgf(msg, args...)
-		} else {
-			event.Fields(argsToMap(args)).Msg(msg)
-		}
-	} else {
-		event.Msg(msg)
-	}
+	log.Error().Err(err).Fields(argsToMap(args)).Msg(msg)
 }

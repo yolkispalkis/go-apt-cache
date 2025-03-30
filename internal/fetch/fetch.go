@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
+	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
 var (
@@ -59,9 +60,9 @@ func NewCoordinator(requestTimeout time.Duration, maxConcurrent int) *Coordinato
 
 	proxyURL, err := http.ProxyFromEnvironment(&http.Request{URL: &url.URL{Scheme: "http", Host: "example.com"}})
 	if err == nil && proxyURL != nil {
-		logging.Info("Using system proxy: %s", proxyURL)
+		logging.Info("Using system proxy", "proxy_url", proxyURL.String())
 	} else if err != nil {
-		logging.Warn("Error checking system proxy settings: %v", err)
+		logging.Warn("Error checking system proxy settings", "error", err)
 	} else {
 		logging.Info("No system proxy configured or detected.")
 	}
@@ -73,20 +74,26 @@ func NewCoordinator(requestTimeout time.Duration, maxConcurrent int) *Coordinato
 }
 
 func (c *Coordinator) Fetch(ctx context.Context, cacheKey, upstreamURL string, clientHeader http.Header) (*Result, error) {
-
 	v, err, _ := c.fetchGroup.Do(cacheKey, func() (interface{}, error) {
-
-		return c.doFetch(ctx, upstreamURL, clientHeader)
+		fetchStartTime := time.Now()
+		result, fetchErr := c.doFetch(ctx, upstreamURL, clientHeader)
+		fetchDuration := time.Since(fetchStartTime)
+		if fetchErr != nil {
+			logging.Debug("Singleflight fetch completed with error", "key", cacheKey, "duration", util.FormatDuration(fetchDuration), "error", fetchErr)
+		} else {
+			logging.Debug("Singleflight fetch completed successfully", "key", cacheKey, "duration", util.FormatDuration(fetchDuration))
+		}
+		return result, fetchErr
 	})
 
 	if err != nil {
-
 		return nil, err
 	}
 
 	result, ok := v.(*Result)
 	if !ok {
 
+		logging.Error("Internal error: unexpected type returned from singleflight group", "key", cacheKey, "type", fmt.Sprintf("%T", v))
 		return nil, fmt.Errorf("internal error: unexpected type returned from singleflight group (%T)", v)
 	}
 
@@ -96,57 +103,60 @@ func (c *Coordinator) Fetch(ctx context.Context, cacheKey, upstreamURL string, c
 func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHeader http.Header) (*Result, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
 	if err != nil {
+
+		logging.ErrorE("Failed to create upstream request", err, "url", upstreamURL)
 		return nil, fmt.Errorf("%w: failed to create upstream request: %v", ErrRequestConfiguration, err)
 	}
 
-	if ims := clientHeader.Get("If-Modified-Since"); ims != "" {
+	ims := clientHeader.Get("If-Modified-Since")
+	inm := clientHeader.Get("If-None-Match")
+	if ims != "" {
 		req.Header.Set("If-Modified-Since", ims)
 	}
-	if inm := clientHeader.Get("If-None-Match"); inm != "" {
+	if inm != "" {
 		req.Header.Set("If-None-Match", inm)
 	}
 
 	req.Header.Set("User-Agent", "go-apt-proxy/1.0")
 	req.Header.Set("Accept", "*/*")
+
 	req.Header.Set("Accept-Encoding", "identity")
 
-	logging.Debug("Fetching upstream: %s (If-Modified-Since: %s)", upstreamURL, req.Header.Get("If-Modified-Since"))
+	logging.Debug("Fetching upstream", "url", upstreamURL, "if_modified_since", ims, "if_none_match", inm)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-
 		if errors.Is(err, context.Canceled) {
-			logging.Warn("Upstream request canceled for %s: %v", upstreamURL, err)
+			logging.Warn("Upstream request canceled", "url", upstreamURL, "error", err)
 			return nil, fmt.Errorf("upstream request canceled: %w", err)
 		}
-
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			logging.Error("Upstream request timeout for %s: %v", upstreamURL, err)
+			logging.ErrorE("Upstream request timeout", err, "url", upstreamURL, "timeout", c.requestTimeout)
 			return nil, fmt.Errorf("upstream request timeout: %w", err)
 		}
-		logging.Error("Upstream request failed for %s: %v", upstreamURL, err)
+
+		logging.ErrorE("Upstream request failed", err, "url", upstreamURL)
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent:
 
+		logging.Debug("Upstream fetch successful", "url", upstreamURL, "status_code", resp.StatusCode)
 	case http.StatusNotModified:
 		resp.Body.Close()
-		logging.Debug("Upstream returned 304 Not Modified for %s", upstreamURL)
+		logging.Debug("Upstream returned 304 Not Modified", "url", upstreamURL)
 		return nil, ErrUpstreamNotModified
 	case http.StatusNotFound:
 		resp.Body.Close()
-		logging.Warn("Upstream returned 404 Not Found for %s", upstreamURL)
+		logging.Warn("Upstream returned 404 Not Found", "url", upstreamURL)
 		return nil, ErrNotFound
-
 	default:
 
 		statusCode := resp.StatusCode
 		statusText := resp.Status
 		resp.Body.Close()
-		logging.Error("Upstream returned error status: %d %s for %s", statusCode, statusText, upstreamURL)
-
+		logging.Error("Upstream returned error status", "status_code", statusCode, "status_text", statusText, "url", upstreamURL)
 		return nil, fmt.Errorf("%w: %d %s", ErrUpstreamError, statusCode, statusText)
 	}
 
@@ -156,7 +166,7 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 		if err == nil {
 			size = parsedSize
 		} else {
-			logging.Warn("Failed to parse Content-Length header %q for %s: %v", cl, upstreamURL, err)
+			logging.Warn("Failed to parse Content-Length header", "error", err, "content_length_header", cl, "url", upstreamURL)
 		}
 	}
 
@@ -166,7 +176,7 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 		if err == nil {
 			modTime = parsedTime
 		} else {
-			logging.Warn("Failed to parse Last-Modified header %q for %s: %v", lm, upstreamURL, err)
+			logging.Warn("Failed to parse Last-Modified header", "error", err, "last_modified_header", lm, "url", upstreamURL)
 		}
 	}
 
