@@ -233,7 +233,6 @@ EOF
 # Создание conffiles для отслеживания файлов конфигурации
 cat > "${DEBIAN_DIR}/conffiles" << EOF
 /etc/go-apt-proxy/config.json
-/etc/apt/apt.conf.d/01proxy
 EOF
 
 # Создание copyright файла
