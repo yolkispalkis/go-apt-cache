@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
@@ -30,12 +31,12 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	case string:
 		tmp, err := time.ParseDuration(value)
 		if err != nil {
-			return err
+			return fmt.Errorf("invalid duration format '%s': %w", value, err)
 		}
 		*d = Duration(tmp)
 		return nil
 	default:
-		return errors.New("invalid duration type")
+		return fmt.Errorf("invalid duration type: %T", v)
 	}
 }
 
@@ -46,7 +47,7 @@ func (d Duration) Duration() time.Duration {
 type FileMode os.FileMode
 
 func (fm FileMode) MarshalJSON() ([]byte, error) {
-	return json.Marshal(fmt.Sprintf("%o", os.FileMode(fm)))
+	return json.Marshal(fmt.Sprintf("0%o", os.FileMode(fm)))
 }
 
 func (fm *FileMode) UnmarshalJSON(b []byte) error {
@@ -55,14 +56,22 @@ func (fm *FileMode) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	var mode uint32
-	if _, err := fmt.Sscan(s, &mode); err != nil {
-		return fmt.Errorf("invalid file mode format: %w", err)
+	_, err := fmt.Sscanf(s, "0%o", &mode)
+	if err != nil {
+		_, err2 := fmt.Sscanf(s, "%o", &mode)
+		if err2 != nil {
+			return fmt.Errorf("invalid file mode format '%s': %v / %v", s, err, err2)
+		}
 	}
+
 	*fm = FileMode(os.FileMode(mode))
 	return nil
 }
 
 func (fm FileMode) FileMode() os.FileMode {
+	if fm == 0 {
+		return 0600
+	}
 	return os.FileMode(fm)
 }
 
@@ -98,7 +107,6 @@ type Config struct {
 	Repositories []Repository          `json:"repositories"`
 }
 
-// Default creates a default configuration instance.
 func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
@@ -142,7 +150,6 @@ func Default() *Config {
 	}
 }
 
-// Load reads the configuration from a JSON file.
 func Load(filePath string) (*Config, error) {
 	filePath = util.CleanPath(filePath)
 	data, err := os.ReadFile(filePath)
@@ -155,15 +162,18 @@ func Load(filePath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", filePath, err)
 	}
 
+	cfg.Cache.Directory = util.CleanPath(cfg.Cache.Directory)
+	cfg.Logging.FilePath = util.CleanPath(cfg.Logging.FilePath)
+	cfg.Server.UnixSocketPath = util.CleanPath(cfg.Server.UnixSocketPath)
+
 	return cfg, nil
 }
 
-// Save writes the configuration to a JSON file.
 func Save(cfg *Config, filePath string) error {
 	filePath = util.CleanPath(filePath)
 	dir := filepath.Dir(filePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		return fmt.Errorf("failed to create directory %s for config: %w", dir, err)
 	}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
@@ -177,20 +187,18 @@ func Save(cfg *Config, filePath string) error {
 	return nil
 }
 
-// EnsureDefaultConfig creates a default config file if it doesn't exist.
 func EnsureDefaultConfig(filePath string) error {
 	filePath = util.CleanPath(filePath)
 	if _, err := os.Stat(filePath); err == nil {
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("failed to check config file %s: %w", filePath, err)
+		return fmt.Errorf("failed to check config file status %s: %w", filePath, err)
 	}
 
 	fmt.Printf("Config file not found at %s, creating default.\n", filePath)
 	return Save(Default(), filePath)
 }
 
-// Validate checks the configuration for potential issues.
 func Validate(cfg *Config) error {
 	if cfg.Server.ListenAddress == "" && cfg.Server.UnixSocketPath == "" {
 		return errors.New("server must configure at least one of listenAddress or unixSocketPath")
@@ -215,8 +223,15 @@ func Validate(cfg *Config) error {
 		if cfg.Cache.Directory == "" {
 			return errors.New("cache.directory must be set when cache is enabled")
 		}
-		if _, err := util.ParseSize(cfg.Cache.MaxSize); err != nil {
+		if !filepath.IsAbs(cfg.Cache.Directory) && !strings.HasPrefix(cfg.Cache.Directory, ".") {
+			logging.Warn("Cache directory is relative and doesn't start with '.', ensure it's intended.", "directory", cfg.Cache.Directory)
+		}
+		parsedSize, err := util.ParseSize(cfg.Cache.MaxSize)
+		if err != nil {
 			return fmt.Errorf("invalid cache.maxSize %q: %w", cfg.Cache.MaxSize, err)
+		}
+		if parsedSize <= 0 {
+			return fmt.Errorf("cache.maxSize must be positive when cache is enabled (got %s -> %d bytes)", cfg.Cache.MaxSize, parsedSize)
 		}
 		if cfg.Cache.ValidationTTL < 0 {
 			return errors.New("cache.validationTTL cannot be negative")
@@ -224,23 +239,23 @@ func Validate(cfg *Config) error {
 	}
 
 	if len(cfg.Repositories) == 0 {
-		return errors.New("at least one repository must be configured")
+		return errors.New("at least one repository must be configured in the 'repositories' list")
 	}
 
 	repoNames := make(map[string]struct{})
 	hasEnabledRepo := false
 	for i, repo := range cfg.Repositories {
 		if repo.Name == "" {
-			return fmt.Errorf("repository %d must have a name", i)
+			return fmt.Errorf("repository %d must have a 'name'", i)
 		}
-		if !util.IsPathSafe(repo.Name) {
-			return fmt.Errorf("repository name %q contains unsafe characters", repo.Name)
+		if !util.IsRepoNameSafe(repo.Name) {
+			return fmt.Errorf("repository name %q contains invalid characters (allowed: a-z, A-Z, 0-9, -, _)", repo.Name)
 		}
 		if repo.URL == "" {
-			return fmt.Errorf("repository %q must have a URL", repo.Name)
+			return fmt.Errorf("repository %q must have a 'url'", repo.Name)
 		}
 		if _, exists := repoNames[repo.Name]; exists {
-			return fmt.Errorf("duplicate repository name %q", repo.Name)
+			return fmt.Errorf("duplicate repository name %q found", repo.Name)
 		}
 		repoNames[repo.Name] = struct{}{}
 
@@ -250,7 +265,11 @@ func Validate(cfg *Config) error {
 	}
 
 	if !hasEnabledRepo {
-		return errors.New("at least one repository must be enabled")
+		logging.Warn("No repositories are enabled in the configuration. The proxy will not serve any repository data.")
+	}
+
+	if _, err := logging.ParseLevel(cfg.Logging.Level); err != nil {
+		return fmt.Errorf("invalid logging.level: %w", err)
 	}
 
 	return nil

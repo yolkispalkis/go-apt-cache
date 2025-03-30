@@ -60,10 +60,8 @@ func Setup(cfg LoggingConfig) error {
 		projectName := "go-apt-cache/"
 		idx := strings.Index(file, projectName)
 		if idx != -1 {
-
 			short = file[idx+len(projectName):]
 		} else {
-
 			dir := filepath.Dir(file)
 			base := filepath.Base(file)
 			grandDir := filepath.Base(dir)
@@ -81,10 +79,8 @@ func Setup(cfg LoggingConfig) error {
 			Out:        os.Stdout,
 			TimeFormat: time.RFC3339,
 			NoColor:    false,
-
 			FormatCaller: func(i interface{}) string {
 				if s, ok := i.(string); ok {
-
 					return "[" + s + "]"
 				}
 				return fmt.Sprintf("[%v]", i)
@@ -98,7 +94,13 @@ func Setup(cfg LoggingConfig) error {
 		fmt.Println("Warning: No log outputs configured (file or terminal), logging is effectively disabled.")
 	}
 
-	level := parseLevel(cfg.Level)
+	level, err := ParseLevel(cfg.Level)
+	if err != nil {
+
+		fmt.Printf("Warning: Invalid log level %q in config during setup: %v. Defaulting to INFO.\n", cfg.Level, err)
+		level = zerolog.InfoLevel
+
+	}
 	zerolog.SetGlobalLevel(level)
 
 	multi := zerolog.MultiLevelWriter(writers...)
@@ -112,39 +114,35 @@ func Setup(cfg LoggingConfig) error {
 	return nil
 }
 
-func parseLevel(levelStr string) zerolog.Level {
+func ParseLevel(levelStr string) (zerolog.Level, error) {
 	switch strings.ToLower(levelStr) {
 	case LevelDebug:
-		return zerolog.DebugLevel
+		return zerolog.DebugLevel, nil
 	case LevelInfo:
-		return zerolog.InfoLevel
+		return zerolog.InfoLevel, nil
 	case LevelWarn, "warning":
-		return zerolog.WarnLevel
+		return zerolog.WarnLevel, nil
 	case LevelError:
-		return zerolog.ErrorLevel
+		return zerolog.ErrorLevel, nil
 	default:
 
-		fmt.Printf("Warning: Unknown log level %q, defaulting to INFO.\n", levelStr)
-		return zerolog.InfoLevel
+		return zerolog.InfoLevel, fmt.Errorf("unknown log level %q (valid levels: debug, info, warn, error)", levelStr)
 	}
 }
 
 func Sync() error {
-
 	return logSync()
 }
 
 func argsToMap(args []any) map[string]interface{} {
 	fields := make(map[string]interface{})
 	if len(args)%2 != 0 {
-
 		log.Warn().Msg("Odd number of arguments provided for key-value logging, ignoring last argument.")
 		args = args[:len(args)-1]
 	}
 	for i := 0; i < len(args); i += 2 {
 		key, keyOk := args[i].(string)
 		if !keyOk {
-
 			log.Warn().Interface("invalid_key_type_arg", args[i]).Int("arg_index", i).Msg("Non-string key provided for key-value logging, skipping pair.")
 			continue
 		}
