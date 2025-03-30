@@ -7,7 +7,7 @@ export PATH=$PATH:/usr/local/go/bin
 PKG_NAME="go-apt-proxy"
 PKG_VERSION="1.0.0"
 PKG_ARCH="amd64"
-PKG_MAINTAINER="yolkispalkis <admin@example.com>"
+PKG_MAINTAINER="yolkispalkis <me@w3h.su>"
 PKG_DESCRIPTION="Высокопроизводительный прокси-сервер для APT, написанный на Go"
 
 # Временные директории для сборки
@@ -116,14 +116,6 @@ WantedBy=multi-user.target
 EOF
 
 chmod 644 "${SYSTEMD_DIR}/go-apt-proxy.service"
-
-# Создание файла прокси для APT
-mkdir -p "${STAGE_DIR}/etc/apt/apt.conf.d"
-cat > "${STAGE_DIR}/etc/apt/apt.conf.d/01proxy" << EOF
-Acquire::http::Proxy "http://localhost:8080";
-EOF
-
-chmod 644 "${STAGE_DIR}/etc/apt/apt.conf.d/01proxy"
 
 # Создание postinst скрипта
 cat > "${DEBIAN_DIR}/postinst" << EOF
