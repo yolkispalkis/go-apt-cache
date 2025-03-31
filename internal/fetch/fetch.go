@@ -39,18 +39,26 @@ type Coordinator struct {
 }
 
 func NewCoordinator(requestTimeout time.Duration, maxConcurrent int) *Coordinator {
+	if maxConcurrent <= 0 {
+		maxConcurrent = 10
+	}
 
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          maxConcurrent * 2,
 		MaxIdleConnsPerHost:   maxConcurrent,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		ForceAttemptHTTP2:     true,
 		MaxConnsPerHost:       maxConcurrent,
-		DisableKeepAlives:     false,
 		ResponseHeaderTimeout: requestTimeout,
+		DisableCompression:    true,
+		DisableKeepAlives:     false,
 	}
 
 	client := &http.Client{
@@ -74,19 +82,28 @@ func NewCoordinator(requestTimeout time.Duration, maxConcurrent int) *Coordinato
 }
 
 func (c *Coordinator) Fetch(ctx context.Context, cacheKey, upstreamURL string, clientHeader http.Header) (*Result, error) {
+
 	v, err, _ := c.fetchGroup.Do(cacheKey, func() (interface{}, error) {
 		fetchStartTime := time.Now()
+
 		result, fetchErr := c.doFetch(ctx, upstreamURL, clientHeader)
 		fetchDuration := time.Since(fetchStartTime)
+
+		logFields := map[string]interface{}{
+			"key":      cacheKey,
+			"url":      upstreamURL,
+			"duration": util.FormatDuration(fetchDuration),
+		}
 		if fetchErr != nil {
-			logging.Debug("Singleflight fetch completed with error", "key", cacheKey, "duration", util.FormatDuration(fetchDuration), "error", fetchErr)
+			logging.Debug("Singleflight fetch completed with error", logFields, "error", fetchErr)
 		} else {
-			logging.Debug("Singleflight fetch completed successfully", "key", cacheKey, "duration", util.FormatDuration(fetchDuration))
+			logging.Debug("Singleflight fetch completed successfully", logFields)
 		}
 		return result, fetchErr
 	})
 
 	if err != nil {
+
 		return nil, err
 	}
 
@@ -103,35 +120,42 @@ func (c *Coordinator) Fetch(ctx context.Context, cacheKey, upstreamURL string, c
 func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHeader http.Header) (*Result, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
 	if err != nil {
-
 		logging.ErrorE("Failed to create upstream request", err, "url", upstreamURL)
 		return nil, fmt.Errorf("%w: failed to create upstream request: %v", ErrRequestConfiguration, err)
 	}
 
-	ims := clientHeader.Get("If-Modified-Since")
-	inm := clientHeader.Get("If-None-Match")
-	if ims != "" {
+	if ims := clientHeader.Get("If-Modified-Since"); ims != "" {
 		req.Header.Set("If-Modified-Since", ims)
 	}
-	if inm != "" {
+	if inm := clientHeader.Get("If-None-Match"); inm != "" {
 		req.Header.Set("If-None-Match", inm)
 	}
 
-	req.Header.Set("User-Agent", "go-apt-proxy/1.0")
+	req.Header.Set("User-Agent", "go-apt-proxy/1.0 (+https://github.com/yolkispalkis/go-apt-cache)")
 	req.Header.Set("Accept", "*/*")
-
 	req.Header.Set("Accept-Encoding", "identity")
 
-	logging.Debug("Fetching upstream", "url", upstreamURL, "if_modified_since", ims, "if_none_match", inm)
+	logging.Debug("Fetching upstream",
+		"url", req.URL.String(),
+		"method", req.Method,
+		"if_modified_since", req.Header.Get("If-Modified-Since"),
+		"if_none_match", req.Header.Get("If-None-Match"),
+	)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+
 		if errors.Is(err, context.Canceled) {
 			logging.Warn("Upstream request canceled", "url", upstreamURL, "error", err)
 			return nil, fmt.Errorf("upstream request canceled: %w", err)
 		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			logging.ErrorE("Upstream request deadline exceeded (timeout)", err, "url", upstreamURL, "timeout", c.requestTimeout)
+			return nil, fmt.Errorf("upstream request timeout: %w", err)
+		}
+
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			logging.ErrorE("Upstream request timeout", err, "url", upstreamURL, "timeout", c.requestTimeout)
+			logging.ErrorE("Upstream request net/http timeout", err, "url", upstreamURL, "timeout", c.requestTimeout)
 			return nil, fmt.Errorf("upstream request timeout: %w", err)
 		}
 
@@ -141,8 +165,8 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent:
-
 		logging.Debug("Upstream fetch successful", "url", upstreamURL, "status_code", resp.StatusCode)
+
 	case http.StatusNotModified:
 		resp.Body.Close()
 		logging.Debug("Upstream returned 304 Not Modified", "url", upstreamURL)
@@ -155,28 +179,35 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 
 		statusCode := resp.StatusCode
 		statusText := resp.Status
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		resp.Body.Close()
-		logging.Error("Upstream returned error status", "status_code", statusCode, "status_text", statusText, "url", upstreamURL)
-		return nil, fmt.Errorf("%w: %d %s", ErrUpstreamError, statusCode, statusText)
+		logging.Error("Upstream returned error status",
+			"status_code", statusCode,
+			"status_text", statusText,
+			"url", upstreamURL,
+			"response_snippet", string(bodyBytes),
+		)
+
+		return nil, fmt.Errorf("%w: %s", ErrUpstreamError, statusText)
 	}
 
 	size := int64(-1)
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
-		parsedSize, err := strconv.ParseInt(cl, 10, 64)
-		if err == nil {
+		parsedSize, parseErr := strconv.ParseInt(cl, 10, 64)
+		if parseErr == nil && parsedSize >= 0 {
 			size = parsedSize
 		} else {
-			logging.Warn("Failed to parse Content-Length header", "error", err, "content_length_header", cl, "url", upstreamURL)
+			logging.Warn("Failed to parse Content-Length header or invalid value", "error", parseErr, "content_length_header", cl, "url", upstreamURL)
 		}
 	}
 
 	var modTime time.Time
 	if lm := resp.Header.Get("Last-Modified"); lm != "" {
-		parsedTime, err := http.ParseTime(lm)
-		if err == nil {
+		parsedTime, parseErr := http.ParseTime(lm)
+		if parseErr == nil {
 			modTime = parsedTime
 		} else {
-			logging.Warn("Failed to parse Last-Modified header", "error", err, "last_modified_header", lm, "url", upstreamURL)
+			logging.Warn("Failed to parse Last-Modified header", "error", parseErr, "last_modified_header", lm, "url", upstreamURL)
 		}
 	}
 

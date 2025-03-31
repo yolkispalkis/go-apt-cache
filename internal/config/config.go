@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,7 +32,13 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	case string:
 		tmp, err := time.ParseDuration(value)
 		if err != nil {
-			return fmt.Errorf("invalid duration format '%s': %w", value, err)
+
+			seconds, errInt := json.Number(value).Int64()
+			if errInt == nil && seconds >= 0 {
+				tmp = time.Duration(seconds) * time.Second
+			} else {
+				return fmt.Errorf("invalid duration format '%s': %w", value, err)
+			}
 		}
 		*d = Duration(tmp)
 		return nil
@@ -56,11 +63,18 @@ func (fm *FileMode) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	var mode uint32
+
 	_, err := fmt.Sscanf(s, "0%o", &mode)
 	if err != nil {
 		_, err2 := fmt.Sscanf(s, "%o", &mode)
 		if err2 != nil {
-			return fmt.Errorf("invalid file mode format '%s': %v / %v", s, err, err2)
+
+			modeDecimal, errDecimal := json.Number(s).Int64()
+			if errDecimal == nil {
+				mode = uint32(modeDecimal)
+			} else {
+				return fmt.Errorf("invalid file mode format '%s': %v / %v / %v", s, err, err2, errDecimal)
+			}
 		}
 	}
 
@@ -69,8 +83,9 @@ func (fm *FileMode) UnmarshalJSON(b []byte) error {
 }
 
 func (fm FileMode) FileMode() os.FileMode {
+
 	if fm == 0 {
-		return 0600
+		return 0660
 	}
 	return os.FileMode(fm)
 }
@@ -218,14 +233,22 @@ func Validate(cfg *Config) error {
 	if cfg.Server.MaxConcurrentFetches <= 0 {
 		return errors.New("server.maxConcurrentFetches must be positive")
 	}
+	if cfg.Server.UnixSocketPath != "" {
+		if cfg.Server.UnixSocketPermissions.FileMode()&0777 == 0 {
+			logging.Warn("server.unixSocketPermissions is 0, using default 0660", "path", cfg.Server.UnixSocketPath)
+
+		}
+	}
 
 	if cfg.Cache.Enabled {
 		if cfg.Cache.Directory == "" {
 			return errors.New("cache.directory must be set when cache is enabled")
 		}
+
 		if !filepath.IsAbs(cfg.Cache.Directory) && !strings.HasPrefix(cfg.Cache.Directory, ".") {
-			logging.Warn("Cache directory is relative and doesn't start with '.', ensure it's intended.", "directory", cfg.Cache.Directory)
+			logging.Warn("Cache directory is relative and doesn't start with '.', ensure it's intended relative to the working directory.", "directory", cfg.Cache.Directory)
 		}
+
 		parsedSize, err := util.ParseSize(cfg.Cache.MaxSize)
 		if err != nil {
 			return fmt.Errorf("invalid cache.maxSize %q: %w", cfg.Cache.MaxSize, err)
@@ -238,8 +261,12 @@ func Validate(cfg *Config) error {
 		}
 	}
 
+	if _, err := logging.ParseLevel(cfg.Logging.Level); err != nil {
+		return fmt.Errorf("invalid logging.level: %w", err)
+	}
+
 	if len(cfg.Repositories) == 0 {
-		return errors.New("at least one repository must be configured in the 'repositories' list")
+		logging.Warn("No repositories configured in the 'repositories' list. Proxy will only serve status.")
 	}
 
 	repoNames := make(map[string]struct{})
@@ -249,11 +276,23 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("repository %d must have a 'name'", i)
 		}
 		if !util.IsRepoNameSafe(repo.Name) {
-			return fmt.Errorf("repository name %q contains invalid characters (allowed: a-z, A-Z, 0-9, -, _)", repo.Name)
+			return fmt.Errorf("repository name %q contains invalid characters or is empty/dot/dotdot (allowed: a-z, A-Z, 0-9, -, _)", repo.Name)
 		}
 		if repo.URL == "" {
 			return fmt.Errorf("repository %q must have a 'url'", repo.Name)
 		}
+
+		parsedURL, err := url.Parse(repo.URL)
+		if err != nil {
+			return fmt.Errorf("repository %q has an invalid URL %q: %w", repo.Name, repo.URL, err)
+		}
+		if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+			return fmt.Errorf("repository %q URL scheme must be http or https, got %q", repo.Name, parsedURL.Scheme)
+		}
+		if parsedURL.Host == "" {
+			return fmt.Errorf("repository %q URL is missing a host", repo.Name)
+		}
+
 		if _, exists := repoNames[repo.Name]; exists {
 			return fmt.Errorf("duplicate repository name %q found", repo.Name)
 		}
@@ -264,12 +303,8 @@ func Validate(cfg *Config) error {
 		}
 	}
 
-	if !hasEnabledRepo {
+	if !hasEnabledRepo && len(cfg.Repositories) > 0 {
 		logging.Warn("No repositories are enabled in the configuration. The proxy will not serve any repository data.")
-	}
-
-	if _, err := logging.ParseLevel(cfg.Logging.Level); err != nil {
-		return fmt.Errorf("invalid logging.level: %w", err)
 	}
 
 	return nil

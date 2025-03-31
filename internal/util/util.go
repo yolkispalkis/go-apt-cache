@@ -16,7 +16,7 @@ import (
 var (
 	sizeRegex = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT])?B?$`)
 
-	repoNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	repoNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
 	unsafeCharsRegex = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
 
@@ -34,11 +34,17 @@ func ParseSize(sizeStr string) (int64, error) {
 
 	matches := sizeRegex.FindStringSubmatch(strings.ToUpper(sizeStr))
 	if matches == nil {
+
+		plainBytes, err := strconv.ParseInt(sizeStr, 10, 64)
+		if err == nil && plainBytes >= 0 {
+			return plainBytes, nil
+		}
 		return 0, fmt.Errorf("invalid size format: %q (expected format like '10GB', '500MB', '1024')", sizeStr)
 	}
 
 	sizeValue, err := strconv.ParseFloat(matches[1], 64)
 	if err != nil {
+
 		return 0, fmt.Errorf("invalid numeric value in size %q: %w", sizeStr, err)
 	}
 
@@ -61,13 +67,18 @@ func ParseSize(sizeStr string) (int64, error) {
 	case "":
 		multiplier = 1
 	default:
+
 		return 0, fmt.Errorf("unknown size unit %q in %q", unit, sizeStr)
 	}
 
 	byteSize := int64(sizeValue * multiplier)
+	if sizeValue > 0 && byteSize <= 0 && multiplier > 1 {
 
-	if sizeValue > 0 && byteSize <= 0 {
 		return 0, fmt.Errorf("size value resulted in non-positive bytes or potential overflow: %q", sizeStr)
+	}
+
+	if float64(byteSize)/multiplier < sizeValue*0.99 {
+		logging.Warn("Potential precision loss during size conversion", "input", sizeStr, "bytes", byteSize)
 	}
 
 	return byteSize, nil
@@ -76,6 +87,7 @@ func ParseSize(sizeStr string) (int64, error) {
 func FormatSize(sizeBytes int64) string {
 	const unit = 1024
 	if sizeBytes < 0 {
+
 		return fmt.Sprintf("%d B", sizeBytes)
 	}
 	if sizeBytes < unit {
@@ -83,6 +95,7 @@ func FormatSize(sizeBytes int64) string {
 	}
 
 	div, exp := int64(unit), 0
+
 	for n := sizeBytes / unit; n >= unit && exp < 3; n /= unit {
 		div *= unit
 		exp++
@@ -94,7 +107,12 @@ func CleanPath(path string) string {
 	if path == "" {
 		return "."
 	}
-	return filepath.Clean(path)
+	cleaned := filepath.Clean(path)
+
+	if filepath.IsAbs(cleaned) || cleaned == "/" || cleaned == `\` {
+		return "."
+	}
+	return cleaned
 }
 
 func CleanPathDir(path string) string {
@@ -105,10 +123,12 @@ func IsRepoNameSafe(component string) bool {
 	if component == "" || component == "." || component == ".." {
 		return false
 	}
-	return repoNameRegex.MatchString(component)
+
+	return repoNameRegex.MatchString(component) && !strings.ContainsAny(component, "/\\")
 }
 
 func SanitizeFilename(name string) string {
+
 	sanitized := unsafeCharsRegex.ReplaceAllString(name, "_")
 
 	sanitized = strings.Trim(sanitized, ". ")
@@ -124,11 +144,13 @@ func SanitizeFilename(name string) string {
 }
 
 func SanitizePath(path string) string {
+
 	cleaned := filepath.ToSlash(path)
 	parts := strings.Split(cleaned, "/")
 	sanitizedParts := make([]string, 0, len(parts))
 
 	for _, part := range parts {
+
 		if part == "" {
 			continue
 		}
@@ -143,6 +165,7 @@ func SanitizePath(path string) string {
 		if sanitizedPart != "" {
 			sanitizedParts = append(sanitizedParts, sanitizedPart)
 		} else {
+
 			logging.Warn("Path component became empty after sanitization, skipping", "original_component", part, "original_path", path)
 		}
 	}
@@ -162,13 +185,14 @@ func GetContentType(filePath string) string {
 		lowercaseBaseName := strings.ToLower(baseName)
 
 		switch lowercaseExt {
-		case ".deb", ".udeb":
+		case ".deb", ".udeb", ".ddeb":
 			mimeType = "application/vnd.debian.binary-package"
 		case ".dsc":
 			mimeType = "text/plain; charset=utf-8"
 		case ".changes":
 			mimeType = "text/plain; charset=utf-8"
 		case ".gz":
+
 			if originalMime != "application/gzip" && originalMime != "application/x-gzip" {
 				mimeType = "application/gzip"
 			}
@@ -180,33 +204,45 @@ func GetContentType(filePath string) string {
 			if originalMime != "application/x-xz" {
 				mimeType = "application/x-xz"
 			}
+		case ".lz4":
+			if originalMime != "application/x-lz4" {
+				mimeType = "application/x-lz4"
+			}
+		case ".zst":
+			if originalMime != "application/zstd" {
+				mimeType = "application/zstd"
+			}
 		case ".diff", ".patch":
 			mimeType = "text/x-diff; charset=utf-8"
 		case ".html", ".htm":
 			mimeType = "text/html; charset=utf-8"
-		case ".txt", ".text", ".log":
-			mimeType = "text/plain; charset=utf-8"
+		case ".txt", ".text", ".log", "":
+
+			switch lowercaseBaseName {
+			case "release", "inrelease", "packages", "sources", "translation", "contents":
+				mimeType = "text/plain; charset=utf-8"
+			default:
+
+				if strings.HasSuffix(lowercaseBaseName, "translation") {
+					mimeType = "text/plain; charset=utf-8"
+				} else if mimeType == "" || strings.HasPrefix(mimeType, "application/octet-stream") {
+
+				}
+			}
 		case ".json":
 			mimeType = "application/json"
 		case ".xml":
 			mimeType = "application/xml"
-		case "":
-			switch lowercaseBaseName {
-			case "release", "inrelease":
-				mimeType = "text/plain; charset=utf-8"
-			default:
-				if mimeType == "" || strings.HasPrefix(mimeType, "application/octet-stream") {
-					mimeType = "application/octet-stream"
-				}
-			}
+
 		default:
+
 			if mimeType == "" {
 				mimeType = "application/octet-stream"
 			}
 		}
 
-		if mimeType != originalMime && mimeType != "application/octet-stream" {
-			logging.Debug("MIME type determined by custom rule or override", "path", filePath, "extension", ext, "base_name", baseName, "determined_mime_type", mimeType, "original_mime_type", originalMime)
+		if mimeType != originalMime && originalMime != "" && !strings.HasPrefix(originalMime, "application/octet-stream") {
+			logging.Debug("MIME type determined by override rule", "path", filePath, "extension", ext, "base_name", baseName, "determined_mime_type", mimeType, "original_mime_type", originalMime)
 		}
 	}
 
@@ -218,18 +254,19 @@ func GetContentType(filePath string) string {
 	return mimeType
 }
 
-var cacheRelevantHeaders = map[string]bool{
+var cacheControlHeaders = map[string]bool{
 	"Cache-Control": true,
 	"Expires":       true,
 	"ETag":          true,
 	"Accept-Ranges": true,
 }
 
-func SelectCacheHeaders(dst, src http.Header) {
+func SelectCacheControlHeaders(dst, src http.Header) {
 	for h, values := range src {
 		canonicalH := http.CanonicalHeaderKey(h)
-		if cacheRelevantHeaders[canonicalH] {
+		if cacheControlHeaders[canonicalH] {
 			if len(values) > 0 {
+
 				dst[canonicalH] = append([]string(nil), values...)
 			}
 		}
@@ -253,25 +290,29 @@ func ApplyCacheHeaders(dst http.Header, srcCacheMetaHeaders http.Header) {
 
 		if len(values) > 0 {
 			dst[canonicalH] = append([]string(nil), values...)
-			logging.Debug("Applying header from cache metadata", "header", canonicalH, "value", values)
+
 		}
 	}
 }
 
 func FormatDuration(d time.Duration) string {
 	nanos := d.Nanoseconds()
+	sign := ""
 	if nanos < 0 {
-		return fmt.Sprintf("%dns", nanos)
+		sign = "-"
+		nanos = -nanos
 	}
 
 	switch {
-	case nanos < 1000:
-		return fmt.Sprintf("%dns", nanos)
-	case nanos < 1000*1000:
-		return fmt.Sprintf("%.3fµs", float64(nanos)/1000.0)
-	case nanos < 1000*1000*1000:
-		return fmt.Sprintf("%.3fms", float64(nanos)/1000000.0)
+	case nanos == 0:
+		return "0s"
+	case nanos < int64(time.Microsecond):
+		return fmt.Sprintf("%s%dns", sign, nanos)
+	case nanos < int64(time.Millisecond):
+		return fmt.Sprintf("%s%.3fµs", sign, float64(nanos)/float64(time.Microsecond))
+	case nanos < int64(time.Second):
+		return fmt.Sprintf("%s%.3fms", sign, float64(nanos)/float64(time.Millisecond))
 	default:
-		return fmt.Sprintf("%.3fs", d.Seconds())
+		return fmt.Sprintf("%s%.3fs", sign, d.Seconds())
 	}
 }
