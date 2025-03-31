@@ -104,6 +104,7 @@ User=apt-proxy
 Group=apt-proxy
 SupplementaryGroups=adm
 WorkingDirectory=/var/cache/go-apt-proxy
+EnvironmentFile=/etc/environment
 
 # Настройки безопасности
 ProtectSystem=full

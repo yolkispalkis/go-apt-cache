@@ -89,16 +89,21 @@ func (c *Coordinator) Fetch(ctx context.Context, cacheKey, upstreamURL string, c
 		result, fetchErr := c.doFetch(ctx, upstreamURL, clientHeader)
 		fetchDuration := time.Since(fetchStartTime)
 
-		logFields := map[string]interface{}{
-			"key":      cacheKey,
-			"url":      upstreamURL,
-			"duration": util.FormatDuration(fetchDuration),
-		}
 		if fetchErr != nil {
-			logging.Debug("Singleflight fetch completed with error", logFields, "error", fetchErr)
+			logging.Debug("Singleflight fetch completed with error",
+				"key", cacheKey,
+				"url", upstreamURL,
+				"duration", util.FormatDuration(fetchDuration),
+				"error", fetchErr,
+			)
 		} else {
-			logging.Debug("Singleflight fetch completed successfully", logFields)
+			logging.Debug("Singleflight fetch completed successfully",
+				"key", cacheKey,
+				"url", upstreamURL,
+				"duration", util.FormatDuration(fetchDuration),
+			)
 		}
+
 		return result, fetchErr
 	})
 
@@ -176,9 +181,9 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 		logging.Warn("Upstream returned 404 Not Found", "url", upstreamURL)
 		return nil, ErrNotFound
 	default:
-
 		statusCode := resp.StatusCode
 		statusText := resp.Status
+
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		resp.Body.Close()
 		logging.Error("Upstream returned error status",
