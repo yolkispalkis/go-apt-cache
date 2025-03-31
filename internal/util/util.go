@@ -32,7 +32,6 @@ func ParseSize(sizeStr string) (int64, error) {
 
 	matches := sizeRegex.FindStringSubmatch(strings.ToUpper(sizeStr))
 	if matches == nil {
-
 		plainBytes, err := strconv.ParseInt(sizeStr, 10, 64)
 		if err == nil && plainBytes >= 0 {
 			return plainBytes, nil
@@ -42,7 +41,6 @@ func ParseSize(sizeStr string) (int64, error) {
 
 	sizeValue, err := strconv.ParseFloat(matches[1], 64)
 	if err != nil {
-
 		return 0, fmt.Errorf("invalid numeric value in size %q: %w", sizeStr, err)
 	}
 
@@ -65,13 +63,11 @@ func ParseSize(sizeStr string) (int64, error) {
 	case "":
 		multiplier = 1
 	default:
-
 		return 0, fmt.Errorf("unknown size unit %q in %q", unit, sizeStr)
 	}
 
 	byteSize := int64(sizeValue * multiplier)
 	if sizeValue > 0 && byteSize <= 0 && multiplier > 1 {
-
 		return 0, fmt.Errorf("size value resulted in non-positive bytes or potential overflow: %q", sizeStr)
 	}
 
@@ -148,7 +144,6 @@ func GetContentType(filePath string) string {
 	mimeType := mime.TypeByExtension(ext)
 
 	if mimeType == "" || strings.HasPrefix(mimeType, "application/octet-stream") {
-
 		lowercaseExt := strings.ToLower(ext)
 		lowercaseBaseName := strings.ToLower(baseName)
 
@@ -160,7 +155,6 @@ func GetContentType(filePath string) string {
 		case ".changes":
 			mimeType = "text/plain; charset=utf-8"
 		case ".gz":
-
 			mimeType = "application/gzip"
 		case ".bz2":
 			mimeType = "application/x-bzip2"
@@ -175,16 +169,13 @@ func GetContentType(filePath string) string {
 		case ".html", ".htm":
 			mimeType = "text/html; charset=utf-8"
 		case ".txt", ".text", ".log", "":
-
 			switch lowercaseBaseName {
 			case "release", "inrelease", "packages", "sources", "translation", "contents":
 				mimeType = "text/plain; charset=utf-8"
 			default:
-
 				if strings.HasSuffix(lowercaseBaseName, "translation") {
 					mimeType = "text/plain; charset=utf-8"
 				}
-
 			}
 		case ".json":
 			mimeType = "application/json"
@@ -192,9 +183,7 @@ func GetContentType(filePath string) string {
 			mimeType = "application/xml"
 		default:
 
-			if mimeType == "" {
-
-			}
+			break
 		}
 	}
 
@@ -256,4 +245,34 @@ func FormatDuration(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%s%.3fs", sign, d.Seconds())
 	}
+}
+
+func CompareETags(ifNoneMatchHeader string, currentETag string) bool {
+	if ifNoneMatchHeader == "" || currentETag == "" {
+		return false
+	}
+
+	if ifNoneMatchHeader == "*" {
+		return true
+	}
+
+	trimWeak := func(etag string) string {
+		return strings.TrimPrefix(etag, "W/")
+	}
+	currentETagTrimmed := trimWeak(currentETag)
+
+	clientEtags := strings.Split(ifNoneMatchHeader, ",")
+	for _, clientEtagRaw := range clientEtags {
+		clientEtag := strings.TrimSpace(clientEtagRaw)
+		if clientEtag == "" {
+			continue
+		}
+		clientEtagTrimmed := trimWeak(clientEtag)
+
+		if clientEtagTrimmed == currentETagTrimmed {
+			return true
+		}
+	}
+
+	return false
 }
