@@ -51,12 +51,8 @@ cat > "${CONFIG_DIR}/config.json" << EOF
     "maxSize": "10GB",
     "enabled": true,
     "cleanOnStart": false,
-    "validationTTL": "5m"б
-    "skipValidationExtensions": [
-      ".deb",
-      ".udeb",
-      ".ddeb"
-    ]
+    "validationTTL": "5m",
+    "skipValidationExtensions": [".deb", ".udeb", ".ddeb"]
   },
   "logging": {
     "level": "info",
