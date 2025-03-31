@@ -49,7 +49,7 @@ func New(
 		repoClosure := repo
 		pathPrefix := "/" + strings.Trim(repoClosure.Name, "/") + "/"
 		stripPrefixPath := "/" + strings.Trim(repoClosure.Name, "/")
-		repoHandler := NewRepositoryHandler(repoClosure, cfg.Server, cacheManager, fetcher)
+		repoHandler := NewRepositoryHandler(repoClosure, cfg, cacheManager, fetcher)
 		mux.Handle(pathPrefix, http.StripPrefix(stripPrefixPath, repoHandler))
 
 		logging.Info("Registered handler for repository",
@@ -83,7 +83,6 @@ func New(
 
 func rootHandler(cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
@@ -150,7 +149,6 @@ func statusHandler(cfg *config.Config, cacheManager cache.CacheManager) http.Han
 			enc.SetIndent("", "  ")
 			if err := enc.Encode(stats); err != nil {
 				logging.ErrorE("Failed to encode status to JSON", err)
-
 				w.Header().Del("Content-Type")
 				http.Error(w, `{"error": "Failed to generate JSON status"}`, http.StatusInternalServerError)
 			}
@@ -212,28 +210,41 @@ func statusHandler(cfg *config.Config, cacheManager cache.CacheManager) http.Han
 }
 
 type RepositoryHandler struct {
-	repoConfig   config.Repository
-	serverConfig config.ServerConfig
-	cacheManager cache.CacheManager
-	fetcher      *fetch.Coordinator
+	repoConfig           config.Repository
+	serverConfig         config.ServerConfig
+	cacheConfig          config.CacheConfig
+	cacheManager         cache.CacheManager
+	fetcher              *fetch.Coordinator
+	skipValidationExtMap map[string]struct{}
 }
 
 func NewRepositoryHandler(
 	repo config.Repository,
-	serverCfg config.ServerConfig,
+	cfg *config.Config,
 	cacheMgr cache.CacheManager,
 	fetcher *fetch.Coordinator,
 ) *RepositoryHandler {
+	skipMap := make(map[string]struct{})
+	if cfg.Cache.Enabled {
+		for _, ext := range cfg.Cache.SkipValidationExtensions {
+			normalizedExt := strings.ToLower(ext)
+			if normalizedExt != "" {
+				skipMap[normalizedExt] = struct{}{}
+			}
+		}
+	}
+
 	return &RepositoryHandler{
-		repoConfig:   repo,
-		serverConfig: serverCfg,
-		cacheManager: cacheMgr,
-		fetcher:      fetcher,
+		repoConfig:           repo,
+		serverConfig:         cfg.Server,
+		cacheConfig:          cfg.Cache,
+		cacheManager:         cacheMgr,
+		fetcher:              fetcher,
+		skipValidationExtMap: skipMap,
 	}
 }
 
 func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		logging.Warn("Method not allowed for repository path", "method", r.Method, "repo", h.repoConfig.Name, "path", r.URL.Path)
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
@@ -274,33 +285,45 @@ func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cacheReader, cacheMeta, cacheGetErr := h.cacheManager.Get(r.Context(), requestCacheKey)
 
 	if cacheGetErr == nil {
-
 		h.cacheManager.RecordHit()
 		logging.Debug("Disk cache hit", "key", requestCacheKey)
+
+		shouldSkipValidation := false
+		fileExt := strings.ToLower(filepath.Ext(relativePath))
+		if _, exists := h.skipValidationExtMap[fileExt]; exists && fileExt != "" {
+			shouldSkipValidation = true
+		}
+
+		if shouldSkipValidation {
+			logging.Debug("Skipping upstream validation based on file extension", "key", requestCacheKey, "extension", fileExt)
+			w.Header().Set("X-Cache-Status", "HIT_NO_VALIDATION")
+
+			if h.checkClientCacheHeaders(w, r, cacheMeta.ModTime, cacheMeta.Headers.Get("ETag")) {
+				cacheReader.Close()
+				return
+			}
+
+			h.serveFromCache(w, r, cacheReader, cacheMeta, relativePath)
+			return
+		}
+
 		w.Header().Set("X-Cache-Status", "HIT")
-
-		etag := cacheMeta.Headers.Get("ETag")
-		cacheModTime := cacheMeta.ModTime
-
 		validationTime, validationOK := h.cacheManager.GetValidation(requestCacheKey)
-
 		serveFromValidCache := false
 
 		if validationOK {
-
 			logging.Debug("Validation cache hit, cache item is considered fresh.", "key", requestCacheKey, "validated_at", validationTime.Format(time.RFC3339))
 			serveFromValidCache = true
-
 			w.Header().Set("X-Cache-Status", "HIT_VALIDATED")
 		} else {
-
 			logging.Debug("Validation cache expired or missing. Initiating revalidation fetch.", "key", requestCacheKey)
 			w.Header().Set("X-Cache-Status", "REVALIDATING")
 
 			revalidationHeaders := make(http.Header)
-			if !cacheModTime.IsZero() {
-				revalidationHeaders.Set("If-Modified-Since", cacheModTime.UTC().Format(http.TimeFormat))
+			if !cacheMeta.ModTime.IsZero() {
+				revalidationHeaders.Set("If-Modified-Since", cacheMeta.ModTime.UTC().Format(http.TimeFormat))
 			}
+			etag := cacheMeta.Headers.Get("ETag")
 			if etag != "" {
 				revalidationHeaders.Set("If-None-Match", etag)
 			}
@@ -309,43 +332,32 @@ func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			if revalErr != nil {
 				if errors.Is(revalErr, fetch.ErrUpstreamNotModified) {
-
-					logging.Info("Revalidation successful: Upstream returned 304 Not Modified, cache is still valid",
-						"url", upstreamURL, "key", requestCacheKey)
+					logging.Info("Revalidation successful: Upstream returned 304 Not Modified, cache is still valid", "url", upstreamURL, "key", requestCacheKey)
 					h.cacheManager.PutValidation(requestCacheKey, time.Now())
 					w.Header().Set("X-Cache-Status", "VALIDATED")
 					serveFromValidCache = true
 				} else {
-
 					cacheReader.Close()
 					h.handleFetchError(w, r, revalErr, "Revalidation fetch failed", upstreamURL, requestCacheKey)
 					return
 				}
 			} else {
-
 				logging.Info("Revalidation fetch successful: Upstream has newer content (sent 200 OK)", "key", requestCacheKey, "url", upstreamURL)
 				cacheReader.Close()
-
 				h.streamAndCache(w, r, revalResult, requestCacheKey, relativePath)
 				return
 			}
-
 		}
 
 		if serveFromValidCache {
-
-			if h.checkClientCacheHeaders(w, r, cacheModTime, etag) {
-
+			if h.checkClientCacheHeaders(w, r, cacheMeta.ModTime, cacheMeta.Headers.Get("ETag")) {
 				cacheReader.Close()
-
 				return
 			} else {
-
 				h.serveFromCache(w, r, cacheReader, cacheMeta, relativePath)
 				return
 			}
 		} else {
-
 			cacheReader.Close()
 			logging.Error("Internal logic error: Reached end of cache hit block without serving or erroring.", "key", requestCacheKey)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -353,14 +365,11 @@ func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 	} else if !errors.Is(cacheGetErr, os.ErrNotExist) {
-
 		h.cacheManager.RecordMiss()
 		logging.ErrorE("Error reading from cache (not ErrNotExist)", cacheGetErr, "key", requestCacheKey)
 		http.Error(w, "Internal Cache Error", http.StatusInternalServerError)
 		return
-
 	} else {
-
 		h.cacheManager.RecordMiss()
 		logging.Debug("Cache miss, fetching from upstream", "key", requestCacheKey, "upstream_url", upstreamURL)
 		w.Header().Set("X-Cache-Status", "MISS")
@@ -368,13 +377,11 @@ func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fetchResult, fetchErr := h.fetcher.Fetch(r.Context(), requestCacheKey, upstreamURL, nil)
 
 		if fetchErr != nil {
-
 			if errors.Is(fetchErr, fetch.ErrUpstreamNotModified) {
 				h.cacheManager.RecordValidationError()
 				logging.ErrorE("CRITICAL: Unexpected upstream 304 during initial cache miss fetch", fetchErr, "key", requestCacheKey, "url", upstreamURL)
 				http.Error(w, "Internal Server Error (upstream protocol error)", http.StatusInternalServerError)
 			} else {
-
 				h.handleFetchError(w, r, fetchErr, "Initial fetch failed", upstreamURL, requestCacheKey)
 			}
 			return
@@ -382,7 +389,6 @@ func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		logging.Debug("Initial fetch successful. Streaming to client and cache.", "key", requestCacheKey, "status_code_from_upstream", fetchResult.StatusCode)
 		h.streamAndCache(w, r, fetchResult, requestCacheKey, relativePath)
-
 	}
 }
 
@@ -394,7 +400,6 @@ func (h *RepositoryHandler) handleFetchError(w http.ResponseWriter, r *http.Requ
 		http.NotFound(w, r)
 	} else if errors.Is(fetchErr, context.Canceled) || errors.Is(fetchErr, context.DeadlineExceeded) {
 		logging.Warn(contextMsg+": Request context cancelled or deadline exceeded", logFields...)
-
 		if r.Context().Err() == nil {
 			http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
 		}
@@ -402,7 +407,6 @@ func (h *RepositoryHandler) handleFetchError(w http.ResponseWriter, r *http.Requ
 		logging.ErrorE(contextMsg+": Upstream request timeout", fetchErr, logFields...)
 		http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
 	} else {
-
 		logging.ErrorE(contextMsg+": Bad gateway or upstream connection error", fetchErr, logFields...)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
@@ -457,11 +461,9 @@ func (h *RepositoryHandler) streamAndCache(w http.ResponseWriter, r *http.Reques
 
 		if putErr != nil {
 			logging.ErrorE("Cache write goroutine finished with error", putErr, "key", cacheKey, "duration", util.FormatDuration(cacheWriteDuration))
-
 			_ = pr.CloseWithError(putErr)
 		} else {
 			logging.Debug("Cache write goroutine finished successfully", "key", cacheKey, "duration", util.FormatDuration(cacheWriteDuration))
-
 			h.cacheManager.PutValidation(cacheKey, time.Now())
 		}
 	}()
@@ -475,7 +477,6 @@ func (h *RepositoryHandler) streamAndCache(w http.ResponseWriter, r *http.Reques
 	if fetchResult.Size >= 0 && !isChunked && fetchResult.StatusCode == http.StatusOK {
 		w.Header().Set("Content-Length", strconv.FormatInt(fetchResult.Size, 10))
 	} else if r.Method == http.MethodHead && fetchResult.Size < 0 {
-
 		w.Header().Del("Content-Length")
 	}
 
@@ -483,12 +484,10 @@ func (h *RepositoryHandler) streamAndCache(w http.ResponseWriter, r *http.Reques
 
 	if r.Method == http.MethodHead {
 		logging.Debug("Handling HEAD request (in streamAndCache), closing pipe writer", "key", cacheKey)
-
 		if err := pw.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 			logging.Warn("Error closing pipe writer for HEAD request", "error", err, "key", cacheKey)
 		}
 	} else {
-
 		logging.Debug("Starting TeeReader copy to client and cache pipe", "key", cacheKey)
 		teeReader := io.TeeReader(fetchResult.Body, pw)
 		bytesWritten, copyErr := io.Copy(w, teeReader)
@@ -510,9 +509,7 @@ func (h *RepositoryHandler) streamAndCache(w http.ResponseWriter, r *http.Reques
 	<-cacheWriteDone
 
 	if cacheWriteErr != nil {
-
 		logging.Warn("Cache write for key finished with error (see previous log)", "key", cacheKey, "error", cacheWriteErr)
-
 	} else {
 		logging.Debug("Cache write confirmation received successfully", "key", cacheKey)
 	}
@@ -541,7 +538,6 @@ func (h *RepositoryHandler) serveFromCache(w http.ResponseWriter, r *http.Reques
 		if cacheMeta.Size >= 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(cacheMeta.Size, 10))
 		} else {
-
 			w.Header().Del("Content-Length")
 			logging.Warn("HEAD request for cached item with unknown size", "key", cacheMeta.Key)
 		}
@@ -552,9 +548,7 @@ func (h *RepositoryHandler) serveFromCache(w http.ResponseWriter, r *http.Reques
 
 	readSeeker, isSeeker := cacheReader.(io.ReadSeeker)
 	if !isSeeker {
-
 		logging.Error("Cache reader is not io.ReadSeeker in serveFromCache, serving via io.Copy", "key", cacheMeta.Key)
-
 		if cacheMeta.Size >= 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(cacheMeta.Size, 10))
 		}
@@ -566,22 +560,18 @@ func (h *RepositoryHandler) serveFromCache(w http.ResponseWriter, r *http.Reques
 			logging.Debug("Served bytes from non-seeker cache via io.Copy in helper", "key", cacheMeta.Key, "written_bytes", bytesWritten)
 		}
 	} else {
-
 		serveName := filepath.Base(relativePath)
 		if serveName == "." || serveName == "/" || serveName == "" {
 			serveName = h.repoConfig.Name
 		}
 		logging.Debug("Serving cache hit via ServeContent in helper", "key", cacheMeta.Key, "serve_name", serveName)
-
 		http.ServeContent(w, r, serveName, cacheMeta.ModTime, readSeeker)
 	}
 }
 
 func (h *RepositoryHandler) checkClientCacheHeaders(w http.ResponseWriter, r *http.Request, modTime time.Time, etag string) bool {
-
 	clientETag := r.Header.Get("If-None-Match")
 	if clientETag != "" && etag != "" {
-
 		if strings.Contains(clientETag, etag) || clientETag == "*" {
 			logging.Debug("Cache check: ETag match", "client_if_none_match", r.Header.Get("If-None-Match"), "cache_etag", etag, "path", r.URL.Path)
 			w.WriteHeader(http.StatusNotModified)
@@ -592,7 +582,6 @@ func (h *RepositoryHandler) checkClientCacheHeaders(w http.ResponseWriter, r *ht
 	clientModSince := r.Header.Get("If-Modified-Since")
 	if clientModSince != "" && !modTime.IsZero() {
 		if t, err := http.ParseTime(clientModSince); err == nil {
-
 			if !modTime.Truncate(time.Second).After(t.Truncate(time.Second)) {
 				logging.Debug("Cache check: Not modified since", "client_if_modified_since", clientModSince, "path", r.URL.Path, "cache_mod_time", modTime.UTC().Format(http.TimeFormat))
 				w.WriteHeader(http.StatusNotModified)
@@ -602,7 +591,6 @@ func (h *RepositoryHandler) checkClientCacheHeaders(w http.ResponseWriter, r *ht
 			logging.Warn("Could not parse If-Modified-Since header", "error", err, "if_modified_since_header", clientModSince, "path", r.URL.Path)
 		}
 	}
-
 	return false
 }
 
@@ -610,19 +598,15 @@ func isClientDisconnectedError(err error) bool {
 	if err == nil {
 		return false
 	}
-
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
-
 	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
 		return true
 	}
-
 	if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
 		return true
 	}
-
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "broken pipe") ||
 		strings.Contains(errStr, "connection reset by peer") ||

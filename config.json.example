@@ -14,7 +14,16 @@
     "maxSize": "10GB",
     "enabled": true,
     "cleanOnStart": false,
-    "validationTTL": "5m"
+    "validationTTL": "5m",
+    "skipValidationExtensions": [
+      ".deb",
+      ".udeb",
+      ".ddeb",
+      ".rpm",
+      ".tar.gz",
+      ".tgz",
+      ".zip"
+    ]
   },
   "logging": {
     "level": "info",
@@ -47,4 +56,4 @@
       "enabled": false
     }
   ]
-} 
+}

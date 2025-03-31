@@ -32,7 +32,6 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	case string:
 		tmp, err := time.ParseDuration(value)
 		if err != nil {
-
 			seconds, errInt := json.Number(value).Int64()
 			if errInt == nil && seconds >= 0 {
 				tmp = time.Duration(seconds) * time.Second
@@ -63,12 +62,10 @@ func (fm *FileMode) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	var mode uint32
-
 	_, err := fmt.Sscanf(s, "0%o", &mode)
 	if err != nil {
 		_, err2 := fmt.Sscanf(s, "%o", &mode)
 		if err2 != nil {
-
 			modeDecimal, errDecimal := json.Number(s).Int64()
 			if errDecimal == nil {
 				mode = uint32(modeDecimal)
@@ -77,13 +74,11 @@ func (fm *FileMode) UnmarshalJSON(b []byte) error {
 			}
 		}
 	}
-
 	*fm = FileMode(os.FileMode(mode))
 	return nil
 }
 
 func (fm FileMode) FileMode() os.FileMode {
-
 	if fm == 0 {
 		return 0660
 	}
@@ -108,11 +103,12 @@ type ServerConfig struct {
 }
 
 type CacheConfig struct {
-	Directory     string   `json:"directory"`
-	MaxSize       string   `json:"maxSize"`
-	Enabled       bool     `json:"enabled"`
-	CleanOnStart  bool     `json:"cleanOnStart"`
-	ValidationTTL Duration `json:"validationTTL"`
+	Directory                string   `json:"directory"`
+	MaxSize                  string   `json:"maxSize"`
+	Enabled                  bool     `json:"enabled"`
+	CleanOnStart             bool     `json:"cleanOnStart"`
+	ValidationTTL            Duration `json:"validationTTL"`
+	SkipValidationExtensions []string `json:"skipValidationExtensions,omitempty"`
 }
 
 type Config struct {
@@ -135,11 +131,12 @@ func Default() *Config {
 			MaxConcurrentFetches:  10,
 		},
 		Cache: CacheConfig{
-			Directory:     "./cache_data",
-			MaxSize:       "10GB",
-			Enabled:       true,
-			CleanOnStart:  false,
-			ValidationTTL: Duration(5 * time.Minute),
+			Directory:                "./cache_data",
+			MaxSize:                  "10GB",
+			Enabled:                  true,
+			CleanOnStart:             false,
+			ValidationTTL:            Duration(5 * time.Minute),
+			SkipValidationExtensions: []string{".deb", ".udeb", ".ddeb"},
 		},
 		Logging: logging.LoggingConfig{
 			Level:           "info",
@@ -236,7 +233,6 @@ func Validate(cfg *Config) error {
 	if cfg.Server.UnixSocketPath != "" {
 		if cfg.Server.UnixSocketPermissions.FileMode()&0777 == 0 {
 			logging.Warn("server.unixSocketPermissions is 0, using default 0660", "path", cfg.Server.UnixSocketPath)
-
 		}
 	}
 
@@ -244,11 +240,9 @@ func Validate(cfg *Config) error {
 		if cfg.Cache.Directory == "" {
 			return errors.New("cache.directory must be set when cache is enabled")
 		}
-
 		if !filepath.IsAbs(cfg.Cache.Directory) && !strings.HasPrefix(cfg.Cache.Directory, ".") {
 			logging.Warn("Cache directory is relative and doesn't start with '.', ensure it's intended relative to the working directory.", "directory", cfg.Cache.Directory)
 		}
-
 		parsedSize, err := util.ParseSize(cfg.Cache.MaxSize)
 		if err != nil {
 			return fmt.Errorf("invalid cache.maxSize %q: %w", cfg.Cache.MaxSize, err)
@@ -258,6 +252,11 @@ func Validate(cfg *Config) error {
 		}
 		if cfg.Cache.ValidationTTL < 0 {
 			return errors.New("cache.validationTTL cannot be negative")
+		}
+		for i, ext := range cfg.Cache.SkipValidationExtensions {
+			if !strings.HasPrefix(ext, ".") || len(ext) < 2 {
+				return fmt.Errorf("invalid extension in cache.skipValidationExtensions[%d]: %q (must start with '.' and have content)", i, ext)
+			}
 		}
 	}
 
@@ -281,7 +280,6 @@ func Validate(cfg *Config) error {
 		if repo.URL == "" {
 			return fmt.Errorf("repository %q must have a 'url'", repo.Name)
 		}
-
 		parsedURL, err := url.Parse(repo.URL)
 		if err != nil {
 			return fmt.Errorf("repository %q has an invalid URL %q: %w", repo.Name, repo.URL, err)
@@ -292,12 +290,10 @@ func Validate(cfg *Config) error {
 		if parsedURL.Host == "" {
 			return fmt.Errorf("repository %q URL is missing a host", repo.Name)
 		}
-
 		if _, exists := repoNames[repo.Name]; exists {
 			return fmt.Errorf("duplicate repository name %q found", repo.Name)
 		}
 		repoNames[repo.Name] = struct{}{}
-
 		if repo.Enabled {
 			hasEnabledRepo = true
 		}
