@@ -68,7 +68,11 @@ func NewCoordinator(requestTimeout time.Duration, maxConcurrent int) *Coordinato
 
 	proxyURL, err := http.ProxyFromEnvironment(&http.Request{URL: &url.URL{Scheme: "http", Host: "example.com"}})
 	if err == nil && proxyURL != nil {
-		logging.Info("Using system proxy", "proxy_url", proxyURL.String())
+
+		logProxyURL := *proxyURL
+		logProxyURL.User = nil
+		logging.Info("Using system proxy", "proxy_url", logProxyURL.String())
+
 	} else if err != nil {
 		logging.Warn("Error checking system proxy settings", "error", err)
 	} else {
@@ -108,7 +112,6 @@ func (c *Coordinator) Fetch(ctx context.Context, cacheKey, upstreamURL string, c
 	})
 
 	if err != nil {
-
 		return nil, err
 	}
 
@@ -123,6 +126,7 @@ func (c *Coordinator) Fetch(ctx context.Context, cacheKey, upstreamURL string, c
 }
 
 func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHeader http.Header) (*Result, error) {
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
 	if err != nil {
 		logging.ErrorE("Failed to create upstream request", err, "url", upstreamURL)
@@ -202,6 +206,7 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 		if parseErr == nil && parsedSize >= 0 {
 			size = parsedSize
 		} else {
+
 			logging.Warn("Failed to parse Content-Length header or invalid value", "error", parseErr, "content_length_header", cl, "url", upstreamURL)
 		}
 	}
@@ -212,6 +217,7 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 		if parseErr == nil {
 			modTime = parsedTime
 		} else {
+
 			logging.Warn("Failed to parse Last-Modified header", "error", parseErr, "last_modified_header", lm, "url", upstreamURL)
 		}
 	}
