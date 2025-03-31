@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 )
 
 var (
@@ -77,17 +75,12 @@ func ParseSize(sizeStr string) (int64, error) {
 		return 0, fmt.Errorf("size value resulted in non-positive bytes or potential overflow: %q", sizeStr)
 	}
 
-	if float64(byteSize)/multiplier < sizeValue*0.99 {
-		logging.Warn("Potential precision loss during size conversion", "input", sizeStr, "bytes", byteSize)
-	}
-
 	return byteSize, nil
 }
 
 func FormatSize(sizeBytes int64) string {
 	const unit = 1024
 	if sizeBytes < 0 {
-
 		return fmt.Sprintf("%d B", sizeBytes)
 	}
 	if sizeBytes < unit {
@@ -95,7 +88,6 @@ func FormatSize(sizeBytes int64) string {
 	}
 
 	div, exp := int64(unit), 0
-
 	for n := sizeBytes / unit; n >= unit && exp < 3; n /= unit {
 		div *= unit
 		exp++
@@ -104,14 +96,7 @@ func FormatSize(sizeBytes int64) string {
 }
 
 func CleanPath(path string) string {
-	if path == "" {
-		return "."
-	}
 	cleaned := filepath.Clean(path)
-
-	if filepath.IsAbs(cleaned) || cleaned == "/" || cleaned == `\` {
-		return "."
-	}
 	return cleaned
 }
 
@@ -123,20 +108,15 @@ func IsRepoNameSafe(component string) bool {
 	if component == "" || component == "." || component == ".." {
 		return false
 	}
-
 	return repoNameRegex.MatchString(component) && !strings.ContainsAny(component, "/\\")
 }
 
 func SanitizeFilename(name string) string {
-
 	sanitized := unsafeCharsRegex.ReplaceAllString(name, "_")
-
 	sanitized = strings.Trim(sanitized, ". ")
-
 	if _, isReserved := reservedNames[strings.ToLower(sanitized)]; isReserved {
 		sanitized = "_" + sanitized
 	}
-
 	if sanitized == "" {
 		return "_"
 	}
@@ -144,43 +124,31 @@ func SanitizeFilename(name string) string {
 }
 
 func SanitizePath(path string) string {
-
 	cleaned := filepath.ToSlash(path)
 	parts := strings.Split(cleaned, "/")
 	sanitizedParts := make([]string, 0, len(parts))
-
 	for _, part := range parts {
-
 		if part == "" {
 			continue
 		}
-
 		if part == "." || part == ".." {
-			logging.Warn("Path traversal component detected and removed during sanitization", "component", part, "original_path", path)
 			continue
 		}
-
 		sanitizedPart := SanitizeFilename(part)
-
 		if sanitizedPart != "" {
 			sanitizedParts = append(sanitizedParts, sanitizedPart)
-		} else {
-
-			logging.Warn("Path component became empty after sanitization, skipping", "original_component", part, "original_path", path)
 		}
 	}
-
 	return filepath.Join(sanitizedParts...)
 }
 
 func GetContentType(filePath string) string {
 	ext := filepath.Ext(filePath)
 	baseName := filepath.Base(filePath)
-
 	mimeType := mime.TypeByExtension(ext)
 
 	if mimeType == "" || strings.HasPrefix(mimeType, "application/octet-stream") {
-		originalMime := mimeType
+
 		lowercaseExt := strings.ToLower(ext)
 		lowercaseBaseName := strings.ToLower(baseName)
 
@@ -193,25 +161,15 @@ func GetContentType(filePath string) string {
 			mimeType = "text/plain; charset=utf-8"
 		case ".gz":
 
-			if originalMime != "application/gzip" && originalMime != "application/x-gzip" {
-				mimeType = "application/gzip"
-			}
+			mimeType = "application/gzip"
 		case ".bz2":
-			if originalMime != "application/x-bzip2" {
-				mimeType = "application/x-bzip2"
-			}
+			mimeType = "application/x-bzip2"
 		case ".xz":
-			if originalMime != "application/x-xz" {
-				mimeType = "application/x-xz"
-			}
+			mimeType = "application/x-xz"
 		case ".lz4":
-			if originalMime != "application/x-lz4" {
-				mimeType = "application/x-lz4"
-			}
+			mimeType = "application/x-lz4"
 		case ".zst":
-			if originalMime != "application/zstd" {
-				mimeType = "application/zstd"
-			}
+			mimeType = "application/zstd"
 		case ".diff", ".patch":
 			mimeType = "text/x-diff; charset=utf-8"
 		case ".html", ".htm":
@@ -225,29 +183,22 @@ func GetContentType(filePath string) string {
 
 				if strings.HasSuffix(lowercaseBaseName, "translation") {
 					mimeType = "text/plain; charset=utf-8"
-				} else if mimeType == "" || strings.HasPrefix(mimeType, "application/octet-stream") {
-
 				}
+
 			}
 		case ".json":
 			mimeType = "application/json"
 		case ".xml":
 			mimeType = "application/xml"
-
 		default:
 
 			if mimeType == "" {
-				mimeType = "application/octet-stream"
-			}
-		}
 
-		if mimeType != originalMime && originalMime != "" && !strings.HasPrefix(originalMime, "application/octet-stream") {
-			logging.Debug("MIME type determined by override rule", "path", filePath, "extension", ext, "base_name", baseName, "determined_mime_type", mimeType, "original_mime_type", originalMime)
+			}
 		}
 	}
 
 	if mimeType == "" {
-		logging.Warn("Could not determine MIME type, falling back to application/octet-stream", "path", filePath)
 		mimeType = "application/octet-stream"
 	}
 
@@ -266,7 +217,6 @@ func SelectCacheControlHeaders(dst, src http.Header) {
 		canonicalH := http.CanonicalHeaderKey(h)
 		if cacheControlHeaders[canonicalH] {
 			if len(values) > 0 {
-
 				dst[canonicalH] = append([]string(nil), values...)
 			}
 		}
@@ -276,21 +226,12 @@ func SelectCacheControlHeaders(dst, src http.Header) {
 func ApplyCacheHeaders(dst http.Header, srcCacheMetaHeaders http.Header) {
 	for h, values := range srcCacheMetaHeaders {
 		canonicalH := http.CanonicalHeaderKey(h)
-
 		switch canonicalH {
-		case "Content-Length",
-			"Content-Type",
-			"Last-Modified",
-			"Date",
-			"Connection",
-			"Transfer-Encoding",
-			"Content-Encoding":
+		case "Content-Length", "Content-Type", "Last-Modified", "Date", "Connection", "Transfer-Encoding", "Content-Encoding":
 			continue
 		}
-
 		if len(values) > 0 {
 			dst[canonicalH] = append([]string(nil), values...)
-
 		}
 	}
 }
