@@ -8,12 +8,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
@@ -23,6 +24,7 @@ var (
 	ErrUpstreamNotModified  = errors.New("upstream resource not modified (304)")
 	ErrUpstreamError        = errors.New("upstream server error")
 	ErrRequestConfiguration = errors.New("invalid request configuration")
+	ErrCacheWriteFailed     = errors.New("failed to write fetched item to cache")
 )
 
 type fetchResultInternal struct {
@@ -34,11 +36,12 @@ type fetchResultInternal struct {
 }
 
 type Coordinator struct {
-	httpClient *http.Client
-	fetchGroup singleflight.Group
+	httpClient   *http.Client
+	fetchGroup   singleflight.Group
+	cacheManager cache.CacheManager
 }
 
-func NewCoordinator(requestTimeout time.Duration, maxConcurrent int) *Coordinator {
+func NewCoordinator(requestTimeout time.Duration, maxConcurrent int, cm cache.CacheManager) *Coordinator {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 10
 	}
@@ -77,18 +80,75 @@ func NewCoordinator(requestTimeout time.Duration, maxConcurrent int) *Coordinato
 	}
 
 	return &Coordinator{
-		httpClient: client,
+		httpClient:   client,
+		cacheManager: cm,
 	}
 }
 
-func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, clientHeader http.Header) (*fetchResultInternal, error) {
+func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, relativePath string, clientHeader http.Header) error {
+	_, err, _ := c.fetchGroup.Do(cacheKey, func() (interface{}, error) {
+		fetchStartTime := time.Now()
+		logging.Debug("Singleflight: Initiating fetch and cache", "key", cacheKey, "url", upstreamURL)
 
+		fetchResult, fetchErr := c.doFetch(ctx, upstreamURL, clientHeader)
+		if fetchErr != nil {
+			if errors.Is(fetchErr, ErrUpstreamNotModified) {
+				logging.Error("Singleflight: Unexpected 304 from upstream during initial fetch", "key", cacheKey, "url", upstreamURL)
+				return nil, fmt.Errorf("%w: unexpected 304 during initial fetch for %s", ErrUpstreamError, cacheKey)
+			}
+			logging.ErrorE("Singleflight: Fetch failed", fetchErr, "key", cacheKey, "url", upstreamURL)
+			return nil, fetchErr
+		}
+		defer fetchResult.Body.Close()
+
+		cachePutMeta := cache.CacheMetadata{
+			Version:   cache.MetadataVersion,
+			FetchTime: time.Now().UTC(),
+			ModTime:   fetchResult.ModTime,
+			Size:      fetchResult.Size,
+			Headers:   make(http.Header),
+			Key:       cacheKey,
+		}
+		finalContentType := ""
+		upstreamContentType := fetchResult.Header.Get("Content-Type")
+		if upstreamContentType != "" && !strings.HasPrefix(strings.ToLower(upstreamContentType), "application/octet-stream") {
+			finalContentType = upstreamContentType
+		} else {
+			finalContentType = util.GetContentType(relativePath)
+			logging.Debug("Singleflight: Using path-detected Content-Type for cache", "path", relativePath, "detected_type", finalContentType, "upstream_type", upstreamContentType)
+		}
+		if finalContentType == "" {
+			finalContentType = "application/octet-stream"
+		}
+		cachePutMeta.Headers.Set("Content-Type", finalContentType)
+		util.SelectCacheControlHeaders(cachePutMeta.Headers, fetchResult.Header)
+
+		logging.Debug("Singleflight: Writing fetched content to cache (blocking)", "key", cacheKey, "size", cachePutMeta.Size)
+		putErr := c.cacheManager.Put(ctx, cacheKey, fetchResult.Body, cachePutMeta)
+		if putErr != nil {
+			logging.ErrorE("Singleflight: Failed to write item to cache", putErr, "key", cacheKey)
+			_ = c.cacheManager.Delete(context.Background(), cacheKey)
+			return nil, fmt.Errorf("%w: %v", ErrCacheWriteFailed, putErr)
+		}
+
+		fetchDuration := time.Since(fetchStartTime)
+		logging.Info("Singleflight: Fetch and cache successful",
+			"key", cacheKey,
+			"url", upstreamURL,
+			"size", cachePutMeta.Size,
+			"duration", util.FormatDuration(fetchDuration),
+		)
+		return nil, nil
+	})
+
+	return err
+}
+
+func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, clientHeader http.Header) (*fetchResultInternal, error) {
 	v, err, _ := c.fetchGroup.Do(fetchKey, func() (interface{}, error) {
 		fetchStartTime := time.Now()
 		logging.Debug("Singleflight: Initiating upstream fetch", "key", fetchKey, "url", upstreamURL)
-
 		result, fetchErr := c.doFetch(ctx, upstreamURL, clientHeader)
-
 		fetchDuration := time.Since(fetchStartTime)
 		if fetchErr != nil {
 			logging.Debug("Singleflight: Fetch completed with error",
@@ -97,7 +157,6 @@ func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, c
 			logging.Debug("Singleflight: Fetch completed successfully",
 				"key", fetchKey, "url", upstreamURL, "duration", util.FormatDuration(fetchDuration), "status", result.StatusCode)
 		}
-
 		return result, fetchErr
 	})
 
@@ -107,29 +166,24 @@ func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, c
 
 	result, ok := v.(*fetchResultInternal)
 	if !ok {
-
 		if rc, okCloser := v.(io.ReadCloser); okCloser {
 			_ = rc.Close()
 		}
 		logging.Error("Internal error: unexpected type returned from fetch singleflight group", "key", fetchKey, "type", fmt.Sprintf("%T", v))
 		return nil, fmt.Errorf("internal error: unexpected type returned from fetch singleflight group (%T)", v)
 	}
-
 	return result, nil
 }
 
 func (c *Coordinator) FetchForRevalidation(ctx context.Context, revalKey, upstreamURL string, conditionalHeaders http.Header) (*fetchResultInternal, error) {
-
 	logging.Debug("Revalidation: Sending conditional request via Fetch", "key", revalKey, "url", upstreamURL, "headers", conditionalHeaders)
 	fetchResult, fetchErr := c.Fetch(ctx, revalKey, upstreamURL, conditionalHeaders)
 
 	if fetchErr != nil {
-
 		if errors.Is(fetchErr, ErrUpstreamNotModified) {
 			logging.Debug("Revalidation: Success (304 Not Modified)", "key", revalKey, "url", upstreamURL)
 			return nil, nil
 		}
-
 		logging.Warn("Revalidation: Fetch failed", "error", fetchErr, "key", revalKey, "url", upstreamURL)
 		return nil, fetchErr
 	}

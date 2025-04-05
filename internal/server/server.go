@@ -36,6 +36,7 @@ func New(
 	fetcher := fetch.NewCoordinator(
 		cfg.Server.RequestTimeout.Duration(),
 		cfg.Server.MaxConcurrentFetches,
+		cacheManager,
 	)
 	logging.Info("Fetch coordinator initialized", "max_concurrent", cfg.Server.MaxConcurrentFetches, "timeout", cfg.Server.RequestTimeout.Duration())
 
@@ -352,71 +353,28 @@ func (h *RepositoryHandler) handleCacheHit(w http.ResponseWriter, r *http.Reques
 
 func (h *RepositoryHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request, requestCacheKey, relativePath, upstreamURL string) {
 	h.cacheManager.RecordMiss()
-	logging.Debug("Cache miss, fetching from upstream", "key", requestCacheKey, "upstream_url", upstreamURL)
+	logging.Debug("Cache miss, fetching from upstream and caching", "key", requestCacheKey, "upstream_url", upstreamURL)
 	w.Header().Set("X-Cache-Status", "MISS")
 
-	fetchResult, fetchErr := h.fetcher.Fetch(r.Context(), requestCacheKey, upstreamURL, r.Header)
+	fetchErr := h.fetcher.FetchAndCache(r.Context(), requestCacheKey, upstreamURL, relativePath, r.Header)
 
 	if fetchErr != nil {
-		h.handleFetchError(w, r, fetchErr, "Upstream fetch failed", upstreamURL, requestCacheKey)
+		h.handleFetchError(w, r, fetchErr, "Fetch/Cache failed", upstreamURL, requestCacheKey)
 		return
 	}
 
-	logging.Debug("Fetch successful. Initiating cache write and streaming.", "key", requestCacheKey, "status_code_from_upstream", fetchResult.StatusCode)
-	w.Header().Set("X-Cache-Status", "MISS_FETCHED")
+	logging.Debug("FetchAndCache successful, serving item from cache", "key", requestCacheKey)
+	w.Header().Set("X-Cache-Status", "MISS_SERVED_CACHE")
 
-	putMeta := cache.CacheMetadata{
-		Version:   cache.MetadataVersion,
-		FetchTime: time.Now().UTC(),
-		ModTime:   fetchResult.ModTime,
-		Size:      fetchResult.Size,
-		Headers:   make(http.Header),
-		Key:       requestCacheKey,
-	}
-	finalContentType := ""
-	upstreamContentType := fetchResult.Header.Get("Content-Type")
-	if upstreamContentType != "" && !strings.HasPrefix(strings.ToLower(upstreamContentType), "application/octet-stream") {
-		finalContentType = upstreamContentType
-	} else {
-		finalContentType = util.GetContentType(relativePath)
-	}
-	if finalContentType == "" {
-		finalContentType = "application/octet-stream"
-	}
-	putMeta.Headers.Set("Content-Type", finalContentType)
-	util.SelectCacheControlHeaders(putMeta.Headers, fetchResult.Header)
-
-	streamReader, putErr := h.cacheManager.Put(r.Context(), requestCacheKey, fetchResult.Body, putMeta)
-
-	if putErr != nil {
-		logging.ErrorE("Failed to initiate cache Put operation after fetch", putErr, "key", requestCacheKey)
-		h.handleFetchError(w, r, fmt.Errorf("cache Put initiation failed: %w", putErr), "Cache Write Failed", upstreamURL, requestCacheKey)
+	cacheReader, cacheMeta, cacheGetErr := h.cacheManager.Get(r.Context(), requestCacheKey)
+	if cacheGetErr != nil {
+		logging.ErrorE("CRITICAL: Failed to read from cache immediately after successful FetchAndCache", cacheGetErr, "key", requestCacheKey)
+		h.handleFetchError(w, r, fmt.Errorf("post-fetch cache read error: %w", cacheGetErr), "Internal Cache Read Failed", upstreamURL, requestCacheKey)
 		return
 	}
-	defer streamReader.Close()
+	defer cacheReader.Close()
 
-	w.Header().Set("Content-Type", finalContentType)
-	util.ApplyCacheHeaders(w.Header(), fetchResult.Header)
-	if !fetchResult.ModTime.IsZero() {
-		w.Header().Set("Last-Modified", fetchResult.ModTime.UTC().Format(http.TimeFormat))
-	}
-	isChunked := len(fetchResult.Header.Values("Transfer-Encoding")) > 0 && fetchResult.Header.Get("Transfer-Encoding") != "identity"
-	if fetchResult.Size >= 0 && !isChunked && fetchResult.StatusCode == http.StatusOK {
-		w.Header().Set("Content-Length", strconv.FormatInt(fetchResult.Size, 10))
-	} else if r.Method == http.MethodHead && fetchResult.Size < 0 {
-		w.Header().Del("Content-Length")
-	}
-
-	w.WriteHeader(fetchResult.StatusCode)
-
-	if r.Method != http.MethodHead {
-		bytesWritten, copyErr := io.Copy(w, streamReader)
-		if copyErr != nil && !isClientDisconnectedError(copyErr) {
-			logging.Warn("Error copying response body to client during initial fetch/cache", "error", copyErr, "key", requestCacheKey, "written_bytes", bytesWritten)
-		} else if copyErr == nil {
-			logging.Debug("Successfully streamed bytes to client during initial fetch/cache", "key", requestCacheKey, "written_bytes", bytesWritten)
-		}
-	}
+	h.serveDirectlyFromCache(w, r, cacheReader, cacheMeta, relativePath)
 }
 
 func (h *RepositoryHandler) attemptRevalidationAndServe(w http.ResponseWriter, r *http.Request, cacheMeta *cache.CacheMetadata, requestCacheKey, relativePath, upstreamURL string) (servedStale bool, err error) {
@@ -472,6 +430,7 @@ func (h *RepositoryHandler) attemptRevalidationAndServe(w http.ResponseWriter, r
 		return true, nil
 	}
 
+	defer newFetchResult.Body.Close()
 	logging.Info("Revalidation fetch successful: Upstream has newer content (2xx received)", "key", requestCacheKey, "url", upstreamURL)
 	w.Header().Set("X-Cache-Status", "UPDATED_FETCHED")
 
@@ -496,40 +455,29 @@ func (h *RepositoryHandler) attemptRevalidationAndServe(w http.ResponseWriter, r
 	updateMeta.Headers.Set("Content-Type", finalContentType)
 	util.SelectCacheControlHeaders(updateMeta.Headers, newFetchResult.Header)
 
-	streamReader, putErr := h.cacheManager.Put(r.Context(), requestCacheKey, newFetchResult.Body, updateMeta)
+	putErr := h.cacheManager.Put(r.Context(), requestCacheKey, newFetchResult.Body, updateMeta)
 
 	if putErr != nil {
 		h.cacheManager.RecordValidationError()
-		logging.ErrorE("Failed to initiate cache Put operation after revalidation", putErr, "key", requestCacheKey)
-		h.handleFetchError(w, r, fmt.Errorf("cache Put initiation failed: %w", putErr), "Cache Update Failed", upstreamURL, requestCacheKey)
+		logging.ErrorE("Failed to update cache after successful revalidation fetch", putErr, "key", requestCacheKey)
+		_ = h.cacheManager.Delete(context.Background(), requestCacheKey)
+
+		h.handleFetchError(w, r, fmt.Errorf("failed to update cache: %w", putErr), "Cache Update Failed", upstreamURL, requestCacheKey)
 		return false, putErr
 	}
 
-	defer streamReader.Close()
+	logging.Info("Cache updated successfully after revalidation, serving updated content", "key", requestCacheKey)
+	w.Header().Set("X-Cache-Status", "UPDATED_SERVED_CACHE")
 
-	w.Header().Set("Content-Type", finalContentType)
-	util.ApplyCacheHeaders(w.Header(), newFetchResult.Header)
-	if !newFetchResult.ModTime.IsZero() {
-		w.Header().Set("Last-Modified", newFetchResult.ModTime.UTC().Format(http.TimeFormat))
+	newCacheReader, newCacheMeta, getErr := h.cacheManager.Get(r.Context(), requestCacheKey)
+	if getErr != nil {
+		logging.ErrorE("CRITICAL: Failed to read from cache immediately after successful revalidation Put", getErr, "key", requestCacheKey)
+		h.handleFetchError(w, r, fmt.Errorf("post-revalidation cache read error: %w", getErr), "Internal Cache Read Failed", upstreamURL, requestCacheKey)
+		return false, getErr
 	}
-	isChunked := len(newFetchResult.Header.Values("Transfer-Encoding")) > 0 && newFetchResult.Header.Get("Transfer-Encoding") != "identity"
-	if updateMeta.Size >= 0 && !isChunked && newFetchResult.StatusCode == http.StatusOK {
-		w.Header().Set("Content-Length", strconv.FormatInt(updateMeta.Size, 10))
-	} else if r.Method == http.MethodHead && updateMeta.Size < 0 {
-		w.Header().Del("Content-Length")
-	}
+	defer newCacheReader.Close()
 
-	w.WriteHeader(newFetchResult.StatusCode)
-
-	if r.Method != http.MethodHead {
-		bytesWritten, copyErr := io.Copy(w, streamReader)
-		if copyErr != nil && !isClientDisconnectedError(copyErr) {
-			logging.Warn("Error copying updated response body to client", "error", copyErr, "key", requestCacheKey, "written_bytes", bytesWritten)
-		} else if copyErr == nil {
-			logging.Debug("Successfully streamed updated bytes to client", "key", requestCacheKey, "written_bytes", bytesWritten)
-		}
-	}
-
+	h.serveDirectlyFromCache(w, r, newCacheReader, newCacheMeta, relativePath)
 	return false, nil
 }
 
@@ -612,6 +560,11 @@ func (h *RepositoryHandler) handleFetchError(w http.ResponseWriter, r *http.Requ
 			http.Error(w, "Internal Server Error (Unexpected 304)", http.StatusInternalServerError)
 		}
 
+	case errors.Is(fetchErr, fetch.ErrCacheWriteFailed):
+		logging.ErrorE(contextMsg+": Failed to write to cache after fetch", fetchErr, logFields...)
+		if !headersSent {
+			http.Error(w, "Internal Server Error (Cache Write Failure)", http.StatusInternalServerError)
+		}
 	case errors.Is(fetchErr, context.Canceled), errors.Is(fetchErr, context.DeadlineExceeded):
 		logging.Warn(contextMsg+": Request context cancelled or deadline exceeded", logFields...)
 		select {

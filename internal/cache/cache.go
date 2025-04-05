@@ -39,7 +39,7 @@ type CacheMetadata struct {
 
 type CacheManager interface {
 	Get(ctx context.Context, key string) (content io.ReadCloser, metadata *CacheMetadata, err error)
-	Put(ctx context.Context, key string, upstreamReader io.Reader, metadata CacheMetadata) (streamReader io.ReadCloser, err error)
+	Put(ctx context.Context, key string, reader io.Reader, metadata CacheMetadata) error
 	Delete(ctx context.Context, key string) error
 	Stats() CacheStats
 	Close() error
@@ -453,213 +453,53 @@ func (c *DiskLRUCache) handleInconsistency(key, reason string, err error) {
 	c.deleteFilesAsync(key)
 }
 
-func (c *DiskLRUCache) Put(ctx context.Context, key string, upstreamReader io.Reader, metadata CacheMetadata) (streamReader io.ReadCloser, err error) {
+func (c *DiskLRUCache) Put(ctx context.Context, key string, reader io.Reader, metadata CacheMetadata) (err error) {
 	if !c.enabled {
-		_, _ = io.Copy(io.Discard, upstreamReader)
-		if rc, ok := upstreamReader.(io.ReadCloser); ok {
-			_ = rc.Close()
-		}
+		_, _ = io.Copy(io.Discard, reader)
 		logging.Warn("Cache is disabled, item not stored", "key", key)
-		return nil, errors.New("cache is disabled, item not stored")
+		return errors.New("cache is disabled, item not stored")
 	}
 	if initErr := c.waitInit(); initErr != nil {
-		_, _ = io.Copy(io.Discard, upstreamReader)
-		if rc, ok := upstreamReader.(io.ReadCloser); ok {
-			_ = rc.Close()
-		}
+		_, _ = io.Copy(io.Discard, reader)
 		logging.ErrorE("Cache initialization failed, cannot Put item", initErr, "key", key)
-		return nil, fmt.Errorf("cache initialization failed, cannot put item %s: %w", key, initErr)
+		return fmt.Errorf("cache initialization failed, cannot put item %s: %w", key, initErr)
 	}
 
 	dirPath, err := c.prepareCacheDirectories(key)
 	if err != nil {
-		_, _ = io.Copy(io.Discard, upstreamReader)
-		if rc, ok := upstreamReader.(io.ReadCloser); ok {
-			_ = rc.Close()
-		}
-		return nil, err
+		_, _ = io.Copy(io.Discard, reader)
+		return err
 	}
 
 	tempContentPath, tempMetaPath, cleanupTempFiles, err := c.createTemporaryFiles(key, dirPath)
 	if err != nil {
-		_, _ = io.Copy(io.Discard, upstreamReader)
-		if rc, ok := upstreamReader.(io.ReadCloser); ok {
-			_ = rc.Close()
-		}
-		return nil, err
+		_, _ = io.Copy(io.Discard, reader)
+		return err
 	}
+	defer cleanupTempFiles()
 
-	pipeReader, pipeWriter := io.Pipe()
-
-	estimatedSize := metadata.Size
-	if estimatedSize < 0 {
-		estimatedSize = 0
-		logging.Warn("Cache Put: Initial size unknown, using 0 for LRU update. Size will be updated upon completion.", "key", key)
-	}
-	oldElement, oldSize, err := c.updateLRUForPut(key, estimatedSize)
+	finalSize, err := c.writeToTemporaryFiles(reader, metadata, tempContentPath, tempMetaPath)
 	if err != nil {
-		_ = pipeWriter.CloseWithError(err)
-		cleanupTempFiles()
-		_, _ = io.Copy(io.Discard, upstreamReader)
-		if rc, ok := upstreamReader.(io.ReadCloser); ok {
-			_ = rc.Close()
-		}
-		return nil, fmt.Errorf("failed to update LRU state for key %s: %w", key, err)
+		return err
 	}
 
-	go c.performCacheWrite(key, upstreamReader, metadata, tempContentPath, tempMetaPath, pipeWriter, cleanupTempFiles, oldElement, oldSize, estimatedSize)
-
-	return pipeReader, nil
-}
-
-func (c *DiskLRUCache) performCacheWrite(
-	key string,
-	upstreamReader io.Reader,
-	metadata CacheMetadata,
-	tempContentPath, tempMetaPath string,
-	pipeWriter *io.PipeWriter,
-	cleanupTempFiles func(),
-	oldElement *list.Element,
-	oldSize, initialEstimatedSize int64,
-) {
-	var finalSize int64 = -1
-	var copyErr error
-	writeStartTime := time.Now()
-
-	if rc, ok := upstreamReader.(io.ReadCloser); ok {
-		defer rc.Close()
-	}
-	defer func() {
-		duration := time.Since(writeStartTime)
-		if copyErr != nil {
-			_ = pipeWriter.CloseWithError(copyErr)
-			logging.ErrorE("Cache write goroutine failed during copy", copyErr, "key", key, "duration", util.FormatDuration(duration))
-			cleanupTempFiles()
-			if initialEstimatedSize >= 0 {
-				c.rollbackLRUUpdate(key, oldElement, oldSize, initialEstimatedSize)
-			}
-		} else if finalSize == -1 {
-			finalErr := errors.New("cache write failed after copy")
-			_ = pipeWriter.CloseWithError(finalErr)
-			logging.ErrorE("Cache write goroutine failed after copy", finalErr, "key", key, "duration", util.FormatDuration(duration))
-			cleanupTempFiles()
-			if initialEstimatedSize >= 0 {
-				c.rollbackLRUUpdate(key, oldElement, oldSize, initialEstimatedSize)
-			}
-		} else {
-			_ = pipeWriter.Close()
-			logging.Debug("Cache write goroutine finished successfully", "key", key, "size", finalSize, "duration", util.FormatDuration(duration))
-		}
-	}()
-
-	logging.Debug("Cache write goroutine started", "key", key)
-
-	contentFile, err := os.OpenFile(tempContentPath, os.O_WRONLY|os.O_TRUNC, 0644)
+	oldElement, oldSize, err := c.updateLRUForPut(key, finalSize)
 	if err != nil {
-		copyErr = fmt.Errorf("failed to open temporary content file %s: %w", tempContentPath, err)
-		return
-	}
-	defer contentFile.Close()
-
-	teeReader := io.TeeReader(upstreamReader, pipeWriter)
-
-	finalSize, copyErr = io.Copy(contentFile, teeReader)
-	if copyErr != nil {
-		return
+		return fmt.Errorf("failed to update LRU state for key %s: %w", key, err)
 	}
 
-	if syncErr := contentFile.Sync(); syncErr != nil {
-		logging.Warn("Failed to sync temporary content file", "error", syncErr, "temp_path", tempContentPath)
-	}
-	if closeErr := contentFile.Close(); closeErr != nil {
-		logging.ErrorE("Failed to close temporary content file after writing", closeErr, "temp_path", tempContentPath, "key", key)
-	}
-
-	metadata.Version = MetadataVersion
-	if metadata.FetchTime.IsZero() {
-		metadata.FetchTime = time.Now().UTC()
-	}
-	if metadata.Size >= 0 && metadata.Size != finalSize {
-		copyErr = fmt.Errorf("cache write size mismatch for %s: expected %d, wrote %d", key, metadata.Size, finalSize)
-		return
-	}
-	metadata.Size = finalSize
-
-	if metadata.Headers == nil {
-		metadata.Headers = make(http.Header)
-	}
-	if metadata.Headers.Get("Content-Type") == "" {
-		logging.Warn("Content-Type was not set in metadata, setting to octet-stream", "key", key)
-		metadata.Headers.Set("Content-Type", "application/octet-stream")
-	}
-
-	metaFile, err := os.OpenFile(tempMetaPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	err = c.commitTemporaryFiles(key, tempContentPath, tempMetaPath)
 	if err != nil {
-		copyErr = fmt.Errorf("failed to open temporary metadata file %s: %w", tempMetaPath, err)
-		return
-	}
-	defer metaFile.Close()
-
-	encoder := json.NewEncoder(metaFile)
-	encoder.SetIndent("", "  ")
-	if encErr := encoder.Encode(&metadata); encErr != nil {
-		_ = metaFile.Close()
-		copyErr = fmt.Errorf("failed to encode metadata for key %s: %w", key, encErr)
-		return
-	}
-	if syncErr := metaFile.Sync(); syncErr != nil {
-		logging.Warn("Failed to sync temporary metadata file", "error", syncErr, "temp_path", tempMetaPath)
-	}
-	if closeErr := metaFile.Close(); closeErr != nil {
-		logging.ErrorE("Failed to close temporary metadata file after writing", closeErr, "temp_path", tempMetaPath, "key", key)
+		c.rollbackLRUUpdate(key, oldElement, oldSize, finalSize)
+		return err
 	}
 
-	commitErr := c.commitTemporaryFiles(key, tempContentPath, tempMetaPath)
-	if commitErr != nil {
-		copyErr = fmt.Errorf("failed to commit cache files for key %s: %w", key, commitErr)
-		if initialEstimatedSize >= 0 {
-			c.rollbackLRUUpdate(key, oldElement, oldSize, initialEstimatedSize)
-			c.mu.Lock()
-			if entry, exists := c.items[key]; exists && entry.size == initialEstimatedSize {
-				logging.Warn("LRU state might be inconsistent after commit failure + rollback.", "key", key)
-			} else if oldElement != nil {
-				// ok
-			} else {
-				if _, exists := c.items[key]; exists {
-					logging.Error("Item exists after failed commit + rollback of new item?", "key", key)
-				}
-			}
-			c.mu.Unlock()
+	tempContentPath = ""
+	tempMetaPath = ""
 
-		}
-		return
-	}
-
-	if initialEstimatedSize == 0 && finalSize > 0 {
-		c.mu.Lock()
-		if entry, exists := c.items[key]; exists && entry.size == 0 {
-			logging.Debug("Updating LRU entry size after successful write", "key", key, "old_size", entry.size, "new_size", finalSize)
-			c.currentSize += finalSize
-			entry.size = finalSize
-		} else if exists {
-			logging.Warn("LRU entry size mismatch or unexpected state during final size update.", "key", key, "entry_size", entry.size, "final_size", finalSize)
-		} else {
-			logging.Warn("LRU entry missing during final size update.", "key", key)
-		}
-		spaceToFree := c.currentSize - c.maxSizeBytes
-		if spaceToFree > 0 {
-			c.evictLocked(spaceToFree)
-		}
-		c.mu.Unlock()
-	}
-
-	copyErr = nil
-	if finalSize < 0 {
-		finalSize = 0
-	}
-
+	logging.Debug("Cache put successful", "key", key, "size", finalSize)
 	c.PutValidation(key, time.Now())
-	logging.Debug("Cache write goroutine: Commit successful", "key", key, "size", finalSize)
+	return nil
 }
 
 func (c *DiskLRUCache) prepareCacheDirectories(key string) (string, error) {
@@ -731,6 +571,71 @@ func (c *DiskLRUCache) createTemporaryFiles(key, dirPath string) (tempContentPat
 	}
 
 	return tempContentPath, tempMetaPath, cleanup, nil
+}
+
+func (c *DiskLRUCache) writeToTemporaryFiles(reader io.Reader, metadata CacheMetadata, tempContentPath, tempMetaPath string) (finalSize int64, err error) {
+	contentFile, err := os.OpenFile(tempContentPath, os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		logging.ErrorE("Failed to open temporary content file for writing", err, "temp_path", tempContentPath, "key", metadata.Key)
+		return -1, fmt.Errorf("failed to open temporary content file %s: %w", tempContentPath, err)
+	}
+
+	writtenSize, err := io.Copy(contentFile, reader)
+	if err != nil {
+		_ = contentFile.Close()
+		logging.ErrorE("Failed to write to temporary content file", err, "temp_path", tempContentPath, "key", metadata.Key)
+		return -1, fmt.Errorf("failed to write content for key %s: %w", metadata.Key, err)
+	}
+	if syncErr := contentFile.Sync(); syncErr != nil {
+		logging.Warn("Failed to sync temporary content file", "error", syncErr, "temp_path", tempContentPath)
+	}
+	if closeErr := contentFile.Close(); closeErr != nil {
+		logging.ErrorE("Failed to close temporary content file after writing", closeErr, "temp_path", tempContentPath, "key", metadata.Key)
+	}
+
+	metadata.Version = MetadataVersion
+	if metadata.FetchTime.IsZero() {
+		metadata.FetchTime = time.Now().UTC()
+	}
+	if metadata.Size >= 0 {
+		if writtenSize != metadata.Size {
+			logging.Error("Cache write size mismatch", "key", metadata.Key, "expected_size", metadata.Size, "written_size", writtenSize)
+			return -1, fmt.Errorf("cache write size mismatch for %s: expected %d, wrote %d", metadata.Key, metadata.Size, writtenSize)
+		}
+	} else {
+		metadata.Size = writtenSize
+	}
+	finalSize = metadata.Size
+
+	if metadata.Headers == nil {
+		metadata.Headers = make(http.Header)
+	}
+	if metadata.Headers.Get("Content-Type") == "" {
+		logging.Warn("Content-Type was not set in metadata provided to Put, setting to octet-stream", "key", metadata.Key)
+		metadata.Headers.Set("Content-Type", "application/octet-stream")
+	}
+
+	metaFile, err := os.OpenFile(tempMetaPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		logging.ErrorE("Failed to open temporary metadata file for writing", err, "temp_path", tempMetaPath, "key", metadata.Key)
+		return -1, fmt.Errorf("failed to open temporary metadata file %s: %w", tempMetaPath, err)
+	}
+
+	encoder := json.NewEncoder(metaFile)
+	encoder.SetIndent("", "  ")
+	if encErr := encoder.Encode(&metadata); encErr != nil {
+		_ = metaFile.Close()
+		logging.ErrorE("Failed to encode metadata to temporary file", encErr, "temp_path", tempMetaPath, "key", metadata.Key)
+		return -1, fmt.Errorf("failed to encode metadata for key %s: %w", metadata.Key, encErr)
+	}
+	if syncErr := metaFile.Sync(); syncErr != nil {
+		logging.Warn("Failed to sync temporary metadata file", "error", syncErr, "temp_path", tempMetaPath)
+	}
+	if closeErr := metaFile.Close(); closeErr != nil {
+		logging.ErrorE("Failed to close temporary metadata file after writing", closeErr, "temp_path", tempMetaPath, "key", metadata.Key)
+	}
+
+	return finalSize, nil
 }
 
 func (c *DiskLRUCache) updateLRUForPut(key string, finalSize int64) (oldElement *list.Element, oldSize int64, err error) {
