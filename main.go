@@ -7,23 +7,18 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
-	"github.com/yolkispalkis/go-apt-cache/internal/fetch"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/server"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
-
-const pprofServerAddr = "localhost:6060"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -48,7 +43,6 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 	cacheDir := flags.String("cache-dir", "", "Override cache.directory")
 	cacheSize := flags.String("cache-size", "", "Override cache.maxSize (e.g., 1GB)")
 	logLevel := flags.String("log-level", "", "Override logging.level (debug, info, warn, error)")
-	enablePprof := flags.Bool("enable-pprof", false, "Enable the pprof debugging server on "+pprofServerAddr)
 
 	flags.Usage = func() {
 		fmt.Fprintf(flags.Output(), "Usage of %s:\n", args[0])
@@ -104,25 +98,6 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 
 	logging.Info("Configuration loaded and validated successfully", "config_file", *configFile)
 
-	var pprofServer *http.Server
-	if *enablePprof {
-		pprofServer = &http.Server{
-			Addr:              pprofServerAddr,
-			Handler:           http.DefaultServeMux,
-			ReadHeaderTimeout: 3 * time.Second,
-		}
-		go func() {
-			logging.Info("Starting pprof debug server", "address", pprofServerAddr)
-			if err := pprofServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logging.ErrorE("pprof debug server failed", err, "address", pprofServerAddr)
-			} else {
-				logging.Info("pprof debug server stopped", "address", pprofServerAddr)
-			}
-		}()
-	} else {
-		logging.Info("pprof debug server is disabled.")
-	}
-
 	logging.Info("Initializing cache...")
 	cacheManager, err := cache.NewDiskLRUCache(cfg.Cache)
 	if err != nil {
@@ -149,10 +124,7 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 		"init_error", stats.InitError,
 	)
 
-	fetcher := fetch.NewCoordinator(cfg.Server.RequestTimeout.Duration(), cfg.Server.MaxConcurrentFetches)
-	logging.Info("Fetch coordinator initialized", "max_concurrent", cfg.Server.MaxConcurrentFetches, "timeout", cfg.Server.RequestTimeout.Duration())
-
-	srv, err := server.New(cfg, cacheManager, fetcher)
+	srv, err := server.New(cfg, cacheManager)
 	if err != nil {
 		logging.ErrorE("Failed to create server", err)
 		return fmt.Errorf("failed to create server: %w", err)
@@ -268,18 +240,6 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 		logging.Info("Main server shutdown complete.")
 	}
 
-	if pprofServer != nil {
-		logging.Info("Shutting down pprof server...")
-		pprofShutdownCtx, pprofCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer pprofCancel()
-		if pprofErr := pprofServer.Shutdown(pprofShutdownCtx); pprofErr != nil {
-			logging.ErrorE("pprof server shutdown failed", pprofErr)
-			shutdownErr = errors.Join(shutdownErr, pprofErr)
-		} else {
-			logging.Info("pprof server shutdown complete.")
-		}
-	}
-
 	if cfg.Server.UnixSocketPath != "" {
 		socketPath := util.CleanPath(cfg.Server.UnixSocketPath)
 		logging.Debug("Attempting removal of unix socket file post-shutdown", "path", socketPath)
@@ -293,8 +253,10 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 		finalErr = errors.Join(finalErr, fmt.Errorf("shutdown error: %w", shutdownErr))
 	}
 
-	if finalErr != nil && !errors.Is(listenErr, context.Canceled) {
-		return finalErr
+	if finalErr != nil {
+		if !(errors.Is(finalErr, context.Canceled) && shutdownErr == nil) {
+			return finalErr
+		}
 	}
 
 	return nil

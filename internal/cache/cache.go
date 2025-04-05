@@ -39,7 +39,7 @@ type CacheMetadata struct {
 
 type CacheManager interface {
 	Get(ctx context.Context, key string) (content io.ReadCloser, metadata *CacheMetadata, err error)
-	Put(ctx context.Context, key string, reader io.Reader, metadata CacheMetadata) error
+	Put(ctx context.Context, key string, upstreamReader io.Reader, metadata CacheMetadata) (streamReader io.ReadCloser, err error)
 	Delete(ctx context.Context, key string) error
 	Stats() CacheStats
 	Close() error
@@ -188,9 +188,7 @@ func (c *DiskLRUCache) initialize() {
 	if c.cleanOnStart {
 		if err := c.cleanCacheDirectory(); err != nil {
 			c.initErr = err
-			return
 		}
-
 		return
 	}
 
@@ -201,22 +199,12 @@ func (c *DiskLRUCache) initialize() {
 	discoveredEntries := []*cacheEntry{}
 
 	walkErr := filepath.Walk(c.baseDir, func(path string, info os.FileInfo, walkErrIn error) error {
-		if walkErrIn != nil {
-			logging.Warn("Error accessing path during cache scan", "error", walkErrIn, "path", path)
-			if info != nil && info.IsDir() {
+		entry, err := c.processScannedFile(path, info, walkErrIn)
+		if err != nil {
+			logging.Warn("Error processing file during cache scan, skipping", "error", err, "path", path)
+			if info != nil && info.IsDir() && errors.Is(err, filepath.SkipDir) {
 				return filepath.SkipDir
 			}
-			return nil
-		}
-
-		if path == c.baseDir || info.IsDir() || !strings.HasSuffix(path, ContentSuffix) || strings.HasSuffix(path, ".tmp") {
-			return nil
-		}
-
-		atomic.AddInt64(&scannedFiles, 1)
-		entry, err := c.processScannedFile(path, info)
-		if err != nil {
-
 			return nil
 		}
 
@@ -225,6 +213,7 @@ func (c *DiskLRUCache) initialize() {
 			atomic.AddInt64(&loadedItems, 1)
 			atomic.AddInt64(&totalDiscoveredSize, entry.size)
 		}
+		atomic.AddInt64(&scannedFiles, 1)
 		return nil
 	})
 
@@ -241,7 +230,8 @@ func (c *DiskLRUCache) initialize() {
 		"loaded_items", loadedItems,
 		"total_discovered_size", util.FormatSize(totalDiscoveredSize),
 		"current_cache_size", util.FormatSize(c.currentSize),
-		"current_cache_size_bytes", c.currentSize)
+		"current_cache_size_bytes", c.currentSize,
+		"max_cache_size_bytes", c.maxSizeBytes)
 
 	c.mu.Lock()
 	c.evictLocked(0)
@@ -255,12 +245,12 @@ func (c *DiskLRUCache) cleanCacheDirectory() error {
 		logging.ErrorE("Cache clean failed: cannot read directory", err, "directory", c.baseDir)
 		return fmt.Errorf("failed to read cache directory for cleaning %s: %w", c.baseDir, err)
 	}
+
 	cleanedCount := 0
 	for _, entry := range dirEntries {
 		path := filepath.Join(c.baseDir, entry.Name())
 		logging.Debug("Removing cache item during clean", "path", path)
 		if err := os.RemoveAll(path); err != nil {
-
 			logging.Warn("Failed to remove item during cache clean", "error", err, "path", path)
 		} else {
 			cleanedCount++
@@ -277,34 +267,37 @@ func (c *DiskLRUCache) cleanCacheDirectory() error {
 	return nil
 }
 
-func (c *DiskLRUCache) processScannedFile(contentPath string, contentInfo os.FileInfo) (*cacheEntry, error) {
+func (c *DiskLRUCache) processScannedFile(path string, info os.FileInfo, errIn error) (*cacheEntry, error) {
+	if errIn != nil {
+		return nil, errIn
+	}
+
+	if info.IsDir() || path == c.baseDir || !strings.HasSuffix(path, ContentSuffix) || strings.HasSuffix(path, ".tmp") {
+		return nil, nil
+	}
+
+	contentPath := path
 	basePath := strings.TrimSuffix(contentPath, ContentSuffix)
 	metaPath := basePath + MetadataSuffix
+
 	relBasePath, relErr := filepath.Rel(c.baseDir, basePath)
 	if relErr != nil {
-		logging.Warn("Failed to get relative base path during scan, skipping item", "error", relErr, "basePath", basePath, "fullPath", contentPath)
-		return nil, relErr
+		return nil, fmt.Errorf("failed to get relative path for %s: %w", contentPath, relErr)
 	}
 	cacheKey := filepath.ToSlash(relBasePath)
 
 	if cacheKey == "" || cacheKey == "." {
-		logging.Warn("Generated invalid cache key during scan, skipping item.", "path", contentPath, "relative_base", relBasePath)
-		return nil, fmt.Errorf("invalid cache key generated: %s", cacheKey)
+		return nil, fmt.Errorf("invalid cache key generated from path %s", contentPath)
 	}
 
-	realFileSize := contentInfo.Size()
-	entrySize := int64(-1)
-
+	realFileSize := info.Size()
 	metaFile, metaErr := os.Open(metaPath)
+
 	if metaErr != nil {
 		if os.IsNotExist(metaErr) {
-			logging.Warn("Cache inconsistency detected: content file exists without metadata. Removing content.",
-				"key", cacheKey, "content_path", contentPath, "meta_path", metaPath)
-			c.statsInconsistencyContentWithoutMeta.Add(1)
-			_ = os.Remove(contentPath)
+			c.handleInconsistency(cacheKey, "content_without_meta", fmt.Errorf("metadata file %s missing for content %s", metaPath, contentPath))
 		} else {
-			logging.Warn("Error opening metadata file during scan, cannot validate. Skipping item.",
-				"error", metaErr, "meta_path", metaPath, "key", cacheKey, "content_path", contentPath)
+			logging.Warn("Error opening metadata file during scan, skipping item.", "error", metaErr, "meta_path", metaPath)
 		}
 		return nil, metaErr
 	}
@@ -314,27 +307,18 @@ func (c *DiskLRUCache) processScannedFile(contentPath string, contentInfo os.Fil
 	decoder := json.NewDecoder(metaFile)
 	decodeErr := decoder.Decode(&meta)
 	if decodeErr != nil {
-		logging.Warn("Cache inconsistency detected: failed to decode metadata file. Removing entry.",
-			"error", decodeErr, "meta_path", metaPath, "key", cacheKey, "content_path", contentPath)
-		c.statsInconsistencyCorruptMetadata.Add(1)
-		_ = os.Remove(contentPath)
-		_ = os.Remove(metaPath)
+		c.handleInconsistency(cacheKey, "corrupt_metadata", fmt.Errorf("failed to decode %s: %w", metaPath, decodeErr))
 		return nil, decodeErr
 	}
 
+	entrySize := realFileSize
 	if meta.Size >= 0 {
 		if meta.Size != realFileSize {
-			logging.Warn("Cache inconsistency detected: metadata size mismatch. Removing entry.",
-				"key", cacheKey, "meta_size", meta.Size, "file_size", realFileSize, "content_path", contentPath, "meta_path", metaPath)
-			c.statsInconsistencySizeMismatch.Add(1)
-			_ = os.Remove(contentPath)
-			_ = os.Remove(metaPath)
-			return nil, fmt.Errorf("size mismatch: meta=%d, file=%d", meta.Size, realFileSize)
+			c.handleInconsistency(cacheKey, "size_mismatch", fmt.Errorf("meta size %d != file size %d for %s", meta.Size, realFileSize, contentPath))
+			return nil, fmt.Errorf("size mismatch")
 		}
 		entrySize = meta.Size
 	} else {
-
-		entrySize = realFileSize
 		logging.Debug("Metadata size was -1, using actual file size from scan", "key", cacheKey, "size", entrySize)
 	}
 
@@ -359,7 +343,6 @@ func (c *DiskLRUCache) rebuildLRUState(discoveredEntries []*cacheEntry) {
 			c.items[entry.key] = entry
 			c.currentSize += entry.size
 		} else {
-
 			logging.Warn("Duplicate cache key detected during LRU reconstruction, skipping.", "key", entry.key)
 		}
 	}
@@ -379,6 +362,7 @@ func (c *DiskLRUCache) Get(ctx context.Context, key string) (io.ReadCloser, *Cac
 	if !c.enabled {
 		return nil, nil, os.ErrNotExist
 	}
+
 	if err := c.waitInit(); err != nil {
 		logging.ErrorE("Cache initialization failed, cannot Get item", err, "key", key)
 		return nil, nil, fmt.Errorf("cache initialization failed: %w", err)
@@ -391,136 +375,291 @@ func (c *DiskLRUCache) Get(ctx context.Context, key string) (io.ReadCloser, *Cac
 		logging.Debug("Cache miss [GET]: key not found in memory map.", "key", key)
 		return nil, nil, os.ErrNotExist
 	}
-
 	c.lruList.MoveToFront(entry.element)
 	c.mu.Unlock()
 
-	filePath := c.getContentFilePath(key)
+	contentPath := c.getContentFilePath(key)
 	metaPath := c.getMetaFilePath(key)
-	logging.Debug("Cache hit [GET]: checking files", "key", key, "content_file", filePath, "meta_file", metaPath)
+	logging.Debug("Cache hit [GET]: checking files", "key", key, "content_file", contentPath, "meta_file", metaPath)
 
 	metaFile, err := os.Open(metaPath)
 	if err != nil {
-
-		c.handleInconsistencyDuringGet(key, "metadata file not found", err)
+		c.handleInconsistency(key, "meta_without_content", fmt.Errorf("metadata file %s not found or failed to open: %w", metaPath, err))
 		return nil, nil, os.ErrNotExist
 	}
 
 	var metadata CacheMetadata
 	decoder := json.NewDecoder(metaFile)
 	decodeErr := decoder.Decode(&metadata)
-	metaFile.Close()
+	_ = metaFile.Close()
 
 	if decodeErr != nil {
-		c.handleInconsistencyDuringGet(key, "failed to decode metadata file", decodeErr)
+		c.handleInconsistency(key, "corrupt_metadata", fmt.Errorf("failed to decode metadata file %s: %w", metaPath, decodeErr))
 		return nil, nil, os.ErrNotExist
 	}
 
-	contentFile, err := os.Open(filePath)
+	contentFile, err := os.Open(contentPath)
 	if err != nil {
-		c.handleInconsistencyDuringGet(key, "content file not found or failed to open", err)
+		c.handleInconsistency(key, "content_without_meta", fmt.Errorf("content file %s not found or failed to open: %w", contentPath, err))
 		return nil, nil, os.ErrNotExist
 	}
 
 	contentInfo, statErr := contentFile.Stat()
 	if statErr != nil {
 		_ = contentFile.Close()
-		c.handleInconsistencyDuringGet(key, "failed to stat content file", statErr)
+		c.handleInconsistency(key, "stat_error", fmt.Errorf("failed to stat content file %s: %w", contentPath, statErr))
 		return nil, nil, os.ErrNotExist
 	}
 
 	if metadata.Size >= 0 && contentInfo.Size() != metadata.Size {
 		_ = contentFile.Close()
-		c.handleInconsistencyDuringGet(key, "file size mismatch",
-			fmt.Errorf("meta=%d, actual=%d", metadata.Size, contentInfo.Size()))
+		c.handleInconsistency(key, "size_mismatch", fmt.Errorf("metadata size %d != file size %d for %s", metadata.Size, contentInfo.Size(), contentPath))
 		return nil, nil, os.ErrNotExist
 	} else if metadata.Size < 0 {
-
 		metadata.Size = contentInfo.Size()
 		logging.Debug("Updated metadata size based on file size during Get", "key", key, "new_size", metadata.Size)
 	}
 
 	logging.Debug("Cache hit, returning content", "key", key, "size", metadata.Size)
 	metadata.Key = key
-	metadata.FilePath = filePath
+	metadata.FilePath = contentPath
 	metadata.MetaPath = metaPath
 
 	return contentFile, &metadata, nil
 }
 
-func (c *DiskLRUCache) handleInconsistencyDuringGet(key, reason string, err error) {
+func (c *DiskLRUCache) handleInconsistency(key, reason string, err error) {
 	logReason := reason
 	if err != nil {
 		logReason = fmt.Sprintf("%s: %v", reason, err)
 	}
-	logging.Warn("Cache inconsistency detected during Get. Removing entry.", "key", key, "reason", logReason)
+	logging.Warn("Cache inconsistency detected. Removing entry.", "key", key, "reason", logReason)
 
-	if strings.Contains(reason, "metadata file not found") {
-		c.statsInconsistencyContentWithoutMeta.Add(1)
-	} else if strings.Contains(reason, "decode metadata") {
-		c.statsInconsistencyCorruptMetadata.Add(1)
-	} else if strings.Contains(reason, "content file not found") {
+	switch reason {
+	case "meta_without_content":
 		c.statsInconsistencyMetaWithoutContent.Add(1)
-	} else if strings.Contains(reason, "size mismatch") {
+	case "content_without_meta":
+		c.statsInconsistencyContentWithoutMeta.Add(1)
+	case "size_mismatch":
 		c.statsInconsistencySizeMismatch.Add(1)
+	case "corrupt_metadata":
+		c.statsInconsistencyCorruptMetadata.Add(1)
 	}
 
 	c.mu.Lock()
 	c.deleteInternalLocked(key)
 	c.mu.Unlock()
-	go c.deleteFilesAsync(key)
+
+	c.deleteFilesAsync(key)
 }
 
-func (c *DiskLRUCache) Put(ctx context.Context, key string, reader io.Reader, metadata CacheMetadata) (err error) {
+func (c *DiskLRUCache) Put(ctx context.Context, key string, upstreamReader io.Reader, metadata CacheMetadata) (streamReader io.ReadCloser, err error) {
 	if !c.enabled {
-		_, _ = io.Copy(io.Discard, reader)
+		_, _ = io.Copy(io.Discard, upstreamReader)
+		if rc, ok := upstreamReader.(io.ReadCloser); ok {
+			_ = rc.Close()
+		}
 		logging.Warn("Cache is disabled, item not stored", "key", key)
-		return errors.New("cache is disabled, item not stored")
+		return nil, errors.New("cache is disabled, item not stored")
 	}
 	if initErr := c.waitInit(); initErr != nil {
-		_, _ = io.Copy(io.Discard, reader)
+		_, _ = io.Copy(io.Discard, upstreamReader)
+		if rc, ok := upstreamReader.(io.ReadCloser); ok {
+			_ = rc.Close()
+		}
 		logging.ErrorE("Cache initialization failed, cannot Put item", initErr, "key", key)
-		return fmt.Errorf("cache initialization failed, cannot put item %s: %w", key, initErr)
+		return nil, fmt.Errorf("cache initialization failed, cannot put item %s: %w", key, initErr)
 	}
 
 	dirPath, err := c.prepareCacheDirectories(key)
 	if err != nil {
-		_, _ = io.Copy(io.Discard, reader)
-		return err
+		_, _ = io.Copy(io.Discard, upstreamReader)
+		if rc, ok := upstreamReader.(io.ReadCloser); ok {
+			_ = rc.Close()
+		}
+		return nil, err
 	}
 
 	tempContentPath, tempMetaPath, cleanupTempFiles, err := c.createTemporaryFiles(key, dirPath)
 	if err != nil {
-		_, _ = io.Copy(io.Discard, reader)
-		return err
+		_, _ = io.Copy(io.Discard, upstreamReader)
+		if rc, ok := upstreamReader.(io.ReadCloser); ok {
+			_ = rc.Close()
+		}
+		return nil, err
 	}
-	defer cleanupTempFiles()
 
-	finalSize, err := c.writeToTemporaryFiles(reader, metadata, tempContentPath, tempMetaPath)
+	pipeReader, pipeWriter := io.Pipe()
+
+	estimatedSize := metadata.Size
+	if estimatedSize < 0 {
+		estimatedSize = 0
+		logging.Warn("Cache Put: Initial size unknown, using 0 for LRU update. Size will be updated upon completion.", "key", key)
+	}
+	oldElement, oldSize, err := c.updateLRUForPut(key, estimatedSize)
 	if err != nil {
-
-		return err
+		_ = pipeWriter.CloseWithError(err)
+		cleanupTempFiles()
+		_, _ = io.Copy(io.Discard, upstreamReader)
+		if rc, ok := upstreamReader.(io.ReadCloser); ok {
+			_ = rc.Close()
+		}
+		return nil, fmt.Errorf("failed to update LRU state for key %s: %w", key, err)
 	}
 
-	element, oldSize, err := c.updateLRUForPut(key, finalSize)
+	go c.performCacheWrite(key, upstreamReader, metadata, tempContentPath, tempMetaPath, pipeWriter, cleanupTempFiles, oldElement, oldSize, estimatedSize)
+
+	return pipeReader, nil
+}
+
+func (c *DiskLRUCache) performCacheWrite(
+	key string,
+	upstreamReader io.Reader,
+	metadata CacheMetadata,
+	tempContentPath, tempMetaPath string,
+	pipeWriter *io.PipeWriter,
+	cleanupTempFiles func(),
+	oldElement *list.Element,
+	oldSize, initialEstimatedSize int64,
+) {
+	var finalSize int64 = -1
+	var copyErr error
+	writeStartTime := time.Now()
+
+	if rc, ok := upstreamReader.(io.ReadCloser); ok {
+		defer rc.Close()
+	}
+	defer func() {
+		duration := time.Since(writeStartTime)
+		if copyErr != nil {
+			_ = pipeWriter.CloseWithError(copyErr)
+			logging.ErrorE("Cache write goroutine failed during copy", copyErr, "key", key, "duration", util.FormatDuration(duration))
+			cleanupTempFiles()
+			if initialEstimatedSize >= 0 {
+				c.rollbackLRUUpdate(key, oldElement, oldSize, initialEstimatedSize)
+			}
+		} else if finalSize == -1 {
+			finalErr := errors.New("cache write failed after copy")
+			_ = pipeWriter.CloseWithError(finalErr)
+			logging.ErrorE("Cache write goroutine failed after copy", finalErr, "key", key, "duration", util.FormatDuration(duration))
+			cleanupTempFiles()
+			if initialEstimatedSize >= 0 {
+				c.rollbackLRUUpdate(key, oldElement, oldSize, initialEstimatedSize)
+			}
+		} else {
+			_ = pipeWriter.Close()
+			logging.Debug("Cache write goroutine finished successfully", "key", key, "size", finalSize, "duration", util.FormatDuration(duration))
+		}
+	}()
+
+	logging.Debug("Cache write goroutine started", "key", key)
+
+	contentFile, err := os.OpenFile(tempContentPath, os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
+		copyErr = fmt.Errorf("failed to open temporary content file %s: %w", tempContentPath, err)
+		return
+	}
+	defer contentFile.Close()
 
-		return fmt.Errorf("failed to update LRU state for key %s: %w", key, err)
+	teeReader := io.TeeReader(upstreamReader, pipeWriter)
+
+	finalSize, copyErr = io.Copy(contentFile, teeReader)
+	if copyErr != nil {
+		return
 	}
 
-	err = c.commitTemporaryFiles(key, tempContentPath, tempMetaPath)
+	if syncErr := contentFile.Sync(); syncErr != nil {
+		logging.Warn("Failed to sync temporary content file", "error", syncErr, "temp_path", tempContentPath)
+	}
+	if closeErr := contentFile.Close(); closeErr != nil {
+		logging.ErrorE("Failed to close temporary content file after writing", closeErr, "temp_path", tempContentPath, "key", key)
+	}
+
+	metadata.Version = MetadataVersion
+	if metadata.FetchTime.IsZero() {
+		metadata.FetchTime = time.Now().UTC()
+	}
+	if metadata.Size >= 0 && metadata.Size != finalSize {
+		copyErr = fmt.Errorf("cache write size mismatch for %s: expected %d, wrote %d", key, metadata.Size, finalSize)
+		return
+	}
+	metadata.Size = finalSize
+
+	if metadata.Headers == nil {
+		metadata.Headers = make(http.Header)
+	}
+	if metadata.Headers.Get("Content-Type") == "" {
+		logging.Warn("Content-Type was not set in metadata, setting to octet-stream", "key", key)
+		metadata.Headers.Set("Content-Type", "application/octet-stream")
+	}
+
+	metaFile, err := os.OpenFile(tempMetaPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
+		copyErr = fmt.Errorf("failed to open temporary metadata file %s: %w", tempMetaPath, err)
+		return
+	}
+	defer metaFile.Close()
 
-		c.rollbackLRUUpdate(key, element, oldSize, finalSize)
-
-		return err
+	encoder := json.NewEncoder(metaFile)
+	encoder.SetIndent("", "  ")
+	if encErr := encoder.Encode(&metadata); encErr != nil {
+		_ = metaFile.Close()
+		copyErr = fmt.Errorf("failed to encode metadata for key %s: %w", key, encErr)
+		return
+	}
+	if syncErr := metaFile.Sync(); syncErr != nil {
+		logging.Warn("Failed to sync temporary metadata file", "error", syncErr, "temp_path", tempMetaPath)
+	}
+	if closeErr := metaFile.Close(); closeErr != nil {
+		logging.ErrorE("Failed to close temporary metadata file after writing", closeErr, "temp_path", tempMetaPath, "key", key)
 	}
 
-	tempContentPath = ""
-	tempMetaPath = ""
+	commitErr := c.commitTemporaryFiles(key, tempContentPath, tempMetaPath)
+	if commitErr != nil {
+		copyErr = fmt.Errorf("failed to commit cache files for key %s: %w", key, commitErr)
+		if initialEstimatedSize >= 0 {
+			c.rollbackLRUUpdate(key, oldElement, oldSize, initialEstimatedSize)
+			c.mu.Lock()
+			if entry, exists := c.items[key]; exists && entry.size == initialEstimatedSize {
+				logging.Warn("LRU state might be inconsistent after commit failure + rollback.", "key", key)
+			} else if oldElement != nil {
+				// ok
+			} else {
+				if _, exists := c.items[key]; exists {
+					logging.Error("Item exists after failed commit + rollback of new item?", "key", key)
+				}
+			}
+			c.mu.Unlock()
 
-	logging.Debug("Cache put successful", "key", key, "size", finalSize)
-	return nil
+		}
+		return
+	}
+
+	if initialEstimatedSize == 0 && finalSize > 0 {
+		c.mu.Lock()
+		if entry, exists := c.items[key]; exists && entry.size == 0 {
+			logging.Debug("Updating LRU entry size after successful write", "key", key, "old_size", entry.size, "new_size", finalSize)
+			c.currentSize += finalSize
+			entry.size = finalSize
+		} else if exists {
+			logging.Warn("LRU entry size mismatch or unexpected state during final size update.", "key", key, "entry_size", entry.size, "final_size", finalSize)
+		} else {
+			logging.Warn("LRU entry missing during final size update.", "key", key)
+		}
+		spaceToFree := c.currentSize - c.maxSizeBytes
+		if spaceToFree > 0 {
+			c.evictLocked(spaceToFree)
+		}
+		c.mu.Unlock()
+	}
+
+	copyErr = nil
+	if finalSize < 0 {
+		finalSize = 0
+	}
+
+	c.PutValidation(key, time.Now())
+	logging.Debug("Cache write goroutine: Commit successful", "key", key, "size", finalSize)
 }
 
 func (c *DiskLRUCache) prepareCacheDirectories(key string) (string, error) {
@@ -530,14 +669,12 @@ func (c *DiskLRUCache) prepareCacheDirectories(key string) (string, error) {
 	dirInfo, dirStatErr := os.Stat(dirPath)
 	if dirStatErr != nil {
 		if errors.Is(dirStatErr, os.ErrNotExist) {
-
 			if mkdirErr := os.MkdirAll(dirPath, 0755); mkdirErr != nil {
 				logging.ErrorE("Failed to create directory for cache item", mkdirErr, "directory", dirPath, "key", key)
 				return "", fmt.Errorf("failed to create directory %s for cache item %s: %w", dirPath, key, mkdirErr)
 			}
 			return dirPath, nil
 		}
-
 		logging.ErrorE("Failed to stat directory for cache item", dirStatErr, "directory", dirPath, "key", key)
 		return "", fmt.Errorf("failed to stat directory %s for cache item %s: %w", dirPath, key, dirStatErr)
 	}
@@ -550,33 +687,35 @@ func (c *DiskLRUCache) prepareCacheDirectories(key string) (string, error) {
 	return dirPath, nil
 }
 
-func (c *DiskLRUCache) createTemporaryFiles(key, dirPath string) (string, string, func(), error) {
+func (c *DiskLRUCache) createTemporaryFiles(key, dirPath string) (tempContentPath, tempMetaPath string, cleanup func(), err error) {
 	var tempContentFile, tempMetaFile *os.File
-	var tempContentPath, tempMetaPath string
-	var err error
-
 	baseFilename := filepath.Base(c.getBaseFilePath(key))
+	pattern := baseFilename + ".*.tmp"
 
-	tempContentFile, err = os.CreateTemp(dirPath, baseFilename+".*.cache.tmp")
+	tempContentFile, err = os.CreateTemp(dirPath, pattern+ContentSuffix)
 	if err != nil {
 		logging.ErrorE("Failed to create temporary content file", err, "directory", dirPath, "key", key)
-		return "", "", func() {}, fmt.Errorf("failed to create temporary content file for key %s: %w", key, err)
+		err = fmt.Errorf("failed to create temporary content file for key %s: %w", key, err)
+		cleanup = func() {}
+		return
 	}
 	tempContentPath = tempContentFile.Name()
 	_ = tempContentFile.Close()
 	logging.Debug("Created temporary content file", "path", tempContentPath)
 
-	tempMetaFile, err = os.CreateTemp(dirPath, baseFilename+".*.meta.tmp")
+	tempMetaFile, err = os.CreateTemp(dirPath, pattern+MetadataSuffix)
 	if err != nil {
 		_ = os.Remove(tempContentPath)
 		logging.ErrorE("Failed to create temporary metadata file", err, "directory", dirPath, "key", key)
-		return "", "", func() {}, fmt.Errorf("failed to create temporary metadata file for key %s: %w", key, err)
+		err = fmt.Errorf("failed to create temporary metadata file for key %s: %w", key, err)
+		cleanup = func() {}
+		return
 	}
 	tempMetaPath = tempMetaFile.Name()
 	_ = tempMetaFile.Close()
 	logging.Debug("Created temporary metadata file", "path", tempMetaPath)
 
-	cleanup := func() {
+	cleanup = func() {
 		if tempContentPath != "" {
 			logging.Debug("Cleaning up temporary content file", "path", tempContentPath)
 			if remErr := os.Remove(tempContentPath); remErr != nil && !errors.Is(remErr, os.ErrNotExist) {
@@ -594,74 +733,6 @@ func (c *DiskLRUCache) createTemporaryFiles(key, dirPath string) (string, string
 	return tempContentPath, tempMetaPath, cleanup, nil
 }
 
-func (c *DiskLRUCache) writeToTemporaryFiles(reader io.Reader, metadata CacheMetadata, tempContentPath, tempMetaPath string) (int64, error) {
-
-	contentFile, err := os.OpenFile(tempContentPath, os.O_WRONLY, 0644)
-	if err != nil {
-		logging.ErrorE("Failed to open temporary content file for writing", err, "temp_path", tempContentPath, "key", metadata.Key)
-		return -1, fmt.Errorf("failed to open temporary content file %s: %w", tempContentPath, err)
-	}
-
-	writtenSize, err := io.Copy(contentFile, reader)
-	if err != nil {
-		_ = contentFile.Close()
-		logging.ErrorE("Failed to write to temporary content file", err, "temp_path", tempContentPath, "key", metadata.Key)
-		return -1, fmt.Errorf("failed to write content for key %s: %w", metadata.Key, err)
-	}
-	if err = contentFile.Sync(); err != nil {
-
-		logging.Warn("Failed to sync temporary content file", "error", err, "temp_path", tempContentPath)
-	}
-	if err = contentFile.Close(); err != nil {
-		logging.ErrorE("Failed to close temporary content file after writing", err, "temp_path", tempContentPath, "key", metadata.Key)
-
-	}
-
-	metadata.Version = MetadataVersion
-	if metadata.FetchTime.IsZero() {
-		metadata.FetchTime = time.Now().UTC()
-	}
-	if metadata.Size >= 0 {
-		if writtenSize != metadata.Size {
-			logging.Error("Cache write size mismatch", "key", metadata.Key, "expected_size", metadata.Size, "written_size", writtenSize)
-			return -1, fmt.Errorf("cache write size mismatch for %s: expected %d, wrote %d", metadata.Key, metadata.Size, writtenSize)
-		}
-	} else {
-		metadata.Size = writtenSize
-	}
-
-	if metadata.Headers == nil {
-		metadata.Headers = make(http.Header)
-	}
-	if metadata.Headers.Get("Content-Type") == "" {
-		logging.Warn("Content-Type was not set in metadata provided to Put, setting to octet-stream", "key", metadata.Key)
-		metadata.Headers.Set("Content-Type", "application/octet-stream")
-	}
-
-	metaFile, err := os.OpenFile(tempMetaPath, os.O_WRONLY, 0644)
-	if err != nil {
-		logging.ErrorE("Failed to open temporary metadata file for writing", err, "temp_path", tempMetaPath, "key", metadata.Key)
-		return -1, fmt.Errorf("failed to open temporary metadata file %s: %w", tempMetaPath, err)
-	}
-
-	encoder := json.NewEncoder(metaFile)
-	encoder.SetIndent("", "  ")
-	if err = encoder.Encode(&metadata); err != nil {
-		_ = metaFile.Close()
-		logging.ErrorE("Failed to encode metadata to temporary file", err, "temp_path", tempMetaPath, "key", metadata.Key)
-		return -1, fmt.Errorf("failed to encode metadata for key %s: %w", metadata.Key, err)
-	}
-	if err = metaFile.Sync(); err != nil {
-		logging.Warn("Failed to sync temporary metadata file", "error", err, "temp_path", tempMetaPath)
-	}
-	if err = metaFile.Close(); err != nil {
-		logging.ErrorE("Failed to close temporary metadata file after writing", err, "temp_path", tempMetaPath, "key", metadata.Key)
-
-	}
-
-	return metadata.Size, nil
-}
-
 func (c *DiskLRUCache) updateLRUForPut(key string, finalSize int64) (oldElement *list.Element, oldSize int64, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -675,17 +746,15 @@ func (c *DiskLRUCache) updateLRUForPut(key string, finalSize int64) (oldElement 
 		c.currentSize -= oldSize
 		c.lruList.Remove(oldElement)
 		logging.Debug("Updating existing cache entry", "key", key, "old_size", oldSize, "new_size", finalSize)
+		delete(c.items, key)
 	} else {
 		logging.Debug("Adding new cache entry", "key", key, "size", finalSize)
 	}
 
 	spaceNeeded := finalSize
-
-	if oldSize == -1 || finalSize > oldSize {
-		spaceToFree := (c.currentSize + spaceNeeded) - c.maxSizeBytes
-		if spaceToFree > 0 {
-			c.evictLocked(spaceToFree)
-		}
+	spaceToFree := (c.currentSize + spaceNeeded) - c.maxSizeBytes
+	if spaceToFree > 0 {
+		c.evictLocked(spaceToFree)
 	}
 
 	newEntry := &cacheEntry{key: key, size: finalSize}
@@ -697,7 +766,6 @@ func (c *DiskLRUCache) updateLRUForPut(key string, finalSize int64) (oldElement 
 	if c.currentSize < 0 {
 		logging.Error("Internal error: current cache size negative after Put update", "size", c.currentSize, "key", key)
 		c.currentSize = 0
-
 		return oldElement, oldSize, fmt.Errorf("internal cache state error: negative size for key %s", key)
 	}
 
@@ -714,14 +782,17 @@ func (c *DiskLRUCache) rollbackLRUUpdate(key string, oldElement *list.Element, o
 		c.lruList.Remove(entry.element)
 		delete(c.items, key)
 		c.currentSize -= finalSize
+	} else if exists {
+		logging.Error("Rollback LRU inconsistency: new entry found but size mismatch", "key", key, "expected_size", finalSize, "found_size", entry.size)
 	} else {
-
-		logging.Error("Rollback LRU inconsistency: new entry not found or size mismatch", "key", key, "expected_size", finalSize)
+		logging.Error("Rollback LRU inconsistency: new entry not found", "key", key)
 	}
 
 	if oldElement != nil && oldSize != -1 {
-
-		oldEntry := &cacheEntry{key: key, size: oldSize}
+		oldEntry := oldElement.Value.(*cacheEntry)
+		if oldEntry.size != oldSize {
+			logging.Error("Rollback LRU inconsistency: old element size mismatch", "key", key, "expected_old_size", oldSize, "element_size", oldEntry.size)
+		}
 		newOldElement := c.lruList.PushFront(oldEntry)
 		oldEntry.element = newOldElement
 		c.items[key] = oldEntry
@@ -741,14 +812,12 @@ func (c *DiskLRUCache) commitTemporaryFiles(key, tempContentPath, tempMetaPath s
 
 	if err := os.Rename(tempMetaPath, finalMetaPath); err != nil {
 		logging.ErrorE("Failed to rename temporary metadata file", err, "temp_path", tempMetaPath, "final_path", finalMetaPath, "key", key)
-
 		return fmt.Errorf("failed to commit metadata for key %s: %w", key, err)
 	}
 	logging.Debug("Renamed temporary metadata file", "from", tempMetaPath, "to", finalMetaPath)
 
 	if err := os.Rename(tempContentPath, finalContentPath); err != nil {
 		logging.ErrorE("Failed to rename temporary content file. Attempting to remove committed meta file.", err, "temp_path", tempContentPath, "final_path", finalContentPath, "key", key)
-
 		if removeMetaErr := os.Remove(finalMetaPath); removeMetaErr != nil && !os.IsNotExist(removeMetaErr) {
 			logging.ErrorE("Failed to remove committed meta file during content rename failure rollback", removeMetaErr, "meta_path", finalMetaPath, "key", key)
 		}
@@ -794,7 +863,6 @@ func (c *DiskLRUCache) deleteFilesAsync(key string) {
 			logging.Error("Cache delete files async: content deletion failed", logFields)
 			hasError = true
 		}
-
 		if metaErr != nil && !errors.Is(metaErr, os.ErrNotExist) {
 			logFields["meta_error"] = metaErr.Error()
 			logging.Error("Cache delete files async: metadata deletion failed", logFields)
@@ -811,6 +879,10 @@ func (c *DiskLRUCache) Delete(ctx context.Context, key string) error {
 	if !c.enabled {
 		logging.Warn("Cache is disabled, cannot delete", "key", key)
 		return errors.New("cache is disabled, cannot delete")
+	}
+
+	if initErr := c.waitInit(); initErr != nil {
+		logging.Warn("Cannot delete, cache init failed", "error", initErr, "key", key)
 	}
 
 	c.mu.Lock()
@@ -836,17 +908,23 @@ func (c *DiskLRUCache) evictLocked(spaceToFree int64) {
 	targetSize := c.maxSizeBytes
 	if spaceToFree > 0 {
 		targetSize = c.currentSize - spaceToFree
-
 		if targetSize < 0 {
 			targetSize = 0
 		}
+		if targetSize > c.maxSizeBytes {
+			targetSize = c.maxSizeBytes
+		}
 	}
 
-	if c.currentSize <= targetSize && spaceToFree <= 0 {
+	if c.currentSize <= targetSize {
 		return
 	}
 
-	logging.Debug("Eviction check/required", "current_size", util.FormatSize(c.currentSize), "max_size", util.FormatSize(c.maxSizeBytes), "target_free_space", util.FormatSize(spaceToFree), "effective_target_size", util.FormatSize(targetSize))
+	logging.Debug("Eviction required",
+		"current_size", util.FormatSize(c.currentSize),
+		"max_size", util.FormatSize(c.maxSizeBytes),
+		"requested_free_space", util.FormatSize(spaceToFree),
+		"effective_target_size", util.FormatSize(targetSize))
 
 	freedSpace := int64(0)
 	itemsEvicted := 0
@@ -854,7 +932,7 @@ func (c *DiskLRUCache) evictLocked(spaceToFree int64) {
 	for c.currentSize > targetSize {
 		element := c.lruList.Back()
 		if element == nil {
-			if c.currentSize > targetSize {
+			if c.currentSize > 0 {
 				logging.Error("Eviction stopped: LRU list empty but still need to free space. Cache state might be inconsistent.",
 					"current_size", util.FormatSize(c.currentSize), "target_size", util.FormatSize(targetSize))
 			}
@@ -863,18 +941,16 @@ func (c *DiskLRUCache) evictLocked(spaceToFree int64) {
 
 		entry := element.Value.(*cacheEntry)
 
-		_, existed := c.deleteInternalLocked(entry.key)
+		size, existed := c.deleteInternalLocked(entry.key)
 
 		if existed {
-			freedSpace += entry.size
+			freedSpace += size
 			itemsEvicted++
-			logging.Debug("Evicted LRU item", "key", entry.key, "size", entry.size)
-
+			logging.Debug("Evicted LRU item", "key", entry.key, "size", size)
 			c.deleteFilesAsync(entry.key)
 		} else {
-
 			c.lruList.Remove(element)
-			logging.Error("Eviction inconsistency: Element found in LRU list but deleteInternalLocked failed? Removed list element.", "key", entry.key)
+			logging.Error("Eviction inconsistency: Element found in LRU list but not in map? Removed list element.", "key", entry.key)
 		}
 	}
 
@@ -979,7 +1055,6 @@ func (c *DiskLRUCache) GetValidation(key string) (validationTime time.Time, ok b
 		c.valMu.RUnlock()
 		return time.Time{}, false
 	}
-
 	entry := element.Value.(*validationEntry)
 	validatedAt := entry.validated
 	isExpired := time.Since(validatedAt) > ttl
