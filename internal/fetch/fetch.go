@@ -98,11 +98,14 @@ func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, 
 		logging.Debug("Singleflight: Initiating fetch and cache", "key", cacheKey, "url", upstreamURL)
 
 		fetchResult, fetchErr := c.doFetch(ctx, upstreamURL, clientHeader)
+
+		if errors.Is(fetchErr, ErrUpstreamNotModified) {
+			logging.Debug("Singleflight: Upstream returned 304 during initial fetch (likely due to client headers), propagating.", "key", cacheKey, "url", upstreamURL)
+			return nil, ErrUpstreamNotModified
+		}
+
 		if fetchErr != nil {
-			if errors.Is(fetchErr, ErrUpstreamNotModified) {
-				logging.Error("Singleflight: Unexpected 304 from upstream during initial fetch", "key", cacheKey, "url", upstreamURL)
-				return nil, fmt.Errorf("%w: unexpected 304 during initial fetch for %s", ErrUpstreamError, cacheKey)
-			}
+
 			logging.ErrorE("Singleflight: Fetch failed", fetchErr, "key", cacheKey, "url", upstreamURL)
 			return nil, fmt.Errorf("fetch failed for %s: %w", cacheKey, fetchErr)
 		}
@@ -132,6 +135,7 @@ func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, 
 		putErr := c.cacheManager.Put(ctx, cacheKey, fetchResult.Body, cachePutMeta)
 		if putErr != nil {
 			logging.ErrorE("Singleflight: Failed to write item to cache", putErr, "key", cacheKey)
+
 			_ = c.cacheManager.Delete(context.Background(), cacheKey)
 			return nil, fmt.Errorf("%w: %w", ErrCacheWriteFailed, putErr)
 		}
@@ -155,8 +159,13 @@ func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, c
 		result, fetchErr := c.doFetch(ctx, upstreamURL, clientHeader)
 		fetchDuration := time.Since(fetchStartTime)
 		if fetchErr != nil {
-			logging.Debug("Singleflight: Fetch completed with error",
-				"key", fetchKey, "url", upstreamURL, "duration", util.FormatDuration(fetchDuration), "error", fetchErr)
+
+			if errors.Is(fetchErr, ErrUpstreamNotModified) {
+				logging.Debug("Singleflight: Fetch completed with 304 Not Modified", "key", fetchKey, "url", upstreamURL, "duration", util.FormatDuration(fetchDuration))
+			} else {
+				logging.Debug("Singleflight: Fetch completed with error",
+					"key", fetchKey, "url", upstreamURL, "duration", util.FormatDuration(fetchDuration), "error", fetchErr)
+			}
 		} else {
 			logging.Debug("Singleflight: Fetch completed successfully",
 				"key", fetchKey, "url", upstreamURL, "duration", util.FormatDuration(fetchDuration), "status", result.StatusCode)
@@ -165,11 +174,19 @@ func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, c
 	})
 
 	if err != nil {
+
+		if errors.Is(err, ErrUpstreamNotModified) {
+			return nil, ErrUpstreamNotModified
+		}
 		return nil, err
 	}
 
 	result, ok := v.(*FetchResult)
 	if !ok {
+
+		if v == nil && errors.Is(err, ErrUpstreamNotModified) {
+			return nil, ErrUpstreamNotModified
+		}
 		if rc, okCloser := v.(io.ReadCloser); okCloser {
 			_ = rc.Close()
 		}
