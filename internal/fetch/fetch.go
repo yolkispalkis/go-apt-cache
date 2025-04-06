@@ -28,7 +28,7 @@ var (
 	ErrInternalFetch        = errors.New("internal fetcher error")
 )
 
-type fetchResultInternal struct {
+type FetchResult struct {
 	Body       io.ReadCloser
 	Header     http.Header
 	Size       int64
@@ -40,9 +40,10 @@ type Coordinator struct {
 	httpClient   *http.Client
 	fetchGroup   singleflight.Group
 	cacheManager cache.CacheManager
+	userAgent    string
 }
 
-func NewCoordinator(requestTimeout time.Duration, maxConcurrent int, cm cache.CacheManager) *Coordinator {
+func NewCoordinator(requestTimeout time.Duration, maxConcurrent int, cm cache.CacheManager, userAgent string) *Coordinator {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 10
 	}
@@ -80,9 +81,14 @@ func NewCoordinator(requestTimeout time.Duration, maxConcurrent int, cm cache.Ca
 		logging.Info("No system proxy configured or detected.")
 	}
 
+	if userAgent == "" {
+		userAgent = "go-apt-proxy/1.0 (default)"
+	}
+
 	return &Coordinator{
 		httpClient:   client,
 		cacheManager: cm,
+		userAgent:    userAgent,
 	}
 }
 
@@ -143,7 +149,7 @@ func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, 
 	return err
 }
 
-func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, clientHeader http.Header) (*fetchResultInternal, error) {
+func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, clientHeader http.Header) (*FetchResult, error) {
 	v, err, _ := c.fetchGroup.Do(fetchKey, func() (interface{}, error) {
 		fetchStartTime := time.Now()
 		result, fetchErr := c.doFetch(ctx, upstreamURL, clientHeader)
@@ -162,7 +168,7 @@ func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, c
 		return nil, err
 	}
 
-	result, ok := v.(*fetchResultInternal)
+	result, ok := v.(*FetchResult)
 	if !ok {
 		if rc, okCloser := v.(io.ReadCloser); okCloser {
 			_ = rc.Close()
@@ -173,7 +179,7 @@ func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, c
 	return result, nil
 }
 
-func (c *Coordinator) FetchForRevalidation(ctx context.Context, revalKey, upstreamURL string, conditionalHeaders http.Header) (*fetchResultInternal, error) {
+func (c *Coordinator) FetchForRevalidation(ctx context.Context, revalKey, upstreamURL string, conditionalHeaders http.Header) (*FetchResult, error) {
 	logging.Debug("Revalidation: Sending conditional request via Fetch", "key", revalKey, "url", upstreamURL, "headers", conditionalHeaders)
 	fetchResult, fetchErr := c.Fetch(ctx, revalKey, upstreamURL, conditionalHeaders)
 
@@ -190,7 +196,7 @@ func (c *Coordinator) FetchForRevalidation(ctx context.Context, revalKey, upstre
 	return fetchResult, nil
 }
 
-func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHeader http.Header) (*fetchResultInternal, error) {
+func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHeader http.Header) (*FetchResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to create upstream request: %w", ErrRequestConfiguration, err)
@@ -203,13 +209,12 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 		req.Header.Set("If-None-Match", inm)
 	}
 
-	req.Header.Set("User-Agent", "go-apt-proxy/1.0 (+https://github.com/yolkispalkis/go-apt-cache)")
+	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Encoding", "identity")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-
 		if errors.Is(err, context.Canceled) {
 			return nil, fmt.Errorf("upstream request canceled: %w", err)
 		}
@@ -220,13 +225,11 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 		if errors.As(err, &netErr) && netErr.Timeout() {
 			return nil, fmt.Errorf("upstream request timeout: %w", err)
 		}
-
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent:
-
 	case http.StatusNotModified:
 		resp.Body.Close()
 		return nil, ErrUpstreamNotModified
@@ -263,7 +266,7 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 		}
 	}
 
-	return &fetchResultInternal{
+	return &FetchResult{
 		Body:       resp.Body,
 		Header:     resp.Header,
 		Size:       size,

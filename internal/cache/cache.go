@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,23 +48,28 @@ type CacheManager interface {
 }
 
 type CacheStats struct {
-	ItemCount                       int    `json:"item_count"`
-	CurrentSize                     int64  `json:"current_size_bytes"`
-	MaxSize                         int64  `json:"max_size_bytes"`
-	Hits                            uint64 `json:"hits"`
-	Misses                          uint64 `json:"misses"`
-	ValidationHits                  uint64 `json:"validation_hits"`
-	ValidationErrors                uint64 `json:"validation_errors"`
-	ValidationItemCount             int    `json:"validation_item_count"`
-	CacheDirectory                  string `json:"cache_directory"`
-	CacheEnabled                    bool   `json:"cache_enabled"`
-	ValidationTTLEnabled            bool   `json:"validation_ttl_enabled"`
-	ValidationTTL                   string `json:"validation_ttl"`
-	InconsistencyMetaWithoutContent uint64 `json:"inconsistency_meta_without_content"`
-	InconsistencyDuringScan         uint64 `json:"inconsistency_during_scan"`
-	InitTimeMs                      int64  `json:"init_time_ms"`
-	InitError                       string `json:"init_error,omitempty"`
-	CleanOnStart                    bool   `json:"clean_on_start"`
+	ItemCount                        int    `json:"item_count"`
+	CurrentSize                      int64  `json:"current_size_bytes"`
+	MaxSize                          int64  `json:"max_size_bytes"`
+	Hits                             uint64 `json:"hits"`
+	Misses                           uint64 `json:"misses"`
+	ValidationHits                   uint64 `json:"validation_hits"`
+	ValidationErrors                 uint64 `json:"validation_errors"`
+	ValidationItemCount              int    `json:"validation_item_count"`
+	CacheDirectory                   string `json:"cache_directory"`
+	CacheEnabled                     bool   `json:"cache_enabled"`
+	ValidationTTLEnabled             bool   `json:"validation_ttl_enabled"`
+	ValidationTTL                    string `json:"validation_ttl"`
+	InconsistencyMetaMissingOnGet    uint64 `json:"inconsistency_meta_missing_on_get"`
+	InconsistencyMetaReadError       uint64 `json:"inconsistency_meta_read_error"`
+	InconsistencyContentMissingOnGet uint64 `json:"inconsistency_content_missing_on_get"`
+	InconsistencyContentOpenError    uint64 `json:"inconsistency_content_open_error"`
+	InconsistencyContentStatError    uint64 `json:"inconsistency_content_stat_error"`
+	InconsistencySizeMismatchOnGet   uint64 `json:"inconsistency_size_mismatch_on_get"`
+	InconsistencyDuringScan          uint64 `json:"inconsistency_during_scan"`
+	InitTimeMs                       int64  `json:"init_time_ms"`
+	InitError                        string `json:"init_error,omitempty"`
+	CleanOnStart                     bool   `json:"clean_on_start"`
 }
 
 type cacheEntry struct {
@@ -100,12 +104,17 @@ type DiskLRUCache struct {
 	closed       chan struct{}
 	store        *diskStore
 
-	statsHits                            atomic.Uint64
-	statsMisses                          atomic.Uint64
-	statsValidationHits                  atomic.Uint64
-	statsValidationErrors                atomic.Uint64
-	statsInconsistencyMetaWithoutContent atomic.Uint64
-	statsInconsistencyDuringScan         atomic.Uint64
+	statsHits                        atomic.Uint64
+	statsMisses                      atomic.Uint64
+	statsValidationHits              atomic.Uint64
+	statsValidationErrors            atomic.Uint64
+	statsInconsistencyMetaMissing    atomic.Uint64
+	statsInconsistencyMetaReadError  atomic.Uint64
+	statsInconsistencyContentMissing atomic.Uint64
+	statsInconsistencyContentOpen    atomic.Uint64
+	statsInconsistencyContentStat    atomic.Uint64
+	statsInconsistencySizeMismatch   atomic.Uint64
+	statsInconsistencyDuringScan     atomic.Uint64
 }
 
 func NewDiskLRUCache(cfg config.CacheConfig) (*DiskLRUCache, error) {
@@ -174,7 +183,7 @@ func (c *DiskLRUCache) initialize() {
 	}
 
 	logging.Info("Scanning cache directory to rebuild state...", "directory", c.store.baseDir)
-	discoveredEntries, scannedFiles, scanErr := c.store.scanDirectory()
+	discoveredEntries, scannedFiles, scanErr := c.store.scanDirectory(&c.statsInconsistencyDuringScan)
 	if scanErr != nil {
 		c.initErr = fmt.Errorf("failed during cache directory scan: %w", scanErr)
 		logging.ErrorE("Cache scan failed", c.initErr)
@@ -188,7 +197,6 @@ func (c *DiskLRUCache) initialize() {
 	}
 
 	c.rebuildLRUState(discoveredEntries)
-	c.statsInconsistencyDuringScan.Store(uint64(len(discoveredEntries)))
 
 	logging.Info("Cache scan reconstruction complete",
 		"scanned_files", scannedFiles,
@@ -256,8 +264,7 @@ func (c *DiskLRUCache) Get(ctx context.Context, key string) (io.ReadCloser, *Cac
 			c.handleInconsistency(key, "meta_missing_on_get", fmt.Errorf("metadata file missing for key in memory: %w", err))
 			return nil, nil, os.ErrNotExist
 		}
-		logging.ErrorE("Failed to read metadata for cache hit", err, "key", key)
-		c.handleInconsistency(key, "meta_read_error", err)
+		c.handleInconsistency(key, "meta_read_error", fmt.Errorf("failed reading metadata for %s: %w", key, err))
 		return nil, nil, os.ErrNotExist
 	}
 
@@ -267,8 +274,7 @@ func (c *DiskLRUCache) Get(ctx context.Context, key string) (io.ReadCloser, *Cac
 			c.handleInconsistency(key, "content_missing_on_get", fmt.Errorf("content file missing for key in memory: %w", err))
 			return nil, nil, os.ErrNotExist
 		}
-		logging.ErrorE("Failed to open content file for cache hit", err, "key", key)
-		c.handleInconsistency(key, "content_open_error", err)
+		c.handleInconsistency(key, "content_open_error", fmt.Errorf("failed opening content file for %s: %w", key, err))
 		return nil, nil, os.ErrNotExist
 	}
 
@@ -297,8 +303,19 @@ func (c *DiskLRUCache) handleInconsistency(key, reason string, err error) {
 	}
 	logging.Warn("Cache inconsistency detected. Removing entry.", "key", key, "reason", logReason)
 
-	if strings.Contains(reason, "meta") {
-		c.statsInconsistencyMetaWithoutContent.Add(1)
+	switch reason {
+	case "meta_missing_on_get":
+		c.statsInconsistencyMetaMissing.Add(1)
+	case "meta_read_error":
+		c.statsInconsistencyMetaReadError.Add(1)
+	case "content_missing_on_get":
+		c.statsInconsistencyContentMissing.Add(1)
+	case "content_open_error":
+		c.statsInconsistencyContentOpen.Add(1)
+	case "content_stat_error":
+		c.statsInconsistencyContentStat.Add(1)
+	case "size_mismatch_on_get":
+		c.statsInconsistencySizeMismatch.Add(1)
 	}
 
 	c.mu.Lock()
@@ -336,36 +353,20 @@ func (c *DiskLRUCache) Put(ctx context.Context, key string, reader io.Reader, me
 		return fmt.Errorf("failed writing temporary files for %s: %w", key, err)
 	}
 
-	oldElement, oldSize, err := c.updateLRUForPut(key, finalSize)
-	if err != nil {
-		return fmt.Errorf("failed updating LRU state for %s: %w", key, err)
-	}
-
 	err = c.store.commitTemporaryFiles(key, tempContentPath, tempMetaPath)
 	if err != nil {
-		c.rollbackLRUUpdate(key, oldElement, oldSize, finalSize)
 		return fmt.Errorf("failed committing cache files for %s: %w", key, err)
 	}
 
 	tempContentPath = ""
 	tempMetaPath = ""
 
-	c.PutValidation(key, time.Now())
-	return nil
-}
-
-func (c *DiskLRUCache) updateLRUForPut(key string, finalSize int64) (oldElement *list.Element, oldSize int64, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	oldSize = -1
-
 	if oldEntry, exists := c.items[key]; exists {
-		oldSize = oldEntry.size
-		oldElement = oldEntry.element
-
-		c.currentSize -= oldSize
-		c.lruList.Remove(oldElement)
+		c.currentSize -= oldEntry.size
+		c.lruList.Remove(oldEntry.element)
 		delete(c.items, key)
 	}
 
@@ -384,36 +385,10 @@ func (c *DiskLRUCache) updateLRUForPut(key string, finalSize int64) (oldElement 
 	if c.currentSize < 0 {
 		logging.Error("Internal error: current cache size negative after Put update", "size", c.currentSize, "key", key)
 		c.currentSize = 0
-		return oldElement, oldSize, fmt.Errorf("internal cache state error: negative size for key %s", key)
 	}
 
-	return oldElement, oldSize, nil
-}
-
-func (c *DiskLRUCache) rollbackLRUUpdate(key string, oldElement *list.Element, oldSize int64, finalSize int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	logging.Warn("Rolling back LRU update due to commit failure", "key", key)
-
-	if entry, exists := c.items[key]; exists && entry.size == finalSize {
-		c.lruList.Remove(entry.element)
-		delete(c.items, key)
-		c.currentSize -= finalSize
-	}
-
-	if oldElement != nil && oldSize != -1 {
-		oldEntry := oldElement.Value.(*cacheEntry)
-		newOldElement := c.lruList.PushFront(oldEntry)
-		oldEntry.element = newOldElement
-		c.items[key] = oldEntry
-		c.currentSize += oldSize
-	}
-
-	if c.currentSize < 0 {
-		logging.Error("Internal error: current cache size negative after Put rollback", "size", c.currentSize, "key", key)
-		c.currentSize = 0
-	}
+	c.PutValidation(key, time.Now())
+	return nil
 }
 
 func (c *DiskLRUCache) deleteInternalLocked(key string) (size int64, exists bool) {
@@ -557,23 +532,28 @@ func (c *DiskLRUCache) Stats() CacheStats {
 	}
 
 	return CacheStats{
-		ItemCount:                       itemCount,
-		CurrentSize:                     currentSize,
-		MaxSize:                         maxSize,
-		Hits:                            c.statsHits.Load(),
-		Misses:                          c.statsMisses.Load(),
-		ValidationHits:                  c.statsValidationHits.Load(),
-		ValidationErrors:                c.statsValidationErrors.Load(),
-		ValidationItemCount:             validationCount,
-		CacheDirectory:                  baseDir,
-		CacheEnabled:                    enabled,
-		ValidationTTLEnabled:            c.validationTTL > 0,
-		ValidationTTL:                   c.validationTTL.String(),
-		InconsistencyMetaWithoutContent: c.statsInconsistencyMetaWithoutContent.Load(),
-		InconsistencyDuringScan:         c.statsInconsistencyDuringScan.Load(),
-		InitTimeMs:                      c.initDuration.Milliseconds(),
-		InitError:                       initErrStr,
-		CleanOnStart:                    c.cleanOnStart,
+		ItemCount:                        itemCount,
+		CurrentSize:                      currentSize,
+		MaxSize:                          maxSize,
+		Hits:                             c.statsHits.Load(),
+		Misses:                           c.statsMisses.Load(),
+		ValidationHits:                   c.statsValidationHits.Load(),
+		ValidationErrors:                 c.statsValidationErrors.Load(),
+		ValidationItemCount:              validationCount,
+		CacheDirectory:                   baseDir,
+		CacheEnabled:                     enabled,
+		ValidationTTLEnabled:             c.validationTTL > 0,
+		ValidationTTL:                    c.validationTTL.String(),
+		InconsistencyMetaMissingOnGet:    c.statsInconsistencyMetaMissing.Load(),
+		InconsistencyMetaReadError:       c.statsInconsistencyMetaReadError.Load(),
+		InconsistencyContentMissingOnGet: c.statsInconsistencyContentMissing.Load(),
+		InconsistencyContentOpenError:    c.statsInconsistencyContentOpen.Load(),
+		InconsistencyContentStatError:    c.statsInconsistencyContentStat.Load(),
+		InconsistencySizeMismatchOnGet:   c.statsInconsistencySizeMismatch.Load(),
+		InconsistencyDuringScan:          c.statsInconsistencyDuringScan.Load(),
+		InitTimeMs:                       c.initDuration.Milliseconds(),
+		InitError:                        initErrStr,
+		CleanOnStart:                     c.cleanOnStart,
 	}
 }
 

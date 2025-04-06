@@ -100,6 +100,7 @@ type ServerConfig struct {
 	IdleTimeout           Duration `json:"idleTimeout"`
 	ReadHeaderTimeout     Duration `json:"readHeaderTimeout"`
 	MaxConcurrentFetches  int      `json:"maxConcurrentFetches"`
+	UserAgent             string   `json:"userAgent,omitempty"`
 }
 
 type CacheConfig struct {
@@ -129,6 +130,7 @@ func Default() *Config {
 			IdleTimeout:           Duration(120 * time.Second),
 			ReadHeaderTimeout:     Duration(10 * time.Second),
 			MaxConcurrentFetches:  10,
+			UserAgent:             "go-apt-proxy/1.0 (+https://github.com/yolkispalkis/go-apt-cache)",
 		},
 		Cache: CacheConfig{
 			Directory:                "./cache_data",
@@ -234,6 +236,10 @@ func Validate(cfg *Config) error {
 		if cfg.Server.UnixSocketPermissions.FileMode()&0777 == 0 {
 			logging.Warn("server.unixSocketPermissions is 0, using default 0660", "path", cfg.Server.UnixSocketPath)
 		}
+	}
+	if cfg.Server.UserAgent == "" {
+		logging.Warn("server.userAgent is empty, using default", "default", Default().Server.UserAgent)
+		cfg.Server.UserAgent = Default().Server.UserAgent
 	}
 
 	if cfg.Cache.Enabled {

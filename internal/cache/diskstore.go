@@ -258,13 +258,13 @@ func (ds *diskStore) cleanDirectory() error {
 	return combinedErr
 }
 
-func (ds *diskStore) scanDirectory() ([]*cacheEntry, int64, error) {
+func (ds *diskStore) scanDirectory(inconsistencyCounter *atomic.Uint64) ([]*cacheEntry, int64, error) {
 	discoveredEntries := []*cacheEntry{}
 	var scannedFiles int64
 	var totalDiscoveredSize int64
-	var inconsistencyCorruptMetadata atomic.Uint64
-	var inconsistencySizeMismatch atomic.Uint64
-	var inconsistencyContentWithoutMeta atomic.Uint64
+	var inconsistencyCorruptMetadata uint64
+	var inconsistencySizeMismatch uint64
+	var inconsistencyContentWithoutMeta uint64
 
 	walkErr := filepath.Walk(ds.baseDir, func(path string, info os.FileInfo, walkErrIn error) error {
 		if walkErrIn != nil {
@@ -287,11 +287,13 @@ func (ds *diskStore) scanDirectory() ([]*cacheEntry, int64, error) {
 		relBasePath, relErr := filepath.Rel(ds.baseDir, basePath)
 		if relErr != nil {
 			logging.Warn("Failed to get relative path, skipping item", "error", relErr, "path", path)
+			inconsistencyCounter.Add(1)
 			return nil
 		}
 		cacheKey := filepath.ToSlash(relBasePath)
 		if cacheKey == "" || cacheKey == "." {
 			logging.Warn("Invalid cache key generated, skipping item", "path", path, "key", cacheKey)
+			inconsistencyCounter.Add(1)
 			return nil
 		}
 
@@ -300,11 +302,12 @@ func (ds *diskStore) scanDirectory() ([]*cacheEntry, int64, error) {
 
 		if metaErr != nil {
 			if os.IsNotExist(metaErr) {
-				inconsistencyContentWithoutMeta.Add(1)
+				inconsistencyContentWithoutMeta++
 				logging.Warn("Cache inconsistency: Content file found without metadata file, skipping item", "content_path", contentPath, "missing_meta_path", metaPath)
 			} else {
 				logging.Warn("Error opening metadata file during scan, skipping item.", "error", metaErr, "meta_path", metaPath)
 			}
+			inconsistencyCounter.Add(1)
 			return nil
 		}
 		defer metaFile.Close()
@@ -313,18 +316,20 @@ func (ds *diskStore) scanDirectory() ([]*cacheEntry, int64, error) {
 		decoder := json.NewDecoder(metaFile)
 		decodeErr := decoder.Decode(&meta)
 		if decodeErr != nil {
-			inconsistencyCorruptMetadata.Add(1)
+			inconsistencyCorruptMetadata++
 			logging.Warn("Cache inconsistency: Failed to decode metadata file, skipping item", "error", decodeErr, "meta_path", metaPath)
 			_ = metaFile.Close()
+			inconsistencyCounter.Add(1)
 			return nil
 		}
 
 		entrySize := realFileSize
 		if meta.Size >= 0 {
 			if meta.Size != realFileSize {
-				inconsistencySizeMismatch.Add(1)
+				inconsistencySizeMismatch++
 				logging.Warn("Cache inconsistency: Metadata size mismatch with actual file size, skipping item", "meta_path", metaPath, "meta_size", meta.Size, "file_size", realFileSize)
 				_ = metaFile.Close()
+				inconsistencyCounter.Add(1)
 				return nil
 			}
 			entrySize = meta.Size
@@ -344,15 +349,16 @@ func (ds *diskStore) scanDirectory() ([]*cacheEntry, int64, error) {
 		return nil, 0, fmt.Errorf("cache directory scan failed: %w", walkErr)
 	}
 
-	logIfInconsistent(inconsistencyContentWithoutMeta.Load(), "content_without_meta")
-	logIfInconsistent(inconsistencyCorruptMetadata.Load(), "corrupt_metadata")
-	logIfInconsistent(inconsistencySizeMismatch.Load(), "size_mismatch")
+	logIfInconsistent(inconsistencyContentWithoutMeta, "content_without_meta", inconsistencyCounter)
+	logIfInconsistent(inconsistencyCorruptMetadata, "corrupt_metadata", inconsistencyCounter)
+	logIfInconsistent(inconsistencySizeMismatch, "size_mismatch", inconsistencyCounter)
 
 	return discoveredEntries, scannedFiles, nil
 }
 
-func logIfInconsistent(count uint64, reason string) {
+func logIfInconsistent(count uint64, reason string, globalCounter *atomic.Uint64) {
 	if count > 0 {
 		logging.Warn("Cache inconsistencies found during scan", "reason", reason, "count", count)
+		globalCounter.Add(count)
 	}
 }
