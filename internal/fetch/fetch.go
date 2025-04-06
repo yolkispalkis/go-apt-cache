@@ -25,6 +25,7 @@ var (
 	ErrUpstreamError        = errors.New("upstream server error")
 	ErrRequestConfiguration = errors.New("invalid request configuration")
 	ErrCacheWriteFailed     = errors.New("failed to write fetched item to cache")
+	ErrInternalFetch        = errors.New("internal fetcher error")
 )
 
 type fetchResultInternal struct {
@@ -97,7 +98,7 @@ func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, 
 				return nil, fmt.Errorf("%w: unexpected 304 during initial fetch for %s", ErrUpstreamError, cacheKey)
 			}
 			logging.ErrorE("Singleflight: Fetch failed", fetchErr, "key", cacheKey, "url", upstreamURL)
-			return nil, fetchErr
+			return nil, fmt.Errorf("fetch failed for %s: %w", cacheKey, fetchErr)
 		}
 		defer fetchResult.Body.Close()
 
@@ -115,7 +116,6 @@ func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, 
 			finalContentType = upstreamContentType
 		} else {
 			finalContentType = util.GetContentType(relativePath)
-			logging.Debug("Singleflight: Using path-detected Content-Type for cache", "path", relativePath, "detected_type", finalContentType, "upstream_type", upstreamContentType)
 		}
 		if finalContentType == "" {
 			finalContentType = "application/octet-stream"
@@ -123,12 +123,11 @@ func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, 
 		cachePutMeta.Headers.Set("Content-Type", finalContentType)
 		util.SelectCacheControlHeaders(cachePutMeta.Headers, fetchResult.Header)
 
-		logging.Debug("Singleflight: Writing fetched content to cache (blocking)", "key", cacheKey, "size", cachePutMeta.Size)
 		putErr := c.cacheManager.Put(ctx, cacheKey, fetchResult.Body, cachePutMeta)
 		if putErr != nil {
 			logging.ErrorE("Singleflight: Failed to write item to cache", putErr, "key", cacheKey)
 			_ = c.cacheManager.Delete(context.Background(), cacheKey)
-			return nil, fmt.Errorf("%w: %v", ErrCacheWriteFailed, putErr)
+			return nil, fmt.Errorf("%w: %w", ErrCacheWriteFailed, putErr)
 		}
 
 		fetchDuration := time.Since(fetchStartTime)
@@ -147,7 +146,6 @@ func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, 
 func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, clientHeader http.Header) (*fetchResultInternal, error) {
 	v, err, _ := c.fetchGroup.Do(fetchKey, func() (interface{}, error) {
 		fetchStartTime := time.Now()
-		logging.Debug("Singleflight: Initiating upstream fetch", "key", fetchKey, "url", upstreamURL)
 		result, fetchErr := c.doFetch(ctx, upstreamURL, clientHeader)
 		fetchDuration := time.Since(fetchStartTime)
 		if fetchErr != nil {
@@ -170,7 +168,7 @@ func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, c
 			_ = rc.Close()
 		}
 		logging.Error("Internal error: unexpected type returned from fetch singleflight group", "key", fetchKey, "type", fmt.Sprintf("%T", v))
-		return nil, fmt.Errorf("internal error: unexpected type returned from fetch singleflight group (%T)", v)
+		return nil, fmt.Errorf("%w: unexpected type from singleflight (%T)", ErrInternalFetch, v)
 	}
 	return result, nil
 }
@@ -182,10 +180,10 @@ func (c *Coordinator) FetchForRevalidation(ctx context.Context, revalKey, upstre
 	if fetchErr != nil {
 		if errors.Is(fetchErr, ErrUpstreamNotModified) {
 			logging.Debug("Revalidation: Success (304 Not Modified)", "key", revalKey, "url", upstreamURL)
-			return nil, nil
+			return nil, ErrUpstreamNotModified
 		}
 		logging.Warn("Revalidation: Fetch failed", "error", fetchErr, "key", revalKey, "url", upstreamURL)
-		return nil, fetchErr
+		return nil, fmt.Errorf("revalidation fetch failed for %s: %w", revalKey, fetchErr)
 	}
 
 	logging.Debug("Revalidation: Resource changed (2xx received)", "key", revalKey, "url", upstreamURL, "status", fetchResult.StatusCode)
@@ -195,8 +193,7 @@ func (c *Coordinator) FetchForRevalidation(ctx context.Context, revalKey, upstre
 func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHeader http.Header) (*fetchResultInternal, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
 	if err != nil {
-		logging.ErrorE("Failed to create upstream request", err, "url", upstreamURL)
-		return nil, fmt.Errorf("%w: failed to create upstream request: %v", ErrRequestConfiguration, err)
+		return nil, fmt.Errorf("%w: failed to create upstream request: %w", ErrRequestConfiguration, err)
 	}
 
 	if ims := clientHeader.Get("If-Modified-Since"); ims != "" {
@@ -210,45 +207,32 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Encoding", "identity")
 
-	logging.Debug("Fetching upstream",
-		"url", req.URL.String(),
-		"method", req.Method,
-		"if_modified_since", req.Header.Get("If-Modified-Since"),
-		"if_none_match", req.Header.Get("If-None-Match"),
-	)
-
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+
 		if errors.Is(err, context.Canceled) {
-			logging.Warn("Upstream request canceled", "url", upstreamURL, "error", err)
 			return nil, fmt.Errorf("upstream request canceled: %w", err)
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			logging.ErrorE("Upstream request deadline exceeded (timeout)", err, "url", upstreamURL)
+			return nil, fmt.Errorf("upstream request deadline exceeded: %w", err)
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
 			return nil, fmt.Errorf("upstream request timeout: %w", err)
 		}
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			logging.ErrorE("Upstream request net/http timeout", err, "url", upstreamURL)
-			return nil, fmt.Errorf("upstream request timeout: %w", err)
-		}
-		logging.ErrorE("Upstream request failed", err, "url", upstreamURL)
+
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent:
-		logging.Debug("Upstream fetch successful", "url", upstreamURL, "status_code", resp.StatusCode)
 
 	case http.StatusNotModified:
 		resp.Body.Close()
-		logging.Debug("Upstream returned 304 Not Modified", "url", upstreamURL)
 		return nil, ErrUpstreamNotModified
-
 	case http.StatusNotFound:
 		resp.Body.Close()
-		logging.Warn("Upstream returned 404 Not Found", "url", upstreamURL)
 		return nil, ErrNotFound
-
 	default:
 		statusCode := resp.StatusCode
 		statusText := resp.Status
@@ -268,8 +252,6 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 		parsedSize, parseErr := strconv.ParseInt(cl, 10, 64)
 		if parseErr == nil && parsedSize >= 0 {
 			size = parsedSize
-		} else {
-			logging.Warn("Failed to parse Content-Length header or invalid value", "error", parseErr, "content_length_header", cl, "url", upstreamURL)
 		}
 	}
 
@@ -278,8 +260,6 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 		parsedTime, parseErr := http.ParseTime(lm)
 		if parseErr == nil {
 			modTime = parsedTime
-		} else {
-			logging.Warn("Failed to parse Last-Modified header", "error", parseErr, "last_modified_header", lm, "url", upstreamURL)
 		}
 	}
 

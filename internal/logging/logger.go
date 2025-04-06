@@ -96,20 +96,15 @@ func Setup(cfg LoggingConfig) error {
 
 	level, err := ParseLevel(cfg.Level)
 	if err != nil {
-
 		fmt.Printf("Warning: Invalid log level %q in config during setup: %v. Defaulting to INFO.\n", cfg.Level, err)
 		level = zerolog.InfoLevel
-
 	}
 	zerolog.SetGlobalLevel(level)
 
 	multi := zerolog.MultiLevelWriter(writers...)
-
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs
-
 	log.Logger = zerolog.New(multi).With().Timestamp().Caller().Logger()
-
-	log.Info().Msgf("Logger initialized with level: %s", cfg.Level)
+	log.Info().Msgf("Logger initialized with level: %s", level.String())
 
 	return nil
 }
@@ -125,7 +120,6 @@ func ParseLevel(levelStr string) (zerolog.Level, error) {
 	case LevelError:
 		return zerolog.ErrorLevel, nil
 	default:
-
 		return zerolog.InfoLevel, fmt.Errorf("unknown log level %q (valid levels: debug, info, warn, error)", levelStr)
 	}
 }

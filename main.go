@@ -37,13 +37,11 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 	flags := flag.NewFlagSet(args[0], flag.ExitOnError)
 	configFile := flags.String("config", "config.json", "Path to configuration file")
 	createConfig := flags.Bool("create-config", false, "Create default configuration file if it doesn't exist and exit")
-
 	listenAddr := flags.String("listen", "", "Override server.listenAddress (e.g., :8080)")
 	unixSocket := flags.String("unix-socket", "", "Override server.unixSocketPath")
 	cacheDir := flags.String("cache-dir", "", "Override cache.directory")
 	cacheSize := flags.String("cache-size", "", "Override cache.maxSize (e.g., 1GB)")
 	logLevel := flags.String("log-level", "", "Override logging.level (debug, info, warn, error)")
-
 	flags.Usage = func() {
 		fmt.Fprintf(flags.Output(), "Usage of %s:\n", args[0])
 		flags.PrintDefaults()
@@ -97,11 +95,10 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 	defer logging.Sync()
 
 	logging.Info("Configuration loaded and validated successfully", "config_file", *configFile)
-
 	logging.Info("Initializing cache...")
+
 	cacheManager, err := cache.NewDiskLRUCache(cfg.Cache)
 	if err != nil {
-		logging.ErrorE("Failed to initialize cache", err)
 		return fmt.Errorf("failed to initialize cache: %w", err)
 	}
 	defer func() {
@@ -126,7 +123,6 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 
 	srv, err := server.New(cfg, cacheManager)
 	if err != nil {
-		logging.ErrorE("Failed to create server", err)
 		return fmt.Errorf("failed to create server: %w", err)
 	}
 
@@ -140,7 +136,6 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 			defer wgListeners.Done()
 			tcpListener, err := net.Listen("tcp", cfg.Server.ListenAddress)
 			if err != nil {
-				logging.ErrorE("Failed to listen on TCP", err, "address", cfg.Server.ListenAddress)
 				listenErr = errors.Join(listenErr, fmt.Errorf("tcp listen %s: %w", cfg.Server.ListenAddress, err))
 				return
 			}
@@ -156,30 +151,24 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 			socketPath := util.CleanPath(cfg.Server.UnixSocketPath)
 			socketDir := filepath.Dir(socketPath)
 			if err := os.MkdirAll(socketDir, 0755); err != nil {
-				logging.ErrorE("Failed to create directory for unix socket", err, "directory", socketDir)
 				listenErr = errors.Join(listenErr, fmt.Errorf("mkdir unix socket dir %s: %w", socketDir, err))
 				return
 			}
 			if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				logging.Warn("Failed to remove existing unix socket file, listen may fail", "error", err, "path", socketPath)
+				logging.Warn("Failed to remove existing unix socket file", "error", err, "path", socketPath)
 			}
-
 			unixListener, err := net.Listen("unix", socketPath)
 			if err != nil {
-				logging.ErrorE("Failed to listen on Unix socket", err, "path", socketPath)
 				listenErr = errors.Join(listenErr, fmt.Errorf("unix listen %s: %w", socketPath, err))
 				return
 			}
-
 			perms := cfg.Server.UnixSocketPermissions.FileMode()
 			if err := os.Chmod(socketPath, perms); err != nil {
 				_ = unixListener.Close()
 				_ = os.Remove(socketPath)
-				logging.ErrorE("Failed to set permissions on unix socket", err, "path", socketPath, "permissions", fmt.Sprintf("0%o", perms))
 				listenErr = errors.Join(listenErr, fmt.Errorf("chmod socket %s to 0%o: %w", socketPath, perms, err))
 				return
 			}
-
 			listeners = append(listeners, unixListener)
 			logging.Info("Listening on Unix socket", "path", socketPath, "permissions", fmt.Sprintf("0%o", perms))
 		}()
@@ -197,9 +186,8 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 		}
 		return fmt.Errorf("failed to start listeners: %w", listenErr)
 	}
-
 	if len(listeners) == 0 {
-		return errors.New("no listeners configured or started (server.listenAddress or server.unixSocketPath must be set and valid)")
+		return errors.New("no listeners configured or started")
 	}
 
 	errChan := make(chan error, len(listeners))
@@ -208,9 +196,8 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 		go func() {
 			listenerAddr := listener.Addr().String()
 			networkType := listener.Addr().Network()
-			logging.Info("Starting main server loop", "network", networkType, "address", listenerAddr)
+			logging.Info("Starting server loop", "network", networkType, "address", listenerAddr)
 			if serveErr := srv.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-				logging.ErrorE("Server loop error", serveErr, "network", networkType, "address", listenerAddr)
 				errChan <- fmt.Errorf("server error on %s (%s): %w", listenerAddr, networkType, serveErr)
 			} else {
 				logging.Info("Server loop stopped gracefully", "network", networkType, "address", listenerAddr)
@@ -223,7 +210,6 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 		logging.Error("Listener/Server failed, initiating shutdown...", "error", err)
 		stop()
 		listenErr = err
-
 	case <-ctx.Done():
 		logging.Info("Shutdown signal received, initiating graceful shutdown...")
 		listenErr = ctx.Err()
@@ -232,19 +218,18 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout.Duration())
 	defer cancelShutdown()
 
-	logging.Info("Attempting graceful main server shutdown...", "timeout", cfg.Server.ShutdownTimeout.Duration())
+	logging.Info("Attempting graceful server shutdown...", "timeout", cfg.Server.ShutdownTimeout.Duration())
 	shutdownErr := srv.Shutdown(shutdownCtx)
 	if shutdownErr != nil {
-		logging.ErrorE("Graceful main server shutdown failed", shutdownErr)
+		logging.ErrorE("Graceful server shutdown failed", shutdownErr)
 	} else {
-		logging.Info("Main server shutdown complete.")
+		logging.Info("Server shutdown complete.")
 	}
 
 	if cfg.Server.UnixSocketPath != "" {
 		socketPath := util.CleanPath(cfg.Server.UnixSocketPath)
-		logging.Debug("Attempting removal of unix socket file post-shutdown", "path", socketPath)
 		if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			logging.Warn("Failed to remove unix socket file during shutdown cleanup", "error", err, "path", socketPath)
+			logging.Warn("Failed to remove unix socket file during cleanup", "error", err, "path", socketPath)
 		}
 	}
 
@@ -252,12 +237,9 @@ func run(ctx context.Context, args []string, stop context.CancelFunc) error {
 	if shutdownErr != nil {
 		finalErr = errors.Join(finalErr, fmt.Errorf("shutdown error: %w", shutdownErr))
 	}
-
-	if finalErr != nil {
-		if !(errors.Is(finalErr, context.Canceled) && shutdownErr == nil) {
-			return finalErr
-		}
+	// Only return error if it wasn't a clean shutdown signal (context.Canceled) without shutdown issues
+	if finalErr != nil && !(errors.Is(finalErr, context.Canceled) && shutdownErr == nil) {
+		return finalErr
 	}
-
 	return nil
 }

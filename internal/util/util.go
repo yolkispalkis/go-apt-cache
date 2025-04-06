@@ -12,13 +12,10 @@ import (
 )
 
 var (
-	sizeRegex = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT])?B?$`)
-
-	repoNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
-
+	sizeRegex        = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT])?B?$`)
+	repoNameRegex    = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 	unsafeCharsRegex = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
-
-	reservedNames = map[string]struct{}{
+	reservedNames    = map[string]struct{}{
 		"con": {}, "prn": {}, "aux": {}, "nul": {},
 		"com1": {}, "com2": {}, "com3": {}, "com4": {}, "com5": {}, "com6": {}, "com7": {}, "com8": {}, "com9": {},
 		"lpt1": {}, "lpt2": {}, "lpt3": {}, "lpt4": {}, "lpt5": {}, "lpt6": {}, "lpt7": {}, "lpt8": {}, "lpt9": {},
@@ -82,7 +79,6 @@ func FormatSize(sizeBytes int64) string {
 	if sizeBytes < unit {
 		return fmt.Sprintf("%d B", sizeBytes)
 	}
-
 	div, exp := int64(unit), 0
 	for n := sizeBytes / unit; n >= unit && exp < 3; n /= unit {
 		div *= unit
@@ -94,10 +90,6 @@ func FormatSize(sizeBytes int64) string {
 func CleanPath(path string) string {
 	cleaned := filepath.Clean(path)
 	return cleaned
-}
-
-func CleanPathDir(path string) string {
-	return filepath.Dir(CleanPath(path))
 }
 
 func IsRepoNameSafe(component string) bool {
@@ -124,10 +116,7 @@ func SanitizePath(path string) string {
 	parts := strings.Split(cleaned, "/")
 	sanitizedParts := make([]string, 0, len(parts))
 	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		if part == "." || part == ".." {
+		if part == "" || part == "." || part == ".." {
 			continue
 		}
 		sanitizedPart := SanitizeFilename(part)
@@ -146,13 +135,10 @@ func GetContentType(filePath string) string {
 	if mimeType == "" || strings.HasPrefix(mimeType, "application/octet-stream") {
 		lowercaseExt := strings.ToLower(ext)
 		lowercaseBaseName := strings.ToLower(baseName)
-
 		switch lowercaseExt {
 		case ".deb", ".udeb", ".ddeb":
 			mimeType = "application/vnd.debian.binary-package"
-		case ".dsc":
-			mimeType = "text/plain; charset=utf-8"
-		case ".changes":
+		case ".dsc", ".changes":
 			mimeType = "text/plain; charset=utf-8"
 		case ".gz":
 			mimeType = "application/gzip"
@@ -181,16 +167,11 @@ func GetContentType(filePath string) string {
 			mimeType = "application/json"
 		case ".xml":
 			mimeType = "application/xml"
-		default:
-
-			break
 		}
 	}
-
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
-
 	return mimeType
 }
 
@@ -232,7 +213,6 @@ func FormatDuration(d time.Duration) string {
 		sign = "-"
 		nanos = -nanos
 	}
-
 	switch {
 	case nanos == 0:
 		return "0s"
@@ -251,16 +231,11 @@ func CompareETags(ifNoneMatchHeader string, currentETag string) bool {
 	if ifNoneMatchHeader == "" || currentETag == "" {
 		return false
 	}
-
 	if ifNoneMatchHeader == "*" {
 		return true
 	}
-
-	trimWeak := func(etag string) string {
-		return strings.TrimPrefix(etag, "W/")
-	}
+	trimWeak := func(etag string) string { return strings.TrimPrefix(etag, "W/") }
 	currentETagTrimmed := trimWeak(currentETag)
-
 	clientEtags := strings.Split(ifNoneMatchHeader, ",")
 	for _, clientEtagRaw := range clientEtags {
 		clientEtag := strings.TrimSpace(clientEtagRaw)
@@ -268,11 +243,9 @@ func CompareETags(ifNoneMatchHeader string, currentETag string) bool {
 			continue
 		}
 		clientEtagTrimmed := trimWeak(clientEtag)
-
 		if clientEtagTrimmed == currentETagTrimmed {
 			return true
 		}
 	}
-
 	return false
 }
