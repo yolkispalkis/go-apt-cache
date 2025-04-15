@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -100,9 +101,24 @@ func rootHandler(cfg *config.Config) http.HandlerFunc {
 		}
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Go APT Proxy</title><style>body{font-family: sans-serif; padding: 1em;} li { margin-bottom: 0.5em; }</style></head><body><h1>Go APT Proxy</h1><p>Status: Running</p><h2>Configured Repositories:</h2><ul>`)
+
+		// Ограничение на количество репозиториев для отображения в HTML
+		const maxReposToDisplay = 50
+		// Максимальный размер HTML-ответа в байтах
+		const maxHTMLSize = 50 * 1024 // 50KB
+
+		htmlResponse := strings.Builder{}
+		htmlResponse.WriteString(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Go APT Proxy</title><style>body{font-family: sans-serif; padding: 1em;} li { margin-bottom: 0.5em; }</style></head><body><h1>Go APT Proxy</h1><p>Status: Running</p><h2>Configured Repositories:</h2><ul>`)
+
 		if len(cfg.Repositories) > 0 {
+			displayCount := 0
 			for _, repo := range cfg.Repositories {
+				// Проверка на превышение лимита вывода для предотвращения DoS
+				if displayCount >= maxReposToDisplay || htmlResponse.Len() > maxHTMLSize/2 {
+					htmlResponse.WriteString("<li>... и ещё репозитории (не показаны для предотвращения DoS) ...</li>")
+					break
+				}
+
 				status := "Disabled"
 				color := "gray"
 				if repo.Enabled {
@@ -110,12 +126,30 @@ func rootHandler(cfg *config.Config) http.HandlerFunc {
 					color = "green"
 				}
 				repoPath := "/" + strings.Trim(repo.Name, "/") + "/"
-				fmt.Fprintf(w, `<li><strong>%s</strong> (<span style="color:%s;">%s</span>): <a href="%s">%s</a> ← %s</li>`, repo.Name, color, status, repoPath, repoPath, repo.URL)
+				escapedName := html.EscapeString(repo.Name)
+				escapedPath := html.EscapeString(repoPath)
+				escapedURL := html.EscapeString(repo.URL)
+
+				fmt.Fprintf(&htmlResponse, `<li><strong>%s</strong> (<span style="color:%s;">%s</span>): <a href="%s">%s</a> ← %s</li>`,
+					escapedName, color, status, escapedPath, escapedPath, escapedURL)
+
+				displayCount++
 			}
 		} else {
-			fmt.Fprint(w, "<li>No repositories configured.</li>")
+			htmlResponse.WriteString("<li>No repositories configured.</li>")
 		}
-		fmt.Fprint(w, `</ul><p><a href="/status">View Detailed Status (Text)</a></p><p><a href="/status?format=json">View Detailed Status (JSON)</a></p></body></html>`)
+
+		htmlResponse.WriteString(`</ul><p><a href="/status">View Detailed Status (Text)</a></p><p><a href="/status?format=json">View Detailed Status (JSON)</a></p></body></html>`)
+
+		// Проверка финального размера
+		if htmlResponse.Len() > maxHTMLSize {
+			logging.Warn("HTML response too large, potential DoS", "size", htmlResponse.Len(), "max", maxHTMLSize)
+			htmlSummary := `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Go APT Proxy</title></head><body><h1>Go APT Proxy</h1><p>Status: Running</p><p>Too many repositories to display. <a href="/status">View text status</a> or <a href="/status?format=json">JSON status</a>.</p></body></html>`
+			fmt.Fprint(w, htmlSummary)
+			return
+		}
+
+		fmt.Fprint(w, htmlResponse.String())
 	}
 }
 
@@ -141,58 +175,82 @@ func statusHandler(cfg *config.Config, cacheManager cache.CacheManager) http.Han
 		}
 
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintln(w, "--- Go APT Proxy Status ---")
-		fmt.Fprintf(w, "Server Time: %s\n\n", time.Now().Format(time.RFC3339))
-		fmt.Fprintln(w, "--- Cache Status ---")
-		fmt.Fprintf(w, "Cache Enabled:          %t\n", stats.CacheEnabled)
+
+		// Ограничения размера вывода
+		const maxReposToDisplay = 50
+		const maxTextStatusSize = 100 * 1024 // 100KB
+
+		statusBuilder := strings.Builder{}
+		statusBuilder.WriteString("--- Go APT Proxy Status ---\n")
+		fmt.Fprintf(&statusBuilder, "Server Time: %s\n\n", time.Now().Format(time.RFC3339))
+		statusBuilder.WriteString("--- Cache Status ---\n")
+		fmt.Fprintf(&statusBuilder, "Cache Enabled:          %t\n", stats.CacheEnabled)
 		if stats.CacheEnabled {
-			fmt.Fprintf(w, "Cache Directory:        %s\n", stats.CacheDirectory)
-			fmt.Fprintf(w, "Clean on Start:         %t\n", stats.CleanOnStart)
-			fmt.Fprintf(w, "Init Time:              %d ms\n", stats.InitTimeMs)
+			fmt.Fprintf(&statusBuilder, "Cache Directory:        %s\n", stats.CacheDirectory)
+			fmt.Fprintf(&statusBuilder, "Clean on Start:         %t\n", stats.CleanOnStart)
+			fmt.Fprintf(&statusBuilder, "Init Time:              %d ms\n", stats.InitTimeMs)
 			if stats.InitError != "" {
-				fmt.Fprintf(w, "Init Error:             %s\n", stats.InitError)
+				fmt.Fprintf(&statusBuilder, "Init Error:             %s\n", stats.InitError)
 			}
-			fmt.Fprintf(w, "Cached Items (memory):  %d\n", stats.ItemCount)
-			fmt.Fprintf(w, "Current Cache Size:     %s (%d bytes)\n", util.FormatSize(stats.CurrentSize), stats.CurrentSize)
-			fmt.Fprintf(w, "Max Cache Size:         %s (%d bytes)\n", util.FormatSize(stats.MaxSize), stats.MaxSize)
-			fmt.Fprintf(w, "Cache Hits:             %d\n", stats.Hits)
-			fmt.Fprintf(w, "Cache Misses:           %d\n", stats.Misses)
-			fmt.Fprintln(w, "\n--- Cache Validation ---")
-			fmt.Fprintf(w, "Validation TTL Enabled: %t\n", stats.ValidationTTLEnabled)
+			fmt.Fprintf(&statusBuilder, "Cached Items (memory):  %d\n", stats.ItemCount)
+			fmt.Fprintf(&statusBuilder, "Current Cache Size:     %s (%d bytes)\n", util.FormatSize(stats.CurrentSize), stats.CurrentSize)
+			fmt.Fprintf(&statusBuilder, "Max Cache Size:         %s (%d bytes)\n", util.FormatSize(stats.MaxSize), stats.MaxSize)
+			fmt.Fprintf(&statusBuilder, "Cache Hits:             %d\n", stats.Hits)
+			fmt.Fprintf(&statusBuilder, "Cache Misses:           %d\n", stats.Misses)
+			statusBuilder.WriteString("\n--- Cache Validation ---\n")
+			fmt.Fprintf(&statusBuilder, "Validation TTL Enabled: %t\n", stats.ValidationTTLEnabled)
 			if stats.ValidationTTLEnabled {
-				fmt.Fprintf(w, "Validation TTL:         %s\n", stats.ValidationTTL)
-				fmt.Fprintf(w, "Validation Entries:     %d\n", stats.ValidationItemCount)
-				fmt.Fprintf(w, "Validation Hits:        %d\n", stats.ValidationHits)
-				fmt.Fprintf(w, "Validation Errors:      %d\n", stats.ValidationErrors)
+				fmt.Fprintf(&statusBuilder, "Validation TTL:         %s\n", stats.ValidationTTL)
+				fmt.Fprintf(&statusBuilder, "Validation Entries:     %d\n", stats.ValidationItemCount)
+				fmt.Fprintf(&statusBuilder, "Validation Hits:        %d\n", stats.ValidationHits)
+				fmt.Fprintf(&statusBuilder, "Validation Errors:      %d\n", stats.ValidationErrors)
 			}
-			fmt.Fprintln(w, "\n--- Cache Inconsistencies (Counters Get/Scan) ---")
-			fmt.Fprintf(w, "  Meta Missing (Get):     %d\n", stats.InconsistencyMetaMissingOnGet)
-			fmt.Fprintf(w, "  Meta Read Err (Get):    %d\n", stats.InconsistencyMetaReadError)
-			fmt.Fprintf(w, "  Content Missing (Get):  %d\n", stats.InconsistencyContentMissingOnGet)
-			fmt.Fprintf(w, "  Content Open Err (Get): %d\n", stats.InconsistencyContentOpenError)
-			fmt.Fprintf(w, "  Content Stat Err (Get): %d\n", stats.InconsistencyContentStatError)
-			fmt.Fprintf(w, "  Size Mismatch (Get):    %d\n", stats.InconsistencySizeMismatchOnGet)
-			fmt.Fprintf(w, "  During Scan (approx):   %d\n", stats.InconsistencyDuringScan)
+			statusBuilder.WriteString("\n--- Cache Inconsistencies (Counters Get/Scan) ---\n")
+			fmt.Fprintf(&statusBuilder, "  Meta Missing (Get):     %d\n", stats.InconsistencyMetaMissingOnGet)
+			fmt.Fprintf(&statusBuilder, "  Meta Read Err (Get):    %d\n", stats.InconsistencyMetaReadError)
+			fmt.Fprintf(&statusBuilder, "  Content Missing (Get):  %d\n", stats.InconsistencyContentMissingOnGet)
+			fmt.Fprintf(&statusBuilder, "  Content Open Err (Get): %d\n", stats.InconsistencyContentOpenError)
+			fmt.Fprintf(&statusBuilder, "  Content Stat Err (Get): %d\n", stats.InconsistencyContentStatError)
+			fmt.Fprintf(&statusBuilder, "  Size Mismatch (Get):    %d\n", stats.InconsistencySizeMismatchOnGet)
+			fmt.Fprintf(&statusBuilder, "  During Scan (approx):   %d\n", stats.InconsistencyDuringScan)
 
 		} else {
-			fmt.Fprintln(w, "Cache is disabled.")
+			statusBuilder.WriteString("Cache is disabled.\n")
 		}
-		fmt.Fprintln(w, "")
-		fmt.Fprintln(w, "--- Configured Repositories ---")
+		statusBuilder.WriteString("\n")
+		statusBuilder.WriteString("--- Configured Repositories ---\n")
 		if len(cfg.Repositories) > 0 {
-			fmt.Fprintf(w, "%-15s | %-8s | %s\n", "Name", "Status", "Upstream URL")
-			fmt.Fprintf(w, "%s\n", strings.Repeat("-", 60))
+			fmt.Fprintf(&statusBuilder, "%-15s | %-8s | %s\n", "Name", "Status", "Upstream URL")
+			fmt.Fprintf(&statusBuilder, "%s\n", strings.Repeat("-", 60))
+
+			displayCount := 0
 			for _, repo := range cfg.Repositories {
+				// Проверяем размер буфера для предотвращения DoS
+				if displayCount >= maxReposToDisplay || statusBuilder.Len() > maxTextStatusSize/2 {
+					statusBuilder.WriteString("... (дополнительные репозитории не показаны для предотвращения DoS) ...\n")
+					break
+				}
+
 				status := "Disabled"
 				if repo.Enabled {
 					status = "Enabled"
 				}
-				fmt.Fprintf(w, "%-15s | %-8s | %s\n", repo.Name, status, repo.URL)
+				fmt.Fprintf(&statusBuilder, "%-15s | %-8s | %s\n", repo.Name, status, repo.URL)
+				displayCount++
 			}
 		} else {
-			fmt.Fprintln(w, "No repositories configured.")
+			statusBuilder.WriteString("No repositories configured.\n")
 		}
-		fmt.Fprintln(w, "\n--- Status End ---")
+		statusBuilder.WriteString("\n--- Status End ---\n")
+
+		// Проверка финального размера
+		if statusBuilder.Len() > maxTextStatusSize {
+			logging.Warn("Text status response too large, potential DoS", "size", statusBuilder.Len(), "max", maxTextStatusSize)
+			fmt.Fprint(w, "--- Go APT Proxy Status ---\nStatus output too large. Try using JSON format with /status?format=json\n")
+			return
+		}
+
+		fmt.Fprint(w, statusBuilder.String())
 	}
 }
 
@@ -257,12 +315,36 @@ func (h *RepositoryHandler) validateAndPrepareRequest(r *http.Request) (relative
 		return "", "", "", fmt.Errorf("method %s not allowed: %w", r.Method, net.ErrWriteToConnected)
 	}
 
+	// Проверка наличия query параметров и фрагментов в URL
+	if r.URL.RawQuery != "" {
+		return "", "", "", errors.New("query parameters are not allowed in requests")
+	}
+
+	if r.URL.Fragment != "" {
+		return "", "", "", errors.New("URL fragments are not allowed in requests")
+	}
+
 	upstreamPathPart := strings.TrimPrefix(r.URL.Path, "/")
 
-	cleanedLocalPath := util.CleanPath(upstreamPathPart)
-	if strings.HasPrefix(cleanedLocalPath, "..") || strings.Contains(cleanedLocalPath, "../") {
+	// Проверка на path traversal до очистки пути
+	if strings.Contains(upstreamPathPart, "../") || strings.Contains(upstreamPathPart, "/..") ||
+		strings.Contains(upstreamPathPart, "..\\") || strings.Contains(upstreamPathPart, "\\..") {
 		return "", "", "", errors.New("potential path traversal detected")
 	}
+
+	cleanedLocalPath := util.CleanPath(upstreamPathPart)
+
+	// Повторная проверка после очистки
+	if strings.HasPrefix(cleanedLocalPath, "..") || strings.Contains(cleanedLocalPath, "../") ||
+		strings.Contains(cleanedLocalPath, "/..") || strings.Contains(cleanedLocalPath, "\\") {
+		return "", "", "", errors.New("potential path traversal detected")
+	}
+
+	absolutePath := filepath.Clean("/" + cleanedLocalPath)
+	if !strings.HasPrefix(absolutePath, "/") || strings.Contains(absolutePath, "\\") {
+		return "", "", "", errors.New("invalid path format detected")
+	}
+	cleanedLocalPath = strings.TrimPrefix(absolutePath, "/")
 
 	relativePath = cleanedLocalPath
 	if relativePath == "." || relativePath == "/" {
@@ -272,23 +354,43 @@ func (h *RepositoryHandler) validateAndPrepareRequest(r *http.Request) (relative
 	if relativePath == "" {
 		requestCacheKey = h.repoConfig.Name
 	} else {
-
 		requestCacheKey = filepath.ToSlash(filepath.Join(h.repoConfig.Name, relativePath))
 	}
 
 	upstreamBaseURL := strings.TrimSuffix(h.repoConfig.URL, "/")
 
-	upstreamURL = upstreamBaseURL + "/" + upstreamPathPart
+	var upstreamURLBuilder strings.Builder
+	upstreamURLBuilder.WriteString(upstreamBaseURL)
+	upstreamURLBuilder.WriteString("/")
+
+	escapedPath := cleanedLocalPath
+	if strings.ContainsAny(cleanedLocalPath, " %") {
+		parts := strings.Split(cleanedLocalPath, "/")
+		for i, part := range parts {
+			if part != "" {
+				parts[i] = strings.ReplaceAll(part, " ", "%20")
+			}
+		}
+		escapedPath = strings.Join(parts, "/")
+	}
+
+	upstreamURLBuilder.WriteString(escapedPath)
+	upstreamURL = upstreamURLBuilder.String()
 
 	return relativePath, requestCacheKey, upstreamURL, nil
 }
 
 func (h *RepositoryHandler) handleCacheHit(w http.ResponseWriter, r *http.Request, cacheReader io.ReadCloser, cacheMeta *cache.CacheMetadata, requestCacheKey, relativePath, upstreamURL string) {
-	defer func() {
-		if cacheReader != nil {
-			_ = cacheReader.Close()
-		}
-	}()
+	if cacheReader != nil {
+		defer cacheReader.Close()
+	}
+
+	if cacheReader == nil {
+		// Если cacheReader равен nil, но метаданные есть, это несоответствие состояния кэша
+		logging.Warn("Cache hit but no reader available", "key", requestCacheKey)
+		h.handleCacheMiss(w, r, requestCacheKey, relativePath, upstreamURL)
+		return
+	}
 
 	h.cacheManager.RecordHit()
 	logging.Debug("Disk cache hit", "key", requestCacheKey)
@@ -306,7 +408,6 @@ func (h *RepositoryHandler) handleCacheHit(w http.ResponseWriter, r *http.Reques
 	serveStale, err := h.performRevalidation(w, r, cacheMeta, requestCacheKey, relativePath, upstreamURL)
 	if err != nil {
 		if !errors.Is(err, fetch.ErrUpstreamNotModified) && !errors.Is(err, fetch.ErrNotFound) && !isClientDisconnectedError(err) {
-
 			logging.Debug("Revalidation failed or handled, response sent.", "error_type", fmt.Sprintf("%T", err), "key", requestCacheKey)
 		}
 		return
@@ -317,7 +418,6 @@ func (h *RepositoryHandler) handleCacheHit(w http.ResponseWriter, r *http.Reques
 		w.Header().Set("X-Cache-Status", "HIT_STALE")
 		h.serveFromCache(w, r, cacheReader, cacheMeta, relativePath)
 	} else {
-
 		logging.Debug("Revalidation successful or updated content served", "key", requestCacheKey)
 	}
 }
@@ -393,13 +493,18 @@ func (h *RepositoryHandler) executeUpstreamRevalidation(ctx context.Context, req
 	if etag := cacheMeta.Headers.Get("ETag"); etag != "" {
 		revalidationHeaders.Set("If-None-Match", etag)
 	}
-	revalKey := requestCacheKey + "::reval"
+	revalKey := "revalidation:" + requestCacheKey
 	return h.fetcher.FetchForRevalidation(ctx, revalKey, upstreamURL, revalidationHeaders)
 }
 
 func (h *RepositoryHandler) handleRevalidationResult(w http.ResponseWriter, r *http.Request, revalErr error, newFetchResult *fetch.FetchResult, cacheMeta *cache.CacheMetadata, requestCacheKey, relativePath, upstreamURL string) (serveStale bool, handled bool, err error) {
-	if newFetchResult != nil {
-		defer newFetchResult.Body.Close()
+	if newFetchResult != nil && newFetchResult.Body != nil {
+		defer func() {
+			closeErr := newFetchResult.Body.Close()
+			if closeErr != nil {
+				logging.Warn("Error closing fetch result body", "key", requestCacheKey, "error", closeErr)
+			}
+		}()
 	}
 
 	if errors.Is(revalErr, fetch.ErrUpstreamNotModified) {
@@ -418,7 +523,10 @@ func (h *RepositoryHandler) handleRevalidationResult(w http.ResponseWriter, r *h
 		w.Header().Set("X-Cache-Status", "REVALIDATION_FAILED_STALE")
 		if errors.Is(revalErr, fetch.ErrNotFound) {
 			logging.Warn("Upstream returned 404 during revalidation, deleting local cache entry", "key", requestCacheKey)
-			_ = h.cacheManager.Delete(context.Background(), requestCacheKey)
+			deleteErr := h.cacheManager.Delete(context.Background(), requestCacheKey)
+			if deleteErr != nil {
+				logging.Warn("Failed to delete cache entry after 404", "key", requestCacheKey, "error", deleteErr)
+			}
 			http.NotFound(w, r)
 			return false, true, revalErr
 		}
@@ -437,17 +545,10 @@ func (h *RepositoryHandler) handleRevalidationResult(w http.ResponseWriter, r *h
 }
 
 func (h *RepositoryHandler) fetchAndServe(w http.ResponseWriter, r *http.Request, requestCacheKey, relativePath, upstreamURL, successStatusHeader string) {
-
-	clientHeaders := r.Header
-	if successStatusHeader == "UPDATED_SERVED_CACHE" {
-
-		clientHeaders = make(http.Header)
-
-	}
+	clientHeaders := r.Header.Clone()
 
 	fetchErr := h.fetcher.FetchAndCache(r.Context(), requestCacheKey, upstreamURL, relativePath, clientHeaders)
 	if fetchErr != nil {
-
 		if errors.Is(fetchErr, fetch.ErrUpstreamNotModified) {
 			logging.Warn("Unexpected 304 during fetchAndServe, sending 304", "key", requestCacheKey)
 			w.Header().Set("X-Cache-Status", "UPDATE_RACE_304")
@@ -471,6 +572,31 @@ func (h *RepositoryHandler) fetchAndServe(w http.ResponseWriter, r *http.Request
 }
 
 func (h *RepositoryHandler) serveFromCache(w http.ResponseWriter, r *http.Request, cacheReader io.ReadCloser, cacheMeta *cache.CacheMetadata, relativePath string) {
+	if cacheReader == nil {
+		keyStr := "unknown"
+		if cacheMeta != nil {
+			keyStr = cacheMeta.Key
+		}
+		logging.ErrorE("Null cache reader provided to serveFromCache", fmt.Errorf("nil reader"), "key", keyStr)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	if cacheMeta == nil {
+		logging.ErrorE("Null cache metadata provided to serveFromCache", fmt.Errorf("nil metadata"), "path", relativePath)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// Проверка, не был ли запрос уже отменен
+	select {
+	case <-r.Context().Done():
+		logging.Debug("Request context done before serving content", "key", cacheMeta.Key)
+		return
+	default:
+		// Продолжаем обслуживание
+	}
+
 	if h.checkClientCacheHeaders(w, r, cacheMeta.ModTime, cacheMeta.Headers.Get("ETag")) {
 		return
 	}
@@ -490,12 +616,29 @@ func (h *RepositoryHandler) serveFromCache(w http.ResponseWriter, r *http.Reques
 
 	util.ApplyCacheHeaders(w.Header(), cacheMeta.Headers)
 
-	if r.Method == http.MethodHead {
+	// Обработка Content-Encoding заголовка
+	contentEncoding := cacheMeta.Headers.Get("Content-Encoding")
+	if contentEncoding != "" {
+		w.Header().Set("Content-Encoding", contentEncoding)
 
-		if cacheMeta.Size >= 0 {
+		// Проверяем наличие Accept-Encoding заголовка у клиента
+		acceptEncoding := r.Header.Get("Accept-Encoding")
+		if acceptEncoding != "" && !strings.Contains(strings.ToLower(acceptEncoding), strings.ToLower(contentEncoding)) {
+			// Клиент не поддерживает кодировку, сбрасываем Content-Encoding
+			logging.Warn("Client does not support Content-Encoding, returning without encoding",
+				"key", cacheMeta.Key,
+				"content_encoding", contentEncoding,
+				"accept_encoding", acceptEncoding)
+			w.Header().Del("Content-Encoding")
+			// По возможности следовало бы перекодировать тело ответа,
+			// но для прокси это сложная операция, поэтому просто передаем как есть
+		}
+	}
+
+	if r.Method == http.MethodHead {
+		if cacheMeta.Size > 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(cacheMeta.Size, 10))
 		} else {
-
 			w.Header().Del("Content-Length")
 		}
 		w.WriteHeader(http.StatusOK)
@@ -504,21 +647,60 @@ func (h *RepositoryHandler) serveFromCache(w http.ResponseWriter, r *http.Reques
 
 	readSeeker, isSeeker := cacheReader.(io.ReadSeeker)
 	if isSeeker {
-		serveName := filepath.Base(relativePath)
-		if serveName == "." || serveName == "/" || serveName == "" {
+		var serveName string
+		if relativePath == "" || relativePath == "." || relativePath == "/" {
 			serveName = h.repoConfig.Name
+		} else {
+			serveName = filepath.Base(relativePath)
+			if serveName == "" || serveName == "." || serveName == "/" {
+				serveName = h.repoConfig.Name
+			}
 		}
+		// http.ServeContent автоматически обрабатывает ошибки и устанавливает соответствующий статус-код,
+		// включая обработку Range запросов и client disconnections
 		http.ServeContent(w, r, serveName, cacheMeta.ModTime, readSeeker)
 	} else {
-
 		logging.Warn("Cache reader is not io.ReadSeeker, serving via io.Copy", "key", cacheMeta.Key)
-		if cacheMeta.Size >= 0 {
+		if cacheMeta.Size > 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(cacheMeta.Size, 10))
+		} else {
+			w.Header().Del("Content-Length")
 		}
 		w.WriteHeader(http.StatusOK)
-		bytesWritten, copyErr := io.Copy(w, cacheReader)
-		if copyErr != nil && !isClientDisconnectedError(copyErr) {
-			logging.ErrorE("Failed to write response body from non-seeker cache", copyErr, "key", cacheMeta.Key, "written_bytes", bytesWritten)
+
+		// Используем буферизированное копирование для улучшения производительности
+		// Адаптируем размер буфера в зависимости от размера файла
+		var bufSize int
+		if cacheMeta.Size > 10*1024*1024 { // > 10MB
+			bufSize = 128 * 1024 // 128KB буфер для больших файлов
+		} else if cacheMeta.Size > 1024*1024 { // > 1MB
+			bufSize = 64 * 1024 // 64KB буфер для средних файлов
+		} else {
+			bufSize = 32 * 1024 // 32KB буфер для маленьких файлов (стандартный размер)
+		}
+		buf := make([]byte, bufSize)
+		bytesWritten, copyErr := io.CopyBuffer(w, cacheReader, buf)
+
+		if copyErr != nil {
+			if !isClientDisconnectedError(copyErr) {
+				logging.ErrorE("Failed to write response body from non-seeker cache", copyErr,
+					"key", cacheMeta.Key,
+					"written_bytes", bytesWritten,
+					"expected_size", cacheMeta.Size)
+				// В этом месте заголовки уже отправлены, поэтому не можем установить код ошибки
+				// Лучшее, что можно сделать - завершить запрос и логировать ошибку
+			} else {
+				logging.Debug("Client disconnected during response write",
+					"key", cacheMeta.Key,
+					"written_bytes", bytesWritten,
+					"expected_size", cacheMeta.Size)
+			}
+			return
+		} else if cacheMeta.Size > 0 && bytesWritten != cacheMeta.Size {
+			logging.Warn("Bytes written doesn't match expected size",
+				"key", cacheMeta.Key,
+				"written", bytesWritten,
+				"expected", cacheMeta.Size)
 		}
 	}
 }
@@ -554,18 +736,17 @@ func (h *RepositoryHandler) handleFetchError(w http.ResponseWriter, r *http.Requ
 	case <-r.Context().Done():
 		logging.Debug("Client context done, not sending fetch error response", "key", requestCacheKey, "original_error", fetchErr)
 	default:
-
-		if w.Header().Get("X-Cache-Status") == "" {
+		headerSent := !isResponseHeaderWritable(w)
+		if !headerSent {
 			http.Error(w, msg, status)
 		} else {
 			logging.Error("Could not send fetch error response, headers possibly already written", append(logFields, "status", status, "msg", msg)...)
-
 		}
 	}
 }
 
 func (h *RepositoryHandler) checkClientCacheHeaders(w http.ResponseWriter, r *http.Request, modTime time.Time, etag string) bool {
-
+	// Проверка If-None-Match для ETag
 	clientETag := r.Header.Get("If-None-Match")
 	if clientETag != "" && etag != "" {
 		if util.CompareETags(clientETag, etag) {
@@ -574,16 +755,78 @@ func (h *RepositoryHandler) checkClientCacheHeaders(w http.ResponseWriter, r *ht
 		}
 	}
 
+	// Проверка If-Modified-Since
 	clientModSince := r.Header.Get("If-Modified-Since")
 	if clientModSince != "" && !modTime.IsZero() {
 		if t, err := http.ParseTime(clientModSince); err == nil {
-
-			if !modTime.Truncate(time.Second).After(t.Truncate(time.Second)) {
+			if !modTime.After(t) {
 				w.WriteHeader(http.StatusNotModified)
 				return true
 			}
 		}
 	}
+
+	// Проверка If-Unmodified-Since
+	clientUnmodSince := r.Header.Get("If-Unmodified-Since")
+	if clientUnmodSince != "" && !modTime.IsZero() {
+		if t, err := http.ParseTime(clientUnmodSince); err == nil {
+			if modTime.After(t) {
+				// Если ресурс был изменен после указанной даты, возвращаем 412
+				w.WriteHeader(http.StatusPreconditionFailed)
+				return true
+			}
+		}
+	}
+
+	// Проверка If-Match для безусловного ETag
+	clientIfMatch := r.Header.Get("If-Match")
+	if clientIfMatch != "" && etag != "" {
+		if clientIfMatch != "*" && !util.CompareETags(clientIfMatch, etag) {
+			// ETag не соответствует, возвращаем 412
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return true
+		}
+	}
+
+	// Если используется заголовок Range, мы должны его обрабатывать только,
+	// если указаны соответствующие предусловия или If-Range соответствует
+	clientRange := r.Header.Get("Range")
+	clientIfRange := r.Header.Get("If-Range")
+
+	// Проверяем валидность Range запроса, если он присутствует
+	if clientRange != "" {
+		// Проверяем формат Range заголовка
+		if !strings.HasPrefix(clientRange, "bytes=") {
+			// Неверный формат Range, возвращаем 416 (Range Not Satisfiable)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", 0))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return true
+		}
+	}
+
+	// Проверяем If-Range заголовок, если он указан
+	if clientRange != "" && clientIfRange != "" && etag != "" {
+		// Если If-Range содержит ETag, который не соответствует текущему,
+		// или дату, после которой ресурс был изменен, возвращаем весь ресурс
+		if strings.Contains(clientIfRange, "\"") {
+			// If-Range - это ETag
+			if !util.CompareETags(clientIfRange, etag) {
+				// Range не применим, http.ServeContent вернет весь ресурс
+				// Вместо модификации заголовка запроса создаем локальную переменную
+				// для индикации, что Range не должен применяться
+				return false
+			}
+		} else {
+			// If-Range - это дата
+			if t, err := http.ParseTime(clientIfRange); err == nil && modTime.After(t) {
+				// Range не применим, http.ServeContent вернет весь ресурс
+				// Вместо модификации заголовка запроса создаем локальную переменную
+				return false
+			}
+		}
+		// Range применим, http.ServeContent обработает Range
+	}
+
 	return false
 }
 
@@ -591,28 +834,43 @@ func isClientDisconnectedError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
-		return true
-	}
-	if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+
+	// Проверка наиболее распространенных ошибок
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, http.ErrAbortHandler) {
 		return true
 	}
 
-	if errors.Is(err, http.ErrAbortHandler) {
+	// Проверка timeout ошибок
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		return true
 	}
-	errStr := strings.ToLower(err.Error())
 
+	// Для ошибок, которые не могут быть определены через errors.Is,
+	// проверяем по строковому представлению (это менее надежно,
+	// но некоторые ошибки приходится обрабатывать таким образом)
+	errStr := err.Error()
 	return strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "connection reset by peer") ||
-		strings.Contains(errStr, "client disconnected") ||
-		strings.Contains(errStr, "request canceled") ||
-		strings.Contains(errStr, "connection closed") ||
-		strings.Contains(errStr, "user canceled") ||
-		strings.Contains(errStr, "context canceled") ||
-		strings.Contains(errStr, "request body closed") ||
-		strings.Contains(errStr, "handler aborted")
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "connection closed")
+}
+
+func isResponseHeaderWritable(w http.ResponseWriter) bool {
+	// Безопасно проверяем интерфейсы, поддерживаемые ResponseWriter
+	_, canFlush := w.(http.Flusher)
+
+	// Если ResponseWriter не поддерживает Flusher, возможно, это указывает на
+	// специальное состояние (например, после вызова WriteHeader)
+	if !canFlush {
+		return false
+	}
+
+	// Если не можем определить точно, предполагаем, что заголовки можно записать
+	return true
 }

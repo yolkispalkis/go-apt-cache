@@ -172,6 +172,7 @@ func (c *DiskLRUCache) initialize() {
 		if err := c.store.cleanDirectory(); err != nil {
 			c.initErr = fmt.Errorf("cache clean failed: %w", err)
 			logging.ErrorE("Cache clean failed", c.initErr)
+			return
 		}
 		c.mu.Lock()
 		c.currentSize = 0
@@ -280,13 +281,17 @@ func (c *DiskLRUCache) Get(ctx context.Context, key string) (io.ReadCloser, *Cac
 
 	contentInfo, statErr := contentFile.Stat()
 	if statErr != nil {
-		_ = contentFile.Close()
+		if closeErr := contentFile.Close(); closeErr != nil {
+			logging.ErrorE("Failed to close content file during stat error", closeErr, "key", key)
+		}
 		c.handleInconsistency(key, "content_stat_error", fmt.Errorf("failed to stat content file: %w", statErr))
 		return nil, nil, os.ErrNotExist
 	}
 
 	if metadata.Size >= 0 && contentInfo.Size() != metadata.Size {
-		_ = contentFile.Close()
+		if closeErr := contentFile.Close(); closeErr != nil {
+			logging.ErrorE("Failed to close content file during size mismatch", closeErr, "key", key)
+		}
 		c.handleInconsistency(key, "size_mismatch_on_get", fmt.Errorf("metadata size %d != file size %d", metadata.Size, contentInfo.Size()))
 		return nil, nil, os.ErrNotExist
 	} else if metadata.Size < 0 {
@@ -397,12 +402,20 @@ func (c *DiskLRUCache) deleteInternalLocked(key string) (size int64, exists bool
 		return 0, false
 	}
 
-	c.lruList.Remove(entry.element)
+	if entry.element != nil {
+		c.lruList.Remove(entry.element)
+	} else {
+		logging.Warn("LRU list element is nil for key", "key", key)
+	}
+
 	delete(c.items, key)
 	c.currentSize -= entry.size
 
 	if c.currentSize < 0 {
-		logging.Error("Internal error: current cache size negative after deleteInternalLocked", "size", c.currentSize, "key", key, "deleted_size", entry.size)
+		logging.Error("Internal error: current cache size negative after deleteInternalLocked",
+			"size", c.currentSize,
+			"key", key,
+			"deleted_size", entry.size)
 		c.currentSize = 0
 	}
 
@@ -411,6 +424,12 @@ func (c *DiskLRUCache) deleteInternalLocked(key string) (size int64, exists bool
 
 func (c *DiskLRUCache) deleteFilesAsync(key string) {
 	go func(k string) {
+		select {
+		case <-c.closed:
+			return
+		default:
+		}
+
 		err := c.store.deleteFiles(k)
 		if err != nil {
 			logging.ErrorE("Cache delete files async failed", err, "key", k)
@@ -470,14 +489,18 @@ func (c *DiskLRUCache) evictLocked(spaceToFree int64) {
 			break
 		}
 
-		entry := element.Value.(*cacheEntry)
-		size, existed := c.deleteInternalLocked(entry.key)
+		if entry, ok := element.Value.(*cacheEntry); ok {
+			size, existed := c.deleteInternalLocked(entry.key)
 
-		if existed {
-			freedSpace += size
-			itemsEvicted++
-			c.deleteFilesAsync(entry.key)
+			if existed {
+				freedSpace += size
+				itemsEvicted++
+				c.deleteFilesAsync(entry.key)
+			} else {
+				c.lruList.Remove(element)
+			}
 		} else {
+			logging.Error("Invalid cache entry type found in LRU list", "value_type", fmt.Sprintf("%T", element.Value))
 			c.lruList.Remove(element)
 		}
 	}
@@ -582,32 +605,18 @@ func (c *DiskLRUCache) GetValidation(key string) (validationTime time.Time, ok b
 		return time.Time{}, false
 	}
 
-	c.valMu.RLock()
-	element, exists := c.validations[key]
-	if !exists {
-		c.valMu.RUnlock()
-		return time.Time{}, false
-	}
-	entry := element.Value.(*validationEntry)
-	validatedAt := entry.validated
-	isExpired := time.Since(validatedAt) > ttl
-	c.valMu.RUnlock()
-
-	if isExpired {
-		c.deleteValidationAsync(key)
-		return time.Time{}, false
-	}
-
 	c.valMu.Lock()
 	defer c.valMu.Unlock()
 
-	element, stillExists := c.validations[key]
-	if !stillExists {
+	element, exists := c.validations[key]
+	if !exists {
 		return time.Time{}, false
 	}
 
-	currentEntry := element.Value.(*validationEntry)
-	if time.Since(currentEntry.validated) > ttl {
+	entry := element.Value.(*validationEntry)
+	validatedAt := entry.validated
+
+	if time.Since(validatedAt) > ttl {
 		c.valLruList.Remove(element)
 		delete(c.validations, key)
 		return time.Time{}, false
@@ -615,10 +624,8 @@ func (c *DiskLRUCache) GetValidation(key string) (validationTime time.Time, ok b
 
 	c.valLruList.MoveToFront(element)
 	c.statsValidationHits.Add(1)
-	validationTime = currentEntry.validated
-	ok = true
 
-	return validationTime, ok
+	return validatedAt, true
 }
 
 func (c *DiskLRUCache) PutValidation(key string, validationTime time.Time) {
@@ -642,15 +649,4 @@ func (c *DiskLRUCache) PutValidation(key string, validationTime time.Time) {
 		element := c.valLruList.PushFront(entry)
 		c.validations[key] = element
 	}
-}
-
-func (c *DiskLRUCache) deleteValidationAsync(key string) {
-	go func(k string) {
-		c.valMu.Lock()
-		if element, exists := c.validations[k]; exists {
-			c.valLruList.Remove(element)
-			delete(c.validations, k)
-		}
-		c.valMu.Unlock()
-	}(key)
 }

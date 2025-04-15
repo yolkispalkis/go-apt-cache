@@ -93,7 +93,7 @@ func NewCoordinator(requestTimeout time.Duration, maxConcurrent int, cm cache.Ca
 }
 
 func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, relativePath string, clientHeader http.Header) error {
-	_, err, _ := c.fetchGroup.Do(cacheKey, func() (interface{}, error) {
+	_, err, shared := c.fetchGroup.Do(cacheKey, func() (interface{}, error) {
 		fetchStartTime := time.Now()
 		logging.Debug("Singleflight: Initiating fetch and cache", "key", cacheKey, "url", upstreamURL)
 
@@ -105,9 +105,11 @@ func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, 
 		}
 
 		if fetchErr != nil {
-
 			logging.ErrorE("Singleflight: Fetch failed", fetchErr, "key", cacheKey, "url", upstreamURL)
 			return nil, fmt.Errorf("fetch failed for %s: %w", cacheKey, fetchErr)
+		}
+		if fetchResult == nil {
+			return nil, fmt.Errorf("fetch returned nil result for %s", cacheKey)
 		}
 		defer fetchResult.Body.Close()
 
@@ -136,7 +138,7 @@ func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, 
 		if putErr != nil {
 			logging.ErrorE("Singleflight: Failed to write item to cache", putErr, "key", cacheKey)
 
-			_ = c.cacheManager.Delete(context.Background(), cacheKey)
+			_ = c.cacheManager.Delete(ctx, cacheKey)
 			return nil, fmt.Errorf("%w: %w", ErrCacheWriteFailed, putErr)
 		}
 
@@ -150,16 +152,19 @@ func (c *Coordinator) FetchAndCache(ctx context.Context, cacheKey, upstreamURL, 
 		return nil, nil
 	})
 
+	if shared {
+		logging.Debug("Singleflight: Request was shared with another in-flight request", "key", cacheKey, "url", upstreamURL)
+	}
+
 	return err
 }
 
 func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, clientHeader http.Header) (*FetchResult, error) {
-	v, err, _ := c.fetchGroup.Do(fetchKey, func() (interface{}, error) {
+	v, err, shared := c.fetchGroup.Do(fetchKey, func() (interface{}, error) {
 		fetchStartTime := time.Now()
 		result, fetchErr := c.doFetch(ctx, upstreamURL, clientHeader)
 		fetchDuration := time.Since(fetchStartTime)
 		if fetchErr != nil {
-
 			if errors.Is(fetchErr, ErrUpstreamNotModified) {
 				logging.Debug("Singleflight: Fetch completed with 304 Not Modified", "key", fetchKey, "url", upstreamURL, "duration", util.FormatDuration(fetchDuration))
 			} else {
@@ -173,8 +178,11 @@ func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, c
 		return result, fetchErr
 	})
 
-	if err != nil {
+	if shared {
+		logging.Debug("Singleflight: Request was shared with another in-flight request", "key", fetchKey, "url", upstreamURL)
+	}
 
+	if err != nil {
 		if errors.Is(err, ErrUpstreamNotModified) {
 			return nil, ErrUpstreamNotModified
 		}
@@ -183,7 +191,6 @@ func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, c
 
 	result, ok := v.(*FetchResult)
 	if !ok {
-
 		if v == nil && errors.Is(err, ErrUpstreamNotModified) {
 			return nil, ErrUpstreamNotModified
 		}
@@ -197,8 +204,10 @@ func (c *Coordinator) Fetch(ctx context.Context, fetchKey, upstreamURL string, c
 }
 
 func (c *Coordinator) FetchForRevalidation(ctx context.Context, revalKey, upstreamURL string, conditionalHeaders http.Header) (*FetchResult, error) {
+	revalFlightKey := "revalidate:" + revalKey
+
 	logging.Debug("Revalidation: Sending conditional request via Fetch", "key", revalKey, "url", upstreamURL, "headers", conditionalHeaders)
-	fetchResult, fetchErr := c.Fetch(ctx, revalKey, upstreamURL, conditionalHeaders)
+	fetchResult, fetchErr := c.Fetch(ctx, revalFlightKey, upstreamURL, conditionalHeaders)
 
 	if fetchErr != nil {
 		if errors.Is(fetchErr, ErrUpstreamNotModified) {
@@ -214,6 +223,11 @@ func (c *Coordinator) FetchForRevalidation(ctx context.Context, revalKey, upstre
 }
 
 func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHeader http.Header) (*FetchResult, error) {
+	_, err := url.Parse(upstreamURL)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid upstream URL: %w", ErrRequestConfiguration, err)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to create upstream request: %w", ErrRequestConfiguration, err)
@@ -245,6 +259,10 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}
 
+	if resp == nil {
+		return nil, fmt.Errorf("http client returned nil response for %s", upstreamURL)
+	}
+
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent:
 	case http.StatusNotModified:
@@ -256,8 +274,18 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 	default:
 		statusCode := resp.StatusCode
 		statusText := resp.Status
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		resp.Body.Close()
+
+		var bodyBytes []byte
+		var readErr error
+
+		if resp.Body != nil {
+			bodyBytes, readErr = io.ReadAll(io.LimitReader(resp.Body, 512))
+			if readErr != nil {
+				logging.Warn("Failed to read error response body", "error", readErr, "url", upstreamURL)
+			}
+			resp.Body.Close()
+		}
+
 		logging.Error("Upstream returned error status",
 			"status_code", statusCode,
 			"status_text", statusText,
@@ -265,6 +293,10 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, clientHea
 			"response_snippet", string(bodyBytes),
 		)
 		return nil, fmt.Errorf("%w: %s", ErrUpstreamError, statusText)
+	}
+
+	if resp.Body == nil {
+		return nil, fmt.Errorf("upstream returned nil body with status %d", resp.StatusCode)
 	}
 
 	size := int64(-1)
