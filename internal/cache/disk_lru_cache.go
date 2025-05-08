@@ -23,8 +23,7 @@ import (
 
 type lruEntry struct {
 	key  string
-	size int64
-	elem *list.Element
+	meta *ItemMeta
 }
 
 type DiskLRU struct {
@@ -36,7 +35,7 @@ type DiskLRU struct {
 	negTTL   time.Duration
 
 	mu           sync.RWMutex
-	items        map[string]*ItemMeta
+	items        map[string]*list.Element
 	lruList      *list.List
 	currentBytes atomic.Int64
 
@@ -48,7 +47,6 @@ type DiskLRU struct {
 func NewDiskLRU(cfg config.CacheConfig, logger zerolog.Logger) (*DiskLRU, error) {
 	if !cfg.Enabled {
 		logger.Info().Msg("Cache disabled in configuration.")
-
 		return &DiskLRU{cfg: cfg, log: logger, ready: true}, nil
 	}
 
@@ -80,7 +78,7 @@ func NewDiskLRU(cfg config.CacheConfig, logger zerolog.Logger) (*DiskLRU, error)
 		maxBytes: maxBytes,
 		defTTL:   cfg.DefaultTTL.StdDuration(),
 		negTTL:   cfg.NegativeTTL.StdDuration(),
-		items:    make(map[string]*ItemMeta),
+		items:    make(map[string]*list.Element),
 		lruList:  list.New(),
 	}, nil
 }
@@ -114,9 +112,11 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 			return
 		}
 
-		type itemToSort struct{ meta *ItemMeta }
+		type itemToSort struct {
+			key  string
+			meta *ItemMeta
+		}
 		var itemsToLoad []itemToSort
-
 		var currentSizeOnDisk int64
 		loadedCount := 0
 
@@ -151,8 +151,10 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 					continue
 				}
 			}
-			itemsToLoad = append(itemsToLoad, itemToSort{meta: meta})
-			currentSizeOnDisk += meta.Size
+			itemsToLoad = append(itemsToLoad, itemToSort{key: meta.Key, meta: meta})
+			if meta.StatusCode != http.StatusNotFound {
+				currentSizeOnDisk += meta.Size
+			}
 			loadedCount++
 		}
 
@@ -161,9 +163,9 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 		})
 
 		for _, item := range itemsToLoad {
-			c.items[item.meta.Key] = item.meta
-			entry := &lruEntry{key: item.meta.Key, size: item.meta.Size}
-			entry.elem = c.lruList.PushFront(entry)
+			entry := &lruEntry{key: item.key, meta: item.meta}
+			listElement := c.lruList.PushFront(entry)
+			c.items[item.key] = listElement
 		}
 		c.currentBytes.Store(currentSizeOnDisk)
 
@@ -179,7 +181,7 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 				Str("max_size", util.FormatSize(c.maxBytes)).
 				Msg("Cache size exceeds maximum after init, performing eviction.")
 
-			c.evictItems(c.currentBytes.Load()-c.maxBytes, false)
+			c.evictItems(c.currentBytes.Load()-c.maxBytes, true)
 		}
 		c.ready = true
 	})
@@ -202,12 +204,15 @@ func (c *DiskLRU) Get(ctx context.Context, key string) (*GetResult, error) {
 	}
 
 	c.mu.RLock()
-	meta, exists := c.items[key]
+	listElement, exists := c.items[key]
 	c.mu.RUnlock()
 
 	if !exists {
 		return nil, ErrNotFound
 	}
+
+	entry := listElement.Value.(*lruEntry)
+	meta := entry.meta
 
 	if meta.StatusCode == http.StatusNotFound {
 		if c.negTTL > 0 && time.Since(meta.FetchedAt) > c.negTTL {
@@ -284,27 +289,27 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, exists := c.items[key]; exists {
+	if oldElement, exists := c.items[key]; exists {
 		c.log.Debug().Str("key", key).Msg("Replacing existing item in cache.")
-		c.removeItemLocked(key, false)
+		c.removeItemLocked(oldElement.Value.(*lruEntry).key, false)
 	}
 
 	if c.maxBytes > 0 && meta.Size > c.maxBytes {
 		c.log.Warn().Str("key", key).
 			Str("item_size", util.FormatSize(meta.Size)).
 			Str("max_cache_size", util.FormatSize(c.maxBytes)).
-			Msg("Item size exceeds max cache size, not caching.")
+			Msg("Item size exceeds max cache size, not caching. Cleaning up written files.")
 		_ = c.store.deleteFiles(meta.Path, meta.MetaPath)
 		return nil, errors.New("item size exceeds maximum cache size")
 	}
 
-	if c.currentBytes.Load()+meta.Size > c.maxBytes {
+	if c.currentBytes.Load()+meta.Size > c.maxBytes && c.maxBytes > 0 {
 		c.evictItemsLocked((c.currentBytes.Load()+meta.Size)-c.maxBytes, true)
 	}
 
-	c.items[key] = meta
-	entry := &lruEntry{key: key, size: meta.Size}
-	entry.elem = c.lruList.PushFront(entry)
+	entry := &lruEntry{key: key, meta: meta}
+	listElement := c.lruList.PushFront(entry)
+	c.items[key] = listElement
 	c.currentBytes.Add(meta.Size)
 
 	c.log.Debug().Str("key", key).Str("size", util.FormatSize(meta.Size)).Msg("Item added to cache.")
@@ -339,14 +344,14 @@ func (c *DiskLRU) putNegativeEntry(_ context.Context, key string, opts PutOption
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, exists := c.items[key]; exists {
-		c.log.Debug().Str("key", key).Msg("Replacing existing item (was not 404 or was different 404) with new negative entry.")
-		c.removeItemLocked(key, true)
+	if oldElement, exists := c.items[key]; exists {
+		c.log.Debug().Str("key", key).Msg("Replacing existing item with new negative entry.")
+		c.removeItemLocked(oldElement.Value.(*lruEntry).key, true)
 	}
 
-	c.items[key] = meta
-	entry := &lruEntry{key: key, size: 0}
-	entry.elem = c.lruList.PushFront(entry)
+	entry := &lruEntry{key: key, meta: meta}
+	listElement := c.lruList.PushFront(entry)
+	c.items[key] = listElement
 
 	return meta, nil
 }
@@ -363,6 +368,7 @@ func (c *DiskLRU) calculateExpiresAt(headers http.Header, fetchedAt time.Time) t
 		if _, ok := directives["no-store"]; ok {
 			return time.Time{}
 		}
+
 		if _, ok := directives["no-cache"]; ok {
 			return fetchedAt
 		}
@@ -370,6 +376,7 @@ func (c *DiskLRU) calculateExpiresAt(headers http.Header, fetchedAt time.Time) t
 
 	if expiresHeader := headers.Get("Expires"); expiresHeader != "" {
 		if expiresTime, err := http.ParseTime(expiresHeader); err == nil {
+
 			if expiresTime.Before(fetchedAt) || expiresTime.Equal(fetchedAt) {
 				return fetchedAt
 			}
@@ -400,32 +407,23 @@ func (c *DiskLRU) Delete(ctx context.Context, key string) error {
 }
 
 func (c *DiskLRU) removeItemLocked(key string, deleteFilesFromDisk bool) {
-	meta, exists := c.items[key]
+	listElement, exists := c.items[key]
 	if !exists {
 		return
 	}
 
-	var targetElement *list.Element
-	for e := c.lruList.Front(); e != nil; e = e.Next() {
-		entry, ok := e.Value.(*lruEntry)
-		if ok && entry.key == key {
-			targetElement = e
-			break
-		}
-	}
+	entry := listElement.Value.(*lruEntry)
+	meta := entry.meta
 
-	if targetElement != nil {
-		c.lruList.Remove(targetElement)
-	} else {
-		c.log.Warn().Str("key", key).Msg("Item in map but not in LRU list during remove. Potential inconsistency.")
-	}
-
+	c.lruList.Remove(listElement)
 	delete(c.items, key)
+
 	if meta.StatusCode != http.StatusNotFound {
 		c.currentBytes.Add(-meta.Size)
 	}
 
 	if deleteFilesFromDisk {
+
 		if err := c.store.deleteFiles(meta.Path, meta.MetaPath); err != nil {
 			c.log.Error().Err(err).Str("key", key).Msg("Failed to delete cache files from disk.")
 		}
@@ -441,30 +439,27 @@ func (c *DiskLRU) MarkUsed(ctx context.Context, key string) error {
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	meta, exists := c.items[key]
+	listElement, exists := c.items[key]
 	if !exists {
+		c.mu.Unlock()
 		return ErrNotFound
 	}
 
-	meta.LastUsedAt = time.Now()
+	entry := listElement.Value.(*lruEntry)
+	entry.meta.LastUsedAt = time.Now()
 
-	if err := c.store.writeMetadata(meta.MetaPath, meta); err != nil {
-		c.log.Warn().Err(err).Str("key", key).Msg("Failed to update metadata file on MarkUsed")
-	}
+	c.lruList.MoveToFront(listElement)
 
-	foundInLRU := false
-	for e := c.lruList.Front(); e != nil; e = e.Next() {
-		if entry, ok := e.Value.(*lruEntry); ok && entry.key == key {
-			c.lruList.MoveToFront(e)
-			foundInLRU = true
-			break
+	metaSnapshot := *entry.meta
+
+	c.mu.Unlock()
+
+	go func(mSnap ItemMeta) {
+		if err := c.store.writeMetadata(mSnap.MetaPath, &mSnap); err != nil {
+			c.log.Warn().Err(err).Str("key", mSnap.Key).Msg("Failed to update metadata file on MarkUsed (async)")
 		}
-	}
-	if !foundInLRU {
-		c.log.Warn().Str("key", key).Msg("Item marked used but not found in LRU list (potentially new or inconsistent state).")
-	}
+	}(metaSnapshot)
+
 	return nil
 }
 
@@ -477,37 +472,38 @@ func (c *DiskLRU) UpdateValidatedAt(ctx context.Context, key string, validatedAt
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	meta, exists := c.items[key]
+	listElement, exists := c.items[key]
 	if !exists {
+		c.mu.Unlock()
 		return ErrNotFound
 	}
 
-	meta.ValidatedAt = validatedAt
-	meta.LastUsedAt = time.Now()
+	entry := listElement.Value.(*lruEntry)
+	entry.meta.ValidatedAt = validatedAt
+	entry.meta.LastUsedAt = time.Now()
 
-	if err := c.store.writeMetadata(meta.MetaPath, meta); err != nil {
+	c.lruList.MoveToFront(listElement)
+
+	metaSnapshot := *entry.meta
+	c.mu.Unlock()
+
+	if err := c.store.writeMetadata(metaSnapshot.MetaPath, &metaSnapshot); err != nil {
 		c.log.Warn().Err(err).Str("key", key).Msg("Failed to update metadata file on UpdateValidatedAt")
-	}
-
-	for e := c.lruList.Front(); e != nil; e = e.Next() {
-		if entry, ok := e.Value.(*lruEntry); ok && entry.key == key {
-			c.lruList.MoveToFront(e)
-			break
-		}
+		return err
 	}
 	return nil
 }
 
 func (c *DiskLRU) evictItemsLocked(requiredSpaceToFree int64, deleteFiles bool) {
+
 	if requiredSpaceToFree <= 0 && c.currentBytes.Load() <= c.maxBytes {
 		return
 	}
 
 	c.log.Info().
-		Str("required_space", util.FormatSize(requiredSpaceToFree)).
+		Str("required_space_to_free", util.FormatSize(requiredSpaceToFree)).
 		Str("current_size", util.FormatSize(c.currentBytes.Load())).
+		Str("max_size", util.FormatSize(c.maxBytes)).
 		Msg("Starting eviction process.")
 
 	freedSpace := int64(0)
@@ -519,31 +515,24 @@ func (c *DiskLRU) evictItemsLocked(requiredSpaceToFree int64, deleteFiles bool) 
 			break
 		}
 
-		entry, ok := tailElement.Value.(*lruEntry)
+		entryToEvict, ok := tailElement.Value.(*lruEntry)
 		if !ok {
 			c.lruList.Remove(tailElement)
 			continue
 		}
 
-		meta, metaExists := c.items[entry.key]
-		if !metaExists {
-			c.log.Warn().Str("key", entry.key).Msg("Item in LRU list but not in metadata map during eviction. Removing from LRU.")
-			c.lruList.Remove(tailElement)
-			continue
-		}
+		c.log.Debug().Str("key", entryToEvict.key).Str("size", util.FormatSize(entryToEvict.meta.Size)).Time("last_used", entryToEvict.meta.LastUsedAt).Msg("Evicting item.")
+		c.removeItemLocked(entryToEvict.key, deleteFiles)
 
-		c.log.Debug().Str("key", entry.key).Str("size", util.FormatSize(entry.size)).Msg("Evicting item.")
-		c.removeItemLocked(entry.key, deleteFiles)
-
-		if meta.StatusCode != http.StatusNotFound {
-			freedSpace += entry.size
+		if entryToEvict.meta.StatusCode != http.StatusNotFound {
+			freedSpace += entryToEvict.meta.Size
 		}
 		itemsEvicted++
 	}
 	c.log.Info().
 		Int("items_evicted", itemsEvicted).
 		Str("space_freed", util.FormatSize(freedSpace)).
-		Str("new_size", util.FormatSize(c.currentBytes.Load())).
+		Str("new_cache_size", util.FormatSize(c.currentBytes.Load())).
 		Msg("Eviction process finished.")
 }
 
@@ -566,12 +555,13 @@ func (c *DiskLRU) Purge(ctx context.Context) error {
 	for k := range c.items {
 		keysToPurge = append(keysToPurge, k)
 	}
+
 	for _, key := range keysToPurge {
 		c.removeItemLocked(key, true)
 	}
 
-	c.items = make(map[string]*ItemMeta)
-	c.lruList = list.New()
+	c.items = make(map[string]*list.Element)
+	c.lruList.Init()
 	c.currentBytes.Store(0)
 
 	c.log.Info().Msg("Cache purge complete.")
@@ -583,6 +573,7 @@ func (c *DiskLRU) Close() error {
 		return nil
 	}
 	c.log.Info().Msg("Closing cache manager.")
+
 	return nil
 }
 

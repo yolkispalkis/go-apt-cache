@@ -119,21 +119,21 @@ func GenerateCacheKey(repo, relPath string) (string, error) {
 	if strings.HasPrefix(cleanRelPath, "/") {
 		cleanRelPath = strings.TrimPrefix(cleanRelPath, "/")
 	}
-	if cleanRelPath == "." {
-		cleanRelPath = ""
+	if cleanRelPath == "." || cleanRelPath == "" {
+		return SanitizeFSComponent(repo), nil
 	}
 
-	parts := []string{SanitizeFSComponent(repo)}
-	if cleanRelPath != "" {
-		for _, p := range strings.Split(cleanRelPath, "/") {
+	var sb strings.Builder
+	sb.WriteString(SanitizeFSComponent(repo))
 
-			if p == "" || p == "." || p == ".." {
-				continue
-			}
-			parts = append(parts, SanitizeFSComponent(p))
+	for _, p := range strings.Split(cleanRelPath, "/") {
+		if p == "" || p == "." || p == ".." {
+			continue
 		}
+		sb.WriteByte('/')
+		sb.WriteString(SanitizeFSComponent(p))
 	}
-	return strings.Join(parts, "/"), nil
+	return sb.String(), nil
 }
 
 func GetContentType(path string) string {
@@ -145,8 +145,10 @@ func GetContentType(path string) string {
 		return "text/plain; charset=utf-8"
 	}
 
-	if strings.HasPrefix(base, "packages") || strings.HasPrefix(base, "sources") ||
-		strings.HasPrefix(base, "translation") || strings.HasPrefix(base, "contents") {
+	if strings.HasPrefix(base, "packages") ||
+		strings.HasPrefix(base, "sources") ||
+		strings.HasPrefix(base, "translation") ||
+		strings.HasPrefix(base, "contents") {
 
 	}
 
@@ -172,8 +174,10 @@ func GetContentType(path string) string {
 	ct := mime.TypeByExtension(ext)
 	if ct == "" {
 
-		if strings.HasPrefix(base, "packages") || strings.HasPrefix(base, "sources") ||
-			strings.HasPrefix(base, "translation") || strings.HasPrefix(base, "contents") {
+		if strings.HasPrefix(base, "packages") ||
+			strings.HasPrefix(base, "sources") ||
+			strings.HasPrefix(base, "translation") ||
+			strings.HasPrefix(base, "contents") {
 			return "text/plain; charset=utf-8"
 		}
 		return "application/octet-stream"
@@ -233,11 +237,13 @@ func IsClientDisconnectedError(err error) bool {
 		return false
 	}
 
-	if errors.Is(err, context.Canceled) || errors.Is(err, http.ErrAbortHandler) ||
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, http.ErrAbortHandler) ||
 		strings.Contains(err.Error(), "broken pipe") ||
 		strings.Contains(err.Error(), "connection reset by peer") {
 		return true
 	}
+
 	var netErr net.Error
 
 	return errors.As(err, &netErr) && (netErr.Timeout() || !netErr.Temporary())
@@ -258,6 +264,7 @@ func CompareETags(clientETagsStr string, resourceETag string) bool {
 	if clientETagsStr == "" || resourceETag == "" {
 		return false
 	}
+
 	if clientETagsStr == "*" {
 		return true
 	}
