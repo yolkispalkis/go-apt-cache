@@ -1,8 +1,11 @@
 package util
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"mime"
+	"net"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -12,10 +15,12 @@ import (
 )
 
 var (
-	sizeRegex        = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT])?B?$`)
-	repoNameRegex    = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
-	unsafeCharsRegex = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
-	reservedNames    = map[string]struct{}{
+	sizeRegex     = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT])?B?$`)
+	repoNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+	fileNameUnsafeCharsRegex = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F\s]+`)
+
+	reservedNames = map[string]struct{}{
 		"con": {}, "prn": {}, "aux": {}, "nul": {},
 		"com1": {}, "com2": {}, "com3": {}, "com4": {}, "com5": {}, "com6": {}, "com7": {}, "com8": {}, "com9": {},
 		"lpt1": {}, "lpt2": {}, "lpt3": {}, "lpt4": {}, "lpt5": {}, "lpt6": {}, "lpt7": {}, "lpt8": {}, "lpt9": {},
@@ -24,16 +29,17 @@ var (
 
 func ParseSize(sizeStr string) (int64, error) {
 	if sizeStr == "" {
-		return 0, nil
+		return 0, errors.New("size string cannot be empty")
 	}
 
-	matches := sizeRegex.FindStringSubmatch(strings.ToUpper(sizeStr))
+	matches := sizeRegex.FindStringSubmatch(strings.ToUpper(strings.TrimSpace(sizeStr)))
 	if matches == nil {
+
 		plainBytes, err := strconv.ParseInt(sizeStr, 10, 64)
 		if err == nil && plainBytes >= 0 {
 			return plainBytes, nil
 		}
-		return 0, fmt.Errorf("invalid size format: %q (expected format like '10GB', '500MB', '1024')", sizeStr)
+		return 0, fmt.Errorf("invalid size format: %q (expected e.g., '10GB', '500MB', '1024')", sizeStr)
 	}
 
 	sizeValue, err := strconv.ParseFloat(matches[1], 64)
@@ -64,18 +70,18 @@ func ParseSize(sizeStr string) (int64, error) {
 	}
 
 	byteSize := int64(sizeValue * multiplier)
-	if sizeValue > 0 && byteSize <= 0 && multiplier > 1 {
-		return 0, fmt.Errorf("size value resulted in non-positive bytes or potential overflow: %q", sizeStr)
-	}
 
+	if sizeValue > 0 && byteSize <= 0 && multiplier > 1.0 {
+		return 0, fmt.Errorf("size value %q resulted in non-positive bytes or overflow", sizeStr)
+	}
 	return byteSize, nil
 }
 
 func FormatSize(sizeBytes int64) string {
-	const unit = 1024
 	if sizeBytes < 0 {
-		return fmt.Sprintf("%d B", sizeBytes)
+		return fmt.Sprintf("%d B (Negative)", sizeBytes)
 	}
+	const unit = 1024
 	if sizeBytes < unit {
 		return fmt.Sprintf("%d B", sizeBytes)
 	}
@@ -88,162 +94,274 @@ func FormatSize(sizeBytes int64) string {
 }
 
 func CleanPath(path string) string {
-	cleaned := filepath.Clean(path)
-	return cleaned
+	if path == "" {
+		return "."
+	}
+	return filepath.Clean(path)
 }
 
-func IsRepoNameSafe(component string) bool {
-	if component == "" || component == "." || component == ".." {
+func IsRepoNameSafe(name string) bool {
+	if name == "" || name == "." || name == ".." {
 		return false
 	}
-	return repoNameRegex.MatchString(component) && !strings.ContainsAny(component, "/\\")
+	if strings.ContainsAny(name, "/\\") {
+		return false
+	}
+	return repoNameRegex.MatchString(name)
 }
 
-func SanitizeFilename(name string) string {
-	sanitized := unsafeCharsRegex.ReplaceAllString(name, "_")
-	sanitized = strings.Trim(sanitized, ". ")
+func SanitizeCacheKeyPathComponent(name string) string {
+	sanitized := fileNameUnsafeCharsRegex.ReplaceAllString(name, "_")
+
+	sanitized = strings.Trim(sanitized, "_")
+
 	if _, isReserved := reservedNames[strings.ToLower(sanitized)]; isReserved {
 		sanitized = "_" + sanitized
 	}
 	if sanitized == "" {
 		return "_"
 	}
+
+	const maxComponentLength = 100
+	if len(sanitized) > maxComponentLength {
+		sanitized = sanitized[:maxComponentLength]
+	}
 	return sanitized
 }
 
-func SanitizePath(path string) string {
-	cleaned := filepath.ToSlash(path)
-	parts := strings.Split(cleaned, "/")
-	sanitizedParts := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if part == "" || part == "." || part == ".." {
-			continue
-		}
-		sanitizedPart := SanitizeFilename(part)
-		if sanitizedPart != "" {
-			sanitizedParts = append(sanitizedParts, sanitizedPart)
+func GenerateCacheKey(repoName, relativePath string) (string, error) {
+	if !IsRepoNameSafe(repoName) {
+		return "", fmt.Errorf("invalid repository name for cache key: %s", repoName)
+	}
+
+	cleanedRelativePath := filepath.ToSlash(filepath.Clean(relativePath))
+	if strings.HasPrefix(cleanedRelativePath, "/") {
+		cleanedRelativePath = strings.TrimPrefix(cleanedRelativePath, "/")
+	}
+	if cleanedRelativePath == "." {
+		cleanedRelativePath = ""
+	}
+
+	parts := []string{repoName}
+	if cleanedRelativePath != "" {
+		pathComponents := strings.Split(cleanedRelativePath, "/")
+		for _, pc := range pathComponents {
+			if pc == "" || pc == "." || pc == ".." {
+				continue
+			}
+			sanitizedComponent := SanitizeCacheKeyPathComponent(pc)
+			if sanitizedComponent == "_" && pc != "_" {
+
+			}
+			parts = append(parts, sanitizedComponent)
 		}
 	}
-	return filepath.Join(sanitizedParts...)
+	return strings.Join(parts, "/"), nil
 }
 
 func GetContentType(filePath string) string {
-	ext := filepath.Ext(filePath)
-	baseName := filepath.Base(filePath)
-	mimeType := mime.TypeByExtension(ext)
+	ext := strings.ToLower(filepath.Ext(filePath))
+	baseName := strings.ToLower(filepath.Base(filePath))
 
-	if mimeType == "" || strings.HasPrefix(mimeType, "application/octet-stream") {
-		lowercaseExt := strings.ToLower(ext)
-		lowercaseBaseName := strings.ToLower(baseName)
-		switch lowercaseExt {
-		case ".deb", ".udeb", ".ddeb":
-			mimeType = "application/vnd.debian.binary-package"
-		case ".dsc", ".changes":
-			mimeType = "text/plain; charset=utf-8"
-		case ".gz":
-			mimeType = "application/gzip"
-		case ".bz2":
-			mimeType = "application/x-bzip2"
-		case ".xz":
-			mimeType = "application/x-xz"
-		case ".lz4":
-			mimeType = "application/x-lz4"
-		case ".zst":
-			mimeType = "application/zstd"
-		case ".diff", ".patch":
-			mimeType = "text/x-diff; charset=utf-8"
-		case ".html", ".htm":
-			mimeType = "text/html; charset=utf-8"
-		case ".txt", ".text", ".log", "":
-			switch lowercaseBaseName {
-			case "release", "inrelease", "packages", "sources", "translation", "contents":
-				mimeType = "text/plain; charset=utf-8"
-			default:
-				if strings.HasSuffix(lowercaseBaseName, "translation") {
-					mimeType = "text/plain; charset=utf-8"
-				}
-			}
-		case ".json":
-			mimeType = "application/json"
-		case ".xml":
-			mimeType = "application/xml"
-		}
+	switch baseName {
+	case "release", "inrelease":
+		return "text/plain; charset=utf-8"
 	}
+	if strings.HasPrefix(baseName, "packages") || strings.HasPrefix(baseName, "sources") ||
+		strings.HasPrefix(baseName, "translation") || strings.HasPrefix(baseName, "contents") {
+
+	}
+
+	switch ext {
+	case ".deb", ".udeb", ".ddeb":
+		return "application/vnd.debian.binary-package"
+	case ".dsc":
+		return "text/plain; charset=utf-8"
+	case ".changes":
+		return "text/plain; charset=utf-8"
+	case ".gz":
+		return "application/gzip"
+	case ".bz2":
+		return "application/x-bzip2"
+	case ".xz":
+		return "application/x-xz"
+	case ".lz4":
+		return "application/x-lz4"
+	case ".zst", ".zstd":
+		return "application/zstd"
+	case ".diff", ".patch":
+		return "text/x-diff; charset=utf-8"
+	case ".list":
+		return "text/plain; charset=utf-8"
+	}
+
+	mimeType := mime.TypeByExtension(ext)
 	if mimeType == "" {
-		mimeType = "application/octet-stream"
+		if strings.HasPrefix(baseName, "packages") || strings.HasPrefix(baseName, "sources") ||
+			strings.HasPrefix(baseName, "translation") || strings.HasPrefix(baseName, "contents") {
+			return "text/plain; charset=utf-8"
+		}
+		return "application/octet-stream"
 	}
 	return mimeType
 }
 
-var cacheControlHeaders = map[string]bool{
-	"Cache-Control": true,
-	"Expires":       true,
-	"ETag":          true,
-	"Accept-Ranges": true,
+func CopyHeader(h http.Header) http.Header {
+	if h == nil {
+		return nil
+	}
+	h2 := make(http.Header, len(h))
+	for k, vv := range h {
+		vv2 := make([]string, len(vv))
+		copy(vv2, vv)
+		h2[k] = vv2
+	}
+	return h2
 }
 
-func SelectCacheControlHeaders(dst, src http.Header) {
-	for h, values := range src {
-		canonicalH := http.CanonicalHeaderKey(h)
-		if cacheControlHeaders[canonicalH] {
-			if len(values) > 0 {
-				dst[canonicalH] = append([]string(nil), values...)
-			}
+func SelectProxyHeaders(dst, src http.Header) {
+
+	headersToConsider := []string{
+		"Cache-Control",
+		"Content-Disposition",
+
+		"Content-Language",
+
+		"Date",
+		"ETag",
+		"Expires",
+		"Last-Modified",
+		"Link",
+		"Pragma",
+		"Retry-After",
+		"Server",
+		"Vary",
+		"Age",
+		"Accept-Ranges",
+	}
+
+	for _, key := range headersToConsider {
+		if values := src.Values(key); len(values) > 0 {
+			dst[http.CanonicalHeaderKey(key)] = values
 		}
 	}
 }
 
-func ApplyCacheHeaders(dst http.Header, srcCacheMetaHeaders http.Header) {
-	for h, values := range srcCacheMetaHeaders {
-		canonicalH := http.CanonicalHeaderKey(h)
-		switch canonicalH {
-		case "Content-Length", "Content-Type", "Last-Modified", "Date", "Connection", "Transfer-Encoding", "Content-Encoding":
+func ParseCacheControl(headerValue string) map[string]string {
+	directives := make(map[string]string)
+	parts := strings.Split(headerValue, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
 			continue
 		}
-		if len(values) > 0 {
-			dst[canonicalH] = append([]string(nil), values...)
+		kv := strings.SplitN(part, "=", 2)
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		var value string
+		if len(kv) == 2 {
+			value = strings.Trim(strings.TrimSpace(kv[1]), "\"")
 		}
+		directives[key] = value
 	}
+	return directives
+}
+
+func IsClientDisconnectedError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, http.ErrAbortHandler) ||
+		strings.Contains(err.Error(), "broken pipe") ||
+		strings.Contains(err.Error(), "connection reset by peer") ||
+		strings.Contains(err.Error(), "client disconnected") ||
+		errors.Is(err, filepath.SkipDir) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || !netErr.Temporary()) {
+
+	}
+	return false
 }
 
 func FormatDuration(d time.Duration) string {
-	nanos := d.Nanoseconds()
-	sign := ""
-	if nanos < 0 {
-		sign = "-"
-		nanos = -nanos
+	if d < time.Millisecond {
+		return fmt.Sprintf("%.3fµs", float64(d.Nanoseconds())/1000.0)
 	}
-	switch {
-	case nanos == 0:
-		return "0s"
-	case nanos < int64(time.Microsecond):
-		return fmt.Sprintf("%s%dns", sign, nanos)
-	case nanos < int64(time.Millisecond):
-		return fmt.Sprintf("%s%.3fµs", sign, float64(nanos)/float64(time.Microsecond))
-	case nanos < int64(time.Second):
-		return fmt.Sprintf("%s%.3fms", sign, float64(nanos)/float64(time.Millisecond))
-	default:
-		return fmt.Sprintf("%s%.3fs", sign, d.Seconds())
+	if d < time.Second {
+		return fmt.Sprintf("%.3fms", float64(d.Nanoseconds())/1000000.0)
 	}
+	return fmt.Sprintf("%.3fs", d.Seconds())
 }
 
-func CompareETags(ifNoneMatchHeader string, currentETag string) bool {
-	if ifNoneMatchHeader == "" || currentETag == "" {
-		return false
+func SanitizePathForFilesystem(relativePath string) (string, error) {
+
+	cleaned := filepath.ToSlash(filepath.Clean(relativePath))
+
+	if filepath.IsAbs(cleaned) {
+		return "", errors.New("path must be relative")
 	}
-	if ifNoneMatchHeader == "*" {
-		return true
+	if cleaned == "." || cleaned == "" {
+		return "", errors.New("path cannot be empty or dot")
 	}
-	trimWeak := func(etag string) string { return strings.TrimPrefix(etag, "W/") }
-	currentETagTrimmed := trimWeak(currentETag)
-	clientEtags := strings.Split(ifNoneMatchHeader, ",")
-	for _, clientEtagRaw := range clientEtags {
-		clientEtag := strings.TrimSpace(clientEtagRaw)
-		if clientEtag == "" {
+	if strings.HasPrefix(cleaned, "/") {
+		cleaned = strings.TrimPrefix(cleaned, "/")
+	}
+
+	parts := strings.Split(cleaned, "/")
+	var sanitizedParts []string
+
+	for _, part := range parts {
+		if part == "" || part == "." {
 			continue
 		}
-		clientEtagTrimmed := trimWeak(clientEtag)
-		if clientEtagTrimmed == currentETagTrimmed {
+		if part == ".." {
+
+			return "", fmt.Errorf("path traversal attempt detected ('..') in component: %s", part)
+		}
+
+		sanitizedComponent := SanitizeCacheKeyPathComponent(part)
+		if sanitizedComponent == "" || sanitizedComponent == "_" && part != "_" {
+			return "", fmt.Errorf("path component '%s' sanitized to an invalid or empty string '%s'", part, sanitizedComponent)
+		}
+		sanitizedParts = append(sanitizedParts, sanitizedComponent)
+	}
+
+	if len(sanitizedParts) == 0 {
+		return "", errors.New("sanitized path resulted in no valid components")
+	}
+
+	return filepath.Join(sanitizedParts...), nil
+}
+
+func CompareETags(clientETagHeader string, resourceETag string) bool {
+	if clientETagHeader == "" || resourceETag == "" {
+		return false
+	}
+
+	if clientETagHeader == "*" {
+		return true
+	}
+
+	normResETag := strings.TrimPrefix(resourceETag, "W/")
+	isResWeak := strings.HasPrefix(resourceETag, "W/")
+
+	tags := strings.Split(clientETagHeader, ",")
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+
+		isClientTagWeak := strings.HasPrefix(tag, "W/")
+		normClientTag := strings.TrimPrefix(tag, "W/")
+
+		if normClientTag == normResETag {
+
+			_ = isResWeak
+			_ = isClientTagWeak
 			return true
 		}
 	}

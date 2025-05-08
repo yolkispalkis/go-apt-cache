@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -13,104 +14,155 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-var (
-	logSync func() error = func() error { return nil }
-)
-
 const (
 	LevelDebug = "debug"
 	LevelInfo  = "info"
 	LevelWarn  = "warn"
 	LevelError = "error"
+	LevelFatal = "fatal"
+	LevelPanic = "panic"
 )
 
 type LoggingConfig struct {
-	Level           string
-	FilePath        string
-	DisableTerminal bool
-	MaxSizeMB       int
-	MaxBackups      int
-	MaxAgeDays      int
-	Compress        bool
+	Level           string `json:"level"`
+	FilePath        string `json:"filePath"`
+	DisableTerminal bool   `json:"disableTerminal"`
+	MaxSizeMB       int    `json:"maxSizeMB"`
+	MaxBackups      int    `json:"maxBackups"`
+	MaxAgeDays      int    `json:"maxAgeDays"`
+	Compress        bool   `json:"compress"`
 }
 
-func Setup(cfg LoggingConfig) error {
-	var writers []io.Writer
-
-	if cfg.FilePath != "" {
-		lj := &lumberjack.Logger{
-			Filename:   cfg.FilePath,
-			MaxSize:    cfg.MaxSizeMB,
-			MaxBackups: cfg.MaxBackups,
-			MaxAge:     cfg.MaxAgeDays,
-			Compress:   cfg.Compress,
-			LocalTime:  true,
-		}
-		writers = append(writers, lj)
-		logSync = lj.Close
-
-		fmt.Printf("Logging to file: %s (Max Size: %dMB, Max Backups: %d, Max Age: %d days, Compress: %t)\n",
-			cfg.FilePath, cfg.MaxSizeMB, cfg.MaxBackups, cfg.MaxAgeDays, cfg.Compress)
-	} else {
-		logSync = func() error { return nil }
+func DefaultConfig() LoggingConfig {
+	return LoggingConfig{
+		Level:           LevelInfo,
+		FilePath:        "",
+		DisableTerminal: false,
+		MaxSizeMB:       100,
+		MaxBackups:      5,
+		MaxAgeDays:      30,
+		Compress:        true,
 	}
+}
 
-	zerolog.CallerMarshalFunc = func(pc uintptr, file string, line int) string {
-		short := file
-		projectName := "go-apt-cache/"
-		idx := strings.Index(file, projectName)
-		if idx != -1 {
-			short = file[idx+len(projectName):]
-		} else {
-			dir := filepath.Dir(file)
-			base := filepath.Base(file)
-			grandDir := filepath.Base(dir)
-			if grandDir != "." && grandDir != "/" && grandDir != "" {
-				short = filepath.Join(grandDir, base)
+var (
+	globalLogger    zerolog.Logger
+	logCloser       io.Closer
+	setupOnce       sync.Once
+	consoleExcluded bool
+)
+
+func Setup(cfg LoggingConfig) error {
+	var err error
+	setupOnce.Do(func() {
+		writers := make([]io.Writer, 0, 2)
+		consoleExcluded = cfg.DisableTerminal
+
+		if cfg.FilePath != "" {
+			absLogPath, pathErr := filepath.Abs(cfg.FilePath)
+			if pathErr != nil {
+				err = fmt.Errorf("failed to determine absolute log path for '%s': %w", cfg.FilePath, pathErr)
+				return
+			}
+			logDir := filepath.Dir(absLogPath)
+			if dirErr := os.MkdirAll(logDir, 0750); dirErr != nil {
+				err = fmt.Errorf("failed to create log directory '%s': %w", logDir, dirErr)
+				return
+			}
+
+			lj := &lumberjack.Logger{
+				Filename:   absLogPath,
+				MaxSize:    cfg.MaxSizeMB,
+				MaxBackups: cfg.MaxBackups,
+				MaxAge:     cfg.MaxAgeDays,
+				Compress:   cfg.Compress,
+				LocalTime:  true,
+			}
+			writers = append(writers, lj)
+			logCloser = lj
+			fmt.Fprintf(os.Stderr, "Logging to file: %s (Max Size: %dMB, Max Backups: %d, Max Age: %d days, Compress: %t)\n",
+				absLogPath, cfg.MaxSizeMB, cfg.MaxBackups, cfg.MaxAgeDays, cfg.Compress)
+		}
+
+		if !cfg.DisableTerminal {
+			consoleWriter := zerolog.ConsoleWriter{
+				Out:        os.Stderr,
+				TimeFormat: time.RFC3339,
+				NoColor:    false,
+				FormatLevel: func(i interface{}) string {
+					if level, ok := i.(string); ok {
+						return strings.ToUpper(fmt.Sprintf("[%s]", level))
+					}
+					return fmt.Sprintf("[%v]", i)
+				},
+				FormatCaller: func(i interface{}) string {
+					if s, ok := i.(string); ok && s != "" {
+						return fmt.Sprintf("<%s>", s)
+					}
+					return ""
+				},
+			}
+
+			if !isTerminal(os.Stderr.Fd()) {
+				consoleWriter.NoColor = true
+			}
+			writers = append(writers, consoleWriter)
+		}
+
+		if len(writers) == 0 {
+
+			if !consoleExcluded {
+				fmt.Fprintln(os.Stderr, "Warning: No log outputs configured, defaulting to simple stderr console output.")
+				writers = append(writers, zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
 			} else {
-				short = base
+				fmt.Fprintln(os.Stderr, "Warning: All log outputs disabled (file path empty and terminal disabled). Logging is off.")
+				writers = append(writers, io.Discard)
 			}
 		}
-		return fmt.Sprintf("%s:%d", short, line)
-	}
 
-	if !cfg.DisableTerminal {
-		consoleWriter := zerolog.ConsoleWriter{
-			Out:        os.Stdout,
-			TimeFormat: time.RFC3339,
-			NoColor:    false,
-			FormatCaller: func(i interface{}) string {
-				if s, ok := i.(string); ok {
-					return "[" + s + "]"
-				}
-				return fmt.Sprintf("[%v]", i)
-			},
+		level, parseErr := ParseLevel(cfg.Level)
+		if parseErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Invalid log level %q: %v. Defaulting to INFO.\n", cfg.Level, parseErr)
+			level = zerolog.InfoLevel
 		}
-		writers = append(writers, consoleWriter)
-	}
+		zerolog.SetGlobalLevel(level)
 
-	if len(writers) == 0 {
-		writers = append(writers, io.Discard)
-		fmt.Println("Warning: No log outputs configured (file or terminal), logging is effectively disabled.")
-	}
+		zerolog.CallerMarshalFunc = func(pc uintptr, file string, line int) string {
+			short := file
 
-	level, err := ParseLevel(cfg.Level)
-	if err != nil {
-		fmt.Printf("Warning: Invalid log level %q in config during setup: %v. Defaulting to INFO.\n", cfg.Level, err)
-		level = zerolog.InfoLevel
-	}
-	zerolog.SetGlobalLevel(level)
+			markers := []string{"/go-apt-cache/", "/internal/", "/pkg/"}
+			foundMarker := false
+			for _, marker := range markers {
+				if idx := strings.LastIndex(file, marker); idx != -1 {
+					short = file[idx+1:]
+					foundMarker = true
+					break
+				}
+			}
+			if !foundMarker {
+				short = filepath.Base(file)
+			}
+			return fmt.Sprintf("%s:%d", short, line)
+		}
 
-	multi := zerolog.MultiLevelWriter(writers...)
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs
-	log.Logger = zerolog.New(multi).With().Timestamp().Caller().Logger()
-	log.Info().Msgf("Logger initialized with level: %s", level.String())
+		multiWriter := zerolog.MultiLevelWriter(writers...)
+		zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs
 
-	return nil
+		loggerBuilder := zerolog.New(multiWriter).With().Timestamp()
+
+		if level <= zerolog.DebugLevel {
+			loggerBuilder = loggerBuilder.Caller()
+		}
+		globalLogger = loggerBuilder.Logger()
+		log.Logger = globalLogger
+
+		globalLogger.Info().Msgf("Logger initialized. Global level: %s", level.String())
+	})
+	return err
 }
 
 func ParseLevel(levelStr string) (zerolog.Level, error) {
-	switch strings.ToLower(levelStr) {
+	switch strings.ToLower(strings.TrimSpace(levelStr)) {
 	case LevelDebug:
 		return zerolog.DebugLevel, nil
 	case LevelInfo:
@@ -119,48 +171,40 @@ func ParseLevel(levelStr string) (zerolog.Level, error) {
 		return zerolog.WarnLevel, nil
 	case LevelError:
 		return zerolog.ErrorLevel, nil
+	case LevelFatal:
+		return zerolog.FatalLevel, nil
+	case LevelPanic:
+		return zerolog.PanicLevel, nil
 	default:
-		return zerolog.InfoLevel, fmt.Errorf("unknown log level %q (valid levels: debug, info, warn, error)", levelStr)
+		return zerolog.NoLevel, fmt.Errorf("unknown log level: %q (valid: debug, info, warn, error, fatal, panic)", levelStr)
 	}
 }
 
 func Sync() error {
-	return logSync()
-}
-
-func argsToMap(args []any) map[string]interface{} {
-	fields := make(map[string]interface{})
-	if len(args)%2 != 0 {
-		log.Warn().Msg("Odd number of arguments provided for key-value logging, ignoring last argument.")
-		args = args[:len(args)-1]
+	if logCloser != nil {
+		return logCloser.Close()
 	}
-	for i := 0; i < len(args); i += 2 {
-		key, keyOk := args[i].(string)
-		if !keyOk {
-			log.Warn().Interface("invalid_key_type_arg", args[i]).Int("arg_index", i).Msg("Non-string key provided for key-value logging, skipping pair.")
-			continue
-		}
-		fields[key] = args[i+1]
+	return nil
+}
+
+func Get() zerolog.Logger {
+	if globalLogger.GetLevel() == zerolog.NoLevel && !consoleExcluded {
+
+		fmt.Fprintln(os.Stderr, "Warning: logging.Get() called before logging.Setup(). Using default stderr logger.")
+		cfg := DefaultConfig()
+		_ = Setup(cfg)
 	}
-	return fields
+	return globalLogger
 }
 
-func Debug(msg string, args ...any) {
-	log.Debug().Fields(argsToMap(args)).Msg(msg)
+func isTerminal(fd uintptr) bool {
+	fileInfo, _ := os.Stdout.Stat()
+	return (fileInfo.Mode() & os.ModeCharDevice) != 0
 }
 
-func Info(msg string, args ...any) {
-	log.Info().Fields(argsToMap(args)).Msg(msg)
-}
-
-func Warn(msg string, args ...any) {
-	log.Warn().Fields(argsToMap(args)).Msg(msg)
-}
-
-func Error(msg string, args ...any) {
-	log.Error().Fields(argsToMap(args)).Msg(msg)
-}
-
-func ErrorE(msg string, err error, args ...any) {
-	log.Error().Err(err).Fields(argsToMap(args)).Msg(msg)
-}
+func Info() *zerolog.Event  { return globalLogger.Info() }
+func Debug() *zerolog.Event { return globalLogger.Debug() }
+func Warn() *zerolog.Event  { return globalLogger.Warn() }
+func Error() *zerolog.Event { return globalLogger.Error() }
+func Fatal() *zerolog.Event { return globalLogger.Fatal() }
+func Panic() *zerolog.Event { return globalLogger.Panic() }

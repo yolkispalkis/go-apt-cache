@@ -1,58 +1,47 @@
 {
   "server": {
     "listenAddress": ":8080",
-    "unixSocketPath": "",
-    "unixSocketPermissions": "660",
-    "requestTimeout": "60s",
+    "unixSocketPath": "/run/go-apt-proxy/apt-proxy.sock",
+    "unixSocketPermissions": "0660",
+    "requestTimeout": "30s",
     "shutdownTimeout": "15s",
     "idleTimeout": "120s",
     "readHeaderTimeout": "10s",
-    "maxConcurrentFetches": 10
+    "maxConcurrentFetches": 20,
+    "userAgent": "go-apt-proxy/2.0 (+https://github.com/yolkispalkis/go-apt-cache)"
   },
   "cache": {
-    "directory": "./cache_data",
-    "maxSize": "10GB",
+    "directory": "/var/cache/go-apt-proxy/data",
+    "maxSize": "20GB",
     "enabled": true,
     "cleanOnStart": false,
-    "validationTTL": "5m",
-    "skipValidationExtensions": [
-      ".deb",
-      ".udeb",
-      ".ddeb",
-      ".rpm",
-      ".tar.gz",
-      ".tgz",
-      ".zip"
-    ]
+    "defaultTTL": "1h",
+    "revalidateOnHitTTL": "0s", 
+    "negativeCacheTTL": "5m"
   },
   "logging": {
     "level": "info",
-    "filePath": "./logs/apt_cache.log",
+    "filePath": "/var/log/go-apt-proxy/proxy.log",
     "disableTerminal": false,
     "maxSizeMB": 100,
-    "maxBackups": 3,
-    "maxAgeDays": 7,
+    "maxBackups": 5,
+    "maxAgeDays": 30,
     "compress": true
   },
   "repositories": [
     {
       "name": "ubuntu",
-      "url": "http://archive.ubuntu.com/ubuntu",
+      "url": "http://archive.ubuntu.com/ubuntu/",
       "enabled": true
     },
     {
       "name": "debian",
-      "url": "http://deb.debian.org/debian",
-      "enabled": false
+      "url": "http://deb.debian.org/debian/",
+      "enabled": true
     },
     {
-      "name": "security",
-      "url": "http://security.ubuntu.com/ubuntu",
-      "enabled": false
-    },
-    {
-      "name": "ppa-example",
-      "url": "http://ppa.launchpadcontent.net/example/ppa/ubuntu",
+      "name": "raspbian",
+      "url": "http://archive.raspberrypi.org/raspbian/",
       "enabled": false
     }
   ]

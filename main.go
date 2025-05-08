@@ -5,241 +5,175 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"sync"
 	"syscall"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
+	"github.com/yolkispalkis/go-apt-cache/internal/fetch"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/server"
-	"github.com/yolkispalkis/go-apt-cache/internal/util"
+	"github.com/yolkispalkis/go-apt-cache/internal/util" // For FormatSize in logging example
 )
 
 func main() {
+	// Setup context for graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	defer stop() // Ensure stop is called to release resources if main exits early
 
-	if err := run(ctx, os.Args, stop); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		_ = logging.Sync()
+	err := run(ctx)
+	if err != nil {
+		// Use stderr for final error messages as logger might not be fully flushed or available
+		fmt.Fprintf(os.Stderr, "Application exited with error: %v\n", err)
+		// Attempt to sync logs one last time
+		if logSyncErr := logging.Sync(); logSyncErr != nil {
+			fmt.Fprintf(os.Stderr, "Failed to sync logs: %v\n", logSyncErr)
+		}
 		os.Exit(1)
 	}
-	fmt.Println("Server shut down gracefully.")
-	_ = logging.Sync()
+
+	fmt.Println("Application shut down gracefully.")
+	if logSyncErr := logging.Sync(); logSyncErr != nil {
+		fmt.Fprintf(os.Stderr, "Failed to sync logs on graceful shutdown: %v\n", logSyncErr)
+	}
 }
 
-func run(ctx context.Context, args []string, stop context.CancelFunc) error {
-	flags := flag.NewFlagSet(args[0], flag.ExitOnError)
-	configFile := flags.String("config", "config.json", "Path to configuration file")
-	createConfig := flags.Bool("create-config", false, "Create default configuration file if it doesn't exist and exit")
-	listenAddr := flags.String("listen", "", "Override server.listenAddress (e.g., :8080)")
-	unixSocket := flags.String("unix-socket", "", "Override server.unixSocketPath")
-	cacheDir := flags.String("cache-dir", "", "Override cache.directory")
-	cacheSize := flags.String("cache-size", "", "Override cache.maxSize (e.g., 1GB)")
-	logLevel := flags.String("log-level", "", "Override logging.level (debug, info, warn, error)")
-	flags.Usage = func() {
-		fmt.Fprintf(flags.Output(), "Usage of %s:\n", args[0])
-		flags.PrintDefaults()
-		fmt.Fprintf(flags.Output(), "\nExample: %s -config /etc/go-apt-proxy/config.json -log-level debug\n", args[0])
-	}
+func run(ctx context.Context) error {
+	// --- Configuration Loading & Flag Parsing ---
+	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	configFile := fs.String("config", "config.json", "Path to configuration file")
+	createConfig := fs.Bool("create-config", false, "Create default configuration file if it doesn't exist and exit")
+	// Add overrides for common settings
+	logLevelOverride := fs.String("log-level", "", "Override logging.level (debug, info, warn, error)")
+	listenAddrOverride := fs.String("listen", "", "Override server.listenAddress (e.g., :8080)")
 
-	if err := flags.Parse(args[1:]); err != nil {
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage of %s:\n", os.Args[0])
+		fs.PrintDefaults()
+		fmt.Fprintf(fs.Output(), "\nExample: %s -config /etc/go-apt-proxy/config.json -log-level debug\n", os.Args[0])
+	}
+	if err := fs.Parse(os.Args[1:]); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
 
 	if *createConfig {
 		if err := config.EnsureDefaultConfig(*configFile); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to ensure default config at %s: %v\n", *configFile, err)
-			return fmt.Errorf("failed to ensure default config: %w", err)
+			return fmt.Errorf("failed to ensure default config at %s: %w", *configFile, err)
 		}
-		fmt.Printf("Default config ensured at %s. Please review and adjust if necessary.\n", *configFile)
-		return nil
+		fmt.Printf("Default config ensured/created at %s. Please review and adjust if necessary.\n", *configFile)
+		return nil // Exit after creating config
 	}
 
 	cfg, err := config.Load(*configFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load configuration from %s: %v\n", *configFile, err)
-		return fmt.Errorf("failed to load configuration: %w", err)
+		// Try to setup basic logging to stderr if config load fails, so this message is seen
+		_ = logging.Setup(logging.DefaultConfig()) // Use defaults for this emergency log
+		logging.Get().Fatal().Err(err).Str("config_file", *configFile).Msg("Failed to load configuration")
+		return fmt.Errorf("loading configuration from %s: %w", *configFile, err) // Should not reach here due to Fatal
 	}
 
-	if *listenAddr != "" {
-		cfg.Server.ListenAddress = *listenAddr
+	// Apply command-line overrides
+	if *logLevelOverride != "" {
+		cfg.Logging.Level = *logLevelOverride
 	}
-	if *unixSocket != "" {
-		cfg.Server.UnixSocketPath = *unixSocket
-	}
-	if *cacheDir != "" {
-		cfg.Cache.Directory = *cacheDir
-	}
-	if *cacheSize != "" {
-		cfg.Cache.MaxSize = *cacheSize
-	}
-	if *logLevel != "" {
-		cfg.Logging.Level = *logLevel
+	if *listenAddrOverride != "" {
+		cfg.Server.ListenAddress = *listenAddrOverride
 	}
 
 	if err := config.Validate(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "Invalid configuration: %v\n", err)
+		_ = logging.Setup(logging.DefaultConfig())
+		logging.Get().Fatal().Err(err).Msg("Invalid configuration")
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
 
+	// --- Logging Setup ---
 	if err := logging.Setup(cfg.Logging); err != nil {
+		// If logging setup fails, print to stderr and exit
 		fmt.Fprintf(os.Stderr, "Failed to setup logging: %v\n", err)
-		return fmt.Errorf("failed to setup logging: %w", err)
+		return fmt.Errorf("setting up logging: %w", err)
 	}
-	defer logging.Sync()
+	logger := logging.Get() // Get the configured global logger
+	logger.Info().Str("config_file", *configFile).Msg("Configuration loaded and validated.")
 
-	logging.Info("Configuration loaded and validated successfully", "config_file", *configFile)
-	logging.Info("Initializing cache...")
-
-	cacheManager, err := cache.NewDiskLRUCache(cfg.Cache)
+	// --- Cache Manager Initialization ---
+	logger.Info().Msg("Initializing cache manager...")
+	cacheManager, err := cache.NewDiskLRUCache(cfg.Cache, logger)
 	if err != nil {
-		return fmt.Errorf("failed to initialize cache: %w", err)
+		logger.Fatal().Err(err).Msg("Failed to initialize cache manager")
+		return fmt.Errorf("initializing cache manager: %w", err)
+	}
+	if err := cacheManager.Init(ctx); err != nil {
+		// Non-fatal init error (e.g. scan failed but cache can operate in a degraded mode or clean state)
+		// DiskLRUCache Init might set an internal error state.
+		logger.Error().Err(err).Msg("Cache manager initialization encountered an error. Cache might be empty or inconsistent.")
+		// Depending on severity, might choose to exit. For now, continue.
+	} else {
+		logger.Info().
+			Str("dir", cfg.Cache.Directory).
+			Str("max_size", cfg.Cache.MaxSize).
+			Bool("enabled", cfg.Cache.Enabled).
+			Int64("initial_items", cacheManager.GetItemCount()).
+			Str("initial_size", util.FormatSize(cacheManager.GetCurrentSize())).
+			Msg("Cache manager initialized.")
 	}
 	defer func() {
-		logging.Info("Closing cache manager...")
+		logger.Info().Msg("Closing cache manager...")
 		if err := cacheManager.Close(); err != nil {
-			logging.ErrorE("Error closing cache manager", err)
-		} else {
-			logging.Info("Cache manager closed.")
+			logger.Error().Err(err).Msg("Error closing cache manager")
 		}
 	}()
 
-	stats := cacheManager.Stats()
-	logging.Info("Initial cache stats",
-		"enabled", stats.CacheEnabled,
-		"directory", stats.CacheDirectory,
-		"items", stats.ItemCount,
-		"current_size", util.FormatSize(stats.CurrentSize),
-		"max_size", util.FormatSize(stats.MaxSize),
-		"init_time_ms", stats.InitTimeMs,
-		"init_error", stats.InitError,
-	)
+	// --- Fetch Coordinator Initialization ---
+	logger.Info().Msg("Initializing fetch coordinator...")
+	fetchCoordinator := fetch.NewCoordinator(cfg.Server, logger)
+	logger.Info().
+		Str("user_agent", cfg.Server.UserAgent).
+		Int("max_concurrent_fetches", cfg.Server.MaxConcurrentFetches).
+		Msg("Fetch coordinator initialized.")
 
-	srv, err := server.New(cfg, cacheManager)
+	// --- HTTP Server Initialization ---
+	logger.Info().Msg("Initializing HTTP server...")
+	httpServer, err := server.New(cfg, cacheManager, fetchCoordinator, logger)
 	if err != nil {
-		return fmt.Errorf("failed to create server: %w", err)
+		logger.Fatal().Err(err).Msg("Failed to create HTTP server")
+		return fmt.Errorf("creating HTTP server: %w", err)
 	}
 
-	listeners := make([]net.Listener, 0, 2)
-	var listenErr error
-	var wgListeners sync.WaitGroup
-
-	if cfg.Server.ListenAddress != "" {
-		wgListeners.Add(1)
-		go func() {
-			defer wgListeners.Done()
-			tcpListener, err := net.Listen("tcp", cfg.Server.ListenAddress)
-			if err != nil {
-				listenErr = errors.Join(listenErr, fmt.Errorf("tcp listen %s: %w", cfg.Server.ListenAddress, err))
-				return
-			}
-			listeners = append(listeners, tcpListener)
-			logging.Info("Listening on TCP", "address", tcpListener.Addr().String())
-		}()
-	}
-
-	if cfg.Server.UnixSocketPath != "" {
-		wgListeners.Add(1)
-		go func() {
-			defer wgListeners.Done()
-			socketPath := util.CleanPath(cfg.Server.UnixSocketPath)
-			socketDir := filepath.Dir(socketPath)
-			if err := os.MkdirAll(socketDir, 0755); err != nil {
-				listenErr = errors.Join(listenErr, fmt.Errorf("mkdir unix socket dir %s: %w", socketDir, err))
-				return
-			}
-			if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				logging.Warn("Failed to remove existing unix socket file", "error", err, "path", socketPath)
-			}
-			unixListener, err := net.Listen("unix", socketPath)
-			if err != nil {
-				listenErr = errors.Join(listenErr, fmt.Errorf("unix listen %s: %w", socketPath, err))
-				return
-			}
-			perms := cfg.Server.UnixSocketPermissions.FileMode()
-			if err := os.Chmod(socketPath, perms); err != nil {
-				_ = unixListener.Close()
-				_ = os.Remove(socketPath)
-				listenErr = errors.Join(listenErr, fmt.Errorf("chmod socket %s to 0%o: %w", socketPath, perms, err))
-				return
-			}
-			listeners = append(listeners, unixListener)
-			logging.Info("Listening on Unix socket", "path", socketPath, "permissions", fmt.Sprintf("0%o", perms))
-		}()
-	}
-
-	wgListeners.Wait()
-
-	if listenErr != nil {
-		stop()
-		for _, l := range listeners {
-			_ = l.Close()
-		}
-		if cfg.Server.UnixSocketPath != "" {
-			_ = os.Remove(util.CleanPath(cfg.Server.UnixSocketPath))
-		}
-		return fmt.Errorf("failed to start listeners: %w", listenErr)
-	}
-	if len(listeners) == 0 {
-		return errors.New("no listeners configured or started")
-	}
-
-	errChan := make(chan error, len(listeners))
-	for _, l := range listeners {
-		listener := l
-		go func() {
-			listenerAddr := listener.Addr().String()
-			networkType := listener.Addr().Network()
-			logging.Info("Starting server loop", "network", networkType, "address", listenerAddr)
-			if serveErr := srv.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-				errChan <- fmt.Errorf("server error on %s (%s): %w", listenerAddr, networkType, serveErr)
-			} else {
-				logging.Info("Server loop stopped gracefully", "network", networkType, "address", listenerAddr)
-			}
-		}()
-	}
+	// --- Start Server and Wait for Shutdown ---
+	serverErrChan := make(chan error, 1)
+	go func() {
+		serverErrChan <- httpServer.Start(ctx)
+	}()
 
 	select {
-	case err := <-errChan:
-		logging.Error("Listener/Server failed, initiating shutdown...", "error", err)
-		stop()
-		listenErr = err
-	case <-ctx.Done():
-		logging.Info("Shutdown signal received, initiating graceful shutdown...")
-		listenErr = ctx.Err()
-	}
-
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout.Duration())
-	defer cancelShutdown()
-
-	logging.Info("Attempting graceful server shutdown...", "timeout", cfg.Server.ShutdownTimeout.Duration())
-	shutdownErr := srv.Shutdown(shutdownCtx)
-	if shutdownErr != nil {
-		logging.ErrorE("Graceful server shutdown failed", shutdownErr)
-	} else {
-		logging.Info("Server shutdown complete.")
-	}
-
-	if cfg.Server.UnixSocketPath != "" {
-		socketPath := util.CleanPath(cfg.Server.UnixSocketPath)
-		if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			logging.Warn("Failed to remove unix socket file during cleanup", "error", err, "path", socketPath)
+	case err := <-serverErrChan:
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error().Err(err).Msg("Server exited with error")
+			// Attempt graceful shutdown even if Start errored out, to clean up listeners etc.
+			if shutdownErr := httpServer.Shutdown(); shutdownErr != nil {
+				logger.Error().Err(shutdownErr).Msg("Error during shutdown after server error.")
+			}
+			return err // Return the original server error
 		}
+		logger.Info().Msg("Server has shut down.")
+	case <-ctx.Done(): // Triggered by signal.NotifyContext or if parent context cancels
+		logger.Info().Msg("Shutdown signal received, initiating graceful shutdown of server...")
+		if shutdownErr := httpServer.Shutdown(); shutdownErr != nil {
+			logger.Error().Err(shutdownErr).Msg("Error during graceful server shutdown.")
+			return shutdownErr // Return shutdown error
+		}
+		logger.Info().Msg("Server has been shut down gracefully due to signal.")
 	}
 
-	finalErr := listenErr
-	if shutdownErr != nil {
-		finalErr = errors.Join(finalErr, fmt.Errorf("shutdown error: %w", shutdownErr))
+	// Final check on cache size if enabled
+	if cfg.Cache.Enabled {
+		logger.Info().
+			Int64("final_items", cacheManager.GetItemCount()).
+			Str("final_size", util.FormatSize(cacheManager.GetCurrentSize())).
+			Msg("Final cache status.")
 	}
-	// Only return error if it wasn't a clean shutdown signal (context.Canceled) without shutdown issues
-	if finalErr != nil && !(errors.Is(finalErr, context.Canceled) && shutdownErr == nil) {
-		return finalErr
-	}
+
 	return nil
 }
