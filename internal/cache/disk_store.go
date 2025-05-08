@@ -11,289 +11,261 @@ import (
 	"strings"
 
 	"github.com/rs/zerolog"
-	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
 const (
-	contentSuffix   = ".content"
-	metadataSuffix  = ".meta"
-	tempFilePattern = "temp_*"
+	contentSuffix  = ".content"
+	metadataSuffix = ".meta"
+	tempPrefix     = "temp_"
 )
 
 type diskStore struct {
 	baseDir string
-	logger  zerolog.Logger
+	log     zerolog.Logger
 }
 
 func newDiskStore(baseDir string, logger zerolog.Logger) (*diskStore, error) {
 	if err := os.MkdirAll(baseDir, 0750); err != nil {
-		return nil, fmt.Errorf("failed to create cache base directory %s: %w", baseDir, err)
+		return nil, fmt.Errorf("create cache base dir %s: %w", baseDir, err)
 	}
 	return &diskStore{
 		baseDir: baseDir,
-		logger:  logger.With().Str("component", "diskStore").Logger(),
+		log:     logger.With().Str("component", "diskStore").Logger(),
 	}, nil
-}
-
-func (ds *diskStore) getSafeRelativePath(key string) (string, error) {
-
-	parts := strings.Split(key, "/")
-	if len(parts) == 0 {
-		return "", errors.New("cache key cannot be empty")
-	}
-
-	sanitizedParts := make([]string, len(parts))
-	for i, part := range parts {
-		sPart, err := util.SanitizePathForFilesystem(part)
-		if err != nil {
-
-			sPart = util.SanitizeCacheKeyPathComponent(part)
-			if sPart == "_" && part != "_" {
-				ds.logger.Warn().Str("original_part", part).Str("sanitized_part", sPart).Msg("Path component sanitized aggressively.")
-			}
-		}
-		sanitizedParts[i] = sPart
-	}
-
-	if len(sanitizedParts) == 0 {
-		return "", errors.New("cache key resulted in no valid path components")
-	}
-
-	return filepath.Join(sanitizedParts...), nil
 }
 
 func (ds *diskStore) contentPath(key string) string {
 
-	safeRelPath, err := ds.getSafeRelativePath(key)
-	if err != nil {
-		ds.logger.Error().Err(err).Str("key", key).Msg("Failed to generate safe relative path for content.")
-
-		safeRelPath = util.SanitizeCacheKeyPathComponent(key)
-	}
-	return filepath.Join(ds.baseDir, safeRelPath+contentSuffix)
+	return filepath.Join(ds.baseDir, key+contentSuffix)
 }
 
 func (ds *diskStore) metadataPath(key string) string {
-	safeRelPath, err := ds.getSafeRelativePath(key)
-	if err != nil {
-		ds.logger.Error().Err(err).Str("key", key).Msg("Failed to generate safe relative path for metadata.")
-		safeRelPath = util.SanitizeCacheKeyPathComponent(key)
-	}
-	return filepath.Join(ds.baseDir, safeRelPath+metadataSuffix)
+	return filepath.Join(ds.baseDir, key+metadataSuffix)
 }
 
-func (ds *diskStore) write(key string, reader io.Reader, meta *CacheItemMetadata) (int64, string, string, error) {
-	finalContentPath := ds.contentPath(key)
-	finalMetaPath := ds.metadataPath(key)
+func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
+	writtenSize int64, cPath, mPath string, err error) {
 
-	dir := filepath.Dir(finalContentPath)
-	if err := os.MkdirAll(dir, 0750); err != nil {
-		return 0, "", "", fmt.Errorf("failed to create directory %s: %w", dir, err)
+	cPath = ds.contentPath(key)
+	mPath = ds.metadataPath(key)
+	itemDir := filepath.Dir(cPath)
+
+	if err = os.MkdirAll(itemDir, 0750); err != nil {
+		return 0, "", "", fmt.Errorf("mkdir %s: %w", itemDir, err)
 	}
 
-	tempContentFile, err := os.CreateTemp(dir, tempFilePattern+contentSuffix)
-	if err != nil {
-		return 0, "", "", fmt.Errorf("failed to create temp content file: %w", err)
-	}
-	defer func() {
-		if tempContentFile != nil {
-			tempContentFile.Close()
-			os.Remove(tempContentFile.Name())
-		}
-	}()
+	var tmpCFile *os.File
+	var tmpCPath string
 
-	var writtenSize int64
-	if reader != nil {
-		bufWriter := bufio.NewWriter(tempContentFile)
-		writtenSize, err = io.Copy(bufWriter, reader)
+	if r != nil {
+		tmpCFile, err = os.CreateTemp(itemDir, tempPrefix+"*"+contentSuffix)
 		if err != nil {
-			return 0, "", "", fmt.Errorf("failed to write content to temp file: %w", err)
+			return 0, "", "", fmt.Errorf("create temp content file: %w", err)
 		}
-		if err := bufWriter.Flush(); err != nil {
-			return 0, "", "", fmt.Errorf("failed to flush content buffer: %w", err)
-		}
-		if err := tempContentFile.Sync(); err != nil {
 
-			ds.logger.Warn().Err(err).Str("path", tempContentFile.Name()).Msg("Failed to sync temp content file")
-		}
-	}
-	tempContentPath := tempContentFile.Name()
-	if err := tempContentFile.Close(); err != nil {
-		return 0, "", "", fmt.Errorf("failed to close temp content file: %w", err)
-	}
-	tempContentFile = nil
+		defer func() {
+			if tmpCFile != nil {
+				tmpCFile.Close()
+				os.Remove(tmpCFile.Name())
+			}
+		}()
 
-	tempMetaFile, err := os.CreateTemp(dir, tempFilePattern+metadataSuffix)
-	if err != nil {
-		os.Remove(tempContentPath)
-		return 0, "", "", fmt.Errorf("failed to create temp metadata file: %w", err)
-	}
-	defer func() {
-		if tempMetaFile != nil {
-			tempMetaFile.Close()
-			os.Remove(tempMetaFile.Name())
+		bufW := bufio.NewWriter(tmpCFile)
+		if writtenSize, err = io.Copy(bufW, r); err != nil {
+			return 0, "", "", fmt.Errorf("write content to temp: %w", err)
 		}
-	}()
+		if err = bufW.Flush(); err != nil {
+			return 0, "", "", fmt.Errorf("flush content buffer: %w", err)
+		}
+		if err = tmpCFile.Sync(); err != nil {
+			ds.log.Warn().Err(err).Str("path", tmpCFile.Name()).Msg("Sync temp content file failed")
+		}
+
+		tmpCPath = tmpCFile.Name()
+		if err = tmpCFile.Close(); err != nil {
+			return 0, "", "", fmt.Errorf("close temp content file: %w", err)
+		}
+		tmpCFile = nil
+	} else {
+		writtenSize = 0
+	}
 
 	meta.Size = writtenSize
-	meta.Path = finalContentPath
-	meta.MetaPath = finalMetaPath
+	meta.Path = cPath
+	meta.MetaPath = mPath
 
-	encoder := json.NewEncoder(tempMetaFile)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(meta); err != nil {
-		os.Remove(tempContentPath)
-		return 0, "", "", fmt.Errorf("failed to encode metadata: %w", err)
+	tmpMFile, err := os.CreateTemp(itemDir, tempPrefix+"*"+metadataSuffix)
+	if err != nil {
+		if tmpCPath != "" {
+			os.Remove(tmpCPath)
+		}
+		return 0, "", "", fmt.Errorf("create temp metadata file: %w", err)
 	}
-	if err := tempMetaFile.Sync(); err != nil {
-		ds.logger.Warn().Err(err).Str("path", tempMetaFile.Name()).Msg("Failed to sync temp metadata file")
-	}
-	tempMetaPath := tempMetaFile.Name()
-	if err := tempMetaFile.Close(); err != nil {
-		os.Remove(tempContentPath)
-		return 0, "", "", fmt.Errorf("failed to close temp metadata file: %w", err)
-	}
-	tempMetaFile = nil
+	defer func() {
+		if tmpMFile != nil {
+			tmpMFile.Close()
+			os.Remove(tmpMFile.Name())
+		}
+	}()
 
-	if err := os.Rename(tempMetaPath, finalMetaPath); err != nil {
-		os.Remove(tempContentPath)
-		os.Remove(tempMetaPath)
-		return 0, "", "", fmt.Errorf("failed to rename temp metadata file to %s: %w", finalMetaPath, err)
+	enc := json.NewEncoder(tmpMFile)
+	enc.SetIndent("", "  ")
+	if err = enc.Encode(meta); err != nil {
+		if tmpCPath != "" {
+			os.Remove(tmpCPath)
+		}
+		return 0, "", "", fmt.Errorf("encode metadata: %w", err)
 	}
-	if err := os.Rename(tempContentPath, finalContentPath); err != nil {
-		os.Remove(finalMetaPath)
-		os.Remove(tempContentPath)
-		return 0, "", "", fmt.Errorf("failed to rename temp content file to %s: %w", finalContentPath, err)
+	if err = tmpMFile.Sync(); err != nil {
+		ds.log.Warn().Err(err).Str("path", tmpMFile.Name()).Msg("Sync temp metadata file failed")
 	}
 
-	return writtenSize, finalContentPath, finalMetaPath, nil
+	tmpMPath := tmpMFile.Name()
+	if err = tmpMFile.Close(); err != nil {
+		if tmpCPath != "" {
+			os.Remove(tmpCPath)
+		}
+		return 0, "", "", fmt.Errorf("close temp metadata file: %w", err)
+	}
+	tmpMFile = nil
+
+	if err = os.Rename(tmpMPath, mPath); err != nil {
+		if tmpCPath != "" {
+			os.Remove(tmpCPath)
+		}
+		os.Remove(tmpMPath)
+		return 0, "", "", fmt.Errorf("rename temp metadata to %s: %w", mPath, err)
+	}
+	if r != nil && tmpCPath != "" {
+		if err = os.Rename(tmpCPath, cPath); err != nil {
+			os.Remove(mPath)
+			os.Remove(tmpCPath)
+			return 0, "", "", fmt.Errorf("rename temp content to %s: %w", cPath, err)
+		}
+	}
+	return writtenSize, cPath, mPath, nil
 }
 
-func (ds *diskStore) writeMetadata(metaPath string, meta *CacheItemMetadata) error {
-	dir := filepath.Dir(metaPath)
-	if err := os.MkdirAll(dir, 0750); err != nil {
-		return fmt.Errorf("failed to create directory %s for metadata: %w", dir, err)
+func (ds *diskStore) writeMetadata(mPath string, meta *ItemMeta) error {
+	itemDir := filepath.Dir(mPath)
+
+	if err := os.MkdirAll(itemDir, 0750); err != nil {
+		return fmt.Errorf("mkdir %s for metadata update: %w", itemDir, err)
 	}
 
-	tempMetaFile, err := os.CreateTemp(dir, tempFilePattern+metadataSuffix)
+	tmpMFile, err := os.CreateTemp(itemDir, tempPrefix+"*"+metadataSuffix)
 	if err != nil {
-		return fmt.Errorf("failed to create temp metadata file: %w", err)
+		return fmt.Errorf("create temp metadata for update: %w", err)
+	}
+	defer func() {
+		if tmpMFile != nil {
+			tmpMFile.Close()
+			os.Remove(tmpMFile.Name())
+		}
+	}()
+
+	enc := json.NewEncoder(tmpMFile)
+	enc.SetIndent("", "  ")
+	if err = enc.Encode(meta); err != nil {
+		return fmt.Errorf("encode metadata for update: %w", err)
+	}
+	if err = tmpMFile.Sync(); err != nil {
+		ds.log.Warn().Err(err).Str("path", tmpMFile.Name()).Msg("Sync temp metadata for update failed")
 	}
 
-	encoder := json.NewEncoder(tempMetaFile)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(meta); err != nil {
-		tempMetaFile.Close()
-		os.Remove(tempMetaFile.Name())
-		return fmt.Errorf("failed to encode metadata: %w", err)
+	tmpPath := tmpMFile.Name()
+	if err = tmpMFile.Close(); err != nil {
+		return fmt.Errorf("close temp metadata for update: %w", err)
 	}
-	if err := tempMetaFile.Sync(); err != nil {
-		ds.logger.Warn().Err(err).Str("path", tempMetaFile.Name()).Msg("Failed to sync temp metadata file")
-	}
+	tmpMFile = nil
 
-	tempPath := tempMetaFile.Name()
-	if err := tempMetaFile.Close(); err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("failed to close temp metadata file: %w", err)
-	}
-
-	if err := os.Rename(tempPath, metaPath); err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("failed to rename temp metadata file to %s: %w", metaPath, err)
+	if err = os.Rename(tmpPath, mPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename temp metadata to %s for update: %w", mPath, err)
 	}
 	return nil
 }
 
-func (ds *diskStore) readMetadataFromFile(metaPath string) (*CacheItemMetadata, error) {
-	file, err := os.Open(metaPath)
+func (ds *diskStore) readMeta(mPath string) (*ItemMeta, error) {
+	f, err := os.Open(mPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open metadata file %s: %w", metaPath, err)
+		return nil, fmt.Errorf("open metadata file %s: %w", mPath, err)
 	}
-	defer file.Close()
+	defer f.Close()
 
-	var meta CacheItemMetadata
+	var meta ItemMeta
 
-	bufReader := bufio.NewReader(file)
-	decoder := json.NewDecoder(bufReader)
-	if err := decoder.Decode(&meta); err != nil {
-		return nil, fmt.Errorf("failed to decode metadata from %s: %w", metaPath, err)
+	if err = json.NewDecoder(bufio.NewReader(f)).Decode(&meta); err != nil {
+		return nil, fmt.Errorf("decode metadata from %s: %w", mPath, err)
 	}
 	return &meta, nil
 }
 
-func (ds *diskStore) openContentFile(contentPath string) (*os.File, error) {
-	file, err := os.Open(contentPath)
+func (ds *diskStore) openContentFile(cPath string) (*os.File, error) {
+	f, err := os.Open(cPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrNotFound
 		}
-		return nil, fmt.Errorf("failed to open content file %s: %w", contentPath, err)
+		return nil, fmt.Errorf("open content file %s: %w", cPath, err)
 	}
-	return file, nil
+	return f, nil
 }
 
-func (ds *diskStore) deleteFiles(contentPath, metaPath string) error {
-	var deleteErrors []error
-	if contentPath != "" {
-		err := os.Remove(contentPath)
-		if err != nil && !os.IsNotExist(err) {
-			deleteErrors = append(deleteErrors, fmt.Errorf("delete content %s: %w", contentPath, err))
+func (ds *diskStore) deleteFiles(cPath, mPath string) error {
+	var errs []string
+	if cPath != "" {
+		if err := os.Remove(cPath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Sprintf("delete content %s: %v", cPath, err))
 		}
 	}
-	if metaPath != "" {
-		err := os.Remove(metaPath)
-		if err != nil && !os.IsNotExist(err) {
-			deleteErrors = append(deleteErrors, fmt.Errorf("delete metadata %s: %w", metaPath, err))
+	if mPath != "" {
+		if err := os.Remove(mPath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Sprintf("delete metadata %s: %v", mPath, err))
 		}
 	}
-	if len(deleteErrors) > 0 {
-
-		var errorStrings []string
-		for _, e := range deleteErrors {
-			errorStrings = append(errorStrings, e.Error())
-		}
-		return errors.New(strings.Join(errorStrings, "; "))
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
 }
 
-func (ds *diskStore) scanMetadataFiles() ([]string, error) {
+func (ds *diskStore) scanMetaFiles() ([]string, error) {
 	var metaFiles []string
-	err := filepath.Walk(ds.baseDir, func(path string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(ds.baseDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-
-			ds.logger.Warn().Err(err).Str("path", path).Msg("Error accessing path during scan")
+			ds.log.Warn().Err(err).Str("path", path).Msg("Error accessing path during scan, skipping.")
 			return nil
 		}
-		if !info.IsDir() && strings.HasSuffix(info.Name(), metadataSuffix) && !strings.HasPrefix(info.Name(), tempFilePattern) {
+		if !d.IsDir() && strings.HasSuffix(d.Name(), metadataSuffix) &&
+			!strings.HasPrefix(d.Name(), tempPrefix) {
 			metaFiles = append(metaFiles, path)
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("error walking cache directory %s: %w", ds.baseDir, err)
+		return nil, fmt.Errorf("walk cache directory %s: %w", ds.baseDir, err)
 	}
 	return metaFiles, nil
 }
 
-func (ds *diskStore) cleanDirectory() error {
-	ds.logger.Info().Str("directory", ds.baseDir).Msg("Cleaning all contents of cache directory.")
-
-	dirEntries, err := os.ReadDir(ds.baseDir)
+func (ds *diskStore) cleanDir() error {
+	ds.log.Info().Str("dir", ds.baseDir).Msg("Cleaning all contents of cache directory.")
+	entries, err := os.ReadDir(ds.baseDir)
 	if err != nil {
-		return fmt.Errorf("failed to read cache directory %s for cleaning: %w", ds.baseDir, err)
+		return fmt.Errorf("read cache directory %s for cleaning: %w", ds.baseDir, err)
 	}
-	for _, entry := range dirEntries {
-		path := filepath.Join(ds.baseDir, entry.Name())
-		if err := os.RemoveAll(path); err != nil {
+	for _, entry := range entries {
+		p := filepath.Join(ds.baseDir, entry.Name())
+		if err := os.RemoveAll(p); err != nil {
 
-			ds.logger.Error().Err(err).Str("path", path).Msg("Failed to remove item during cache clean.")
+			ds.log.Error().Err(err).Str("path", p).Msg("Failed to remove item during cache clean.")
 		}
 	}
 
 	if err := os.MkdirAll(ds.baseDir, 0750); err != nil {
-		ds.logger.Error().Err(err).Str("path", ds.baseDir).Msg("Failed to recreate base directory after cleaning.")
-		return fmt.Errorf("failed to recreate base directory %s after cleaning: %w", ds.baseDir, err)
+		ds.log.Error().Err(err).Str("path", ds.baseDir).Msg("Failed to recreate base directory after cleaning.")
+		return fmt.Errorf("recreate base directory %s after cleaning: %w", ds.baseDir, err)
 	}
 	return nil
 }

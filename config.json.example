@@ -16,7 +16,7 @@
     "enabled": true,
     "cleanOnStart": false,
     "defaultTTL": "1h",
-    "revalidateOnHitTTL": "0s", 
+    "revalidateOnHitTTL": "0s",
     "negativeCacheTTL": "5m"
   },
   "logging": {

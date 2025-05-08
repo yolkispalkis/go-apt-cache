@@ -10,10 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yolkispalkis/go-apt-cache/internal/logging" 
-	"github.com/yolkispalkis/go-apt-cache/internal/util"    
+	"github.com/yolkispalkis/go-apt-cache/internal/logging"
+	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
-
 
 type Duration time.Duration
 
@@ -22,37 +21,34 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 }
 
 func (d *Duration) UnmarshalJSON(b []byte) error {
-	var v interface{}
+	var v any
 	if err := json.Unmarshal(b, &v); err != nil {
 		return err
 	}
-	switch value := v.(type) {
-	case float64: 
-		*d = Duration(time.Duration(value))
-		return nil
+	switch val := v.(type) {
+	case float64:
+		*d = Duration(time.Duration(val))
 	case string:
-		var err error
-		td, err := time.ParseDuration(value)
+		td, err := time.ParseDuration(val)
 		if err != nil {
-			
-			seconds, errInt := json.Number(value).Int64()
-			if errInt == nil && seconds >= 0 {
-				td = time.Duration(seconds) * time.Second
+
+			s, errInt := json.Number(val).Int64()
+			if errInt == nil && s >= 0 {
+				td = time.Duration(s) * time.Second
 			} else {
-				return fmt.Errorf("invalid duration string '%s': %w", value, err)
+				return fmt.Errorf("invalid duration string '%s': %w", val, err)
 			}
 		}
 		*d = Duration(td)
-		return nil
 	default:
 		return fmt.Errorf("invalid duration type: %T", v)
 	}
+	return nil
 }
 
-func (d Duration) Duration() time.Duration {
+func (d Duration) StdDuration() time.Duration {
 	return time.Duration(d)
 }
-
 
 type FileMode os.FileMode
 
@@ -66,15 +62,15 @@ func (fm *FileMode) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	var mode uint32
-	
+
 	if _, err := fmt.Sscanf(s, "0%o", &mode); err != nil {
 		if _, err2 := fmt.Sscanf(s, "%o", &mode); err2 != nil {
-			
-			modeDecimal, errDecimal := json.Number(s).Int64()
+
+			mDecimal, errDecimal := json.Number(s).Int64()
 			if errDecimal == nil {
-				mode = uint32(modeDecimal)
+				mode = uint32(mDecimal)
 			} else {
-				return fmt.Errorf("invalid file mode format '%s': %v / %v / %v", s, err, err2, errDecimal)
+				return fmt.Errorf("invalid file mode format '%s'", s)
 			}
 		}
 	}
@@ -82,9 +78,9 @@ func (fm *FileMode) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (fm FileMode) FileMode() os.FileMode {
-	if fm == 0 { 
-		return 0660 
+func (fm FileMode) StdFileMode() os.FileMode {
+	if fm == 0 {
+		return 0660
 	}
 	return os.FileMode(fm)
 }
@@ -96,227 +92,206 @@ type Repository struct {
 }
 
 type ServerConfig struct {
-	ListenAddress         string   `json:"listenAddress"`
-	UnixSocketPath        string   `json:"unixSocketPath"`
-	UnixSocketPermissions FileMode `json:"unixSocketPermissions"`
-	RequestTimeout        Duration `json:"requestTimeout"`       
-	ShutdownTimeout       Duration `json:"shutdownTimeout"`      
-	IdleTimeout           Duration `json:"idleTimeout"`          
-	ReadHeaderTimeout     Duration `json:"readHeaderTimeout"`    
-	MaxConcurrentFetches  int      `json:"maxConcurrentFetches"` 
-	UserAgent             string   `json:"userAgent,omitempty"`  
+	ListenAddr        string   `json:"listenAddress"`
+	UnixPath          string   `json:"unixSocketPath"`
+	UnixPerms         FileMode `json:"unixSocketPermissions"`
+	ReqTimeout        Duration `json:"requestTimeout"`
+	ShutdownTimeout   Duration `json:"shutdownTimeout"`
+	IdleTimeout       Duration `json:"idleTimeout"`
+	ReadHeaderTimeout Duration `json:"readHeaderTimeout"`
+	MaxConcurrent     int      `json:"maxConcurrentFetches"`
+	UserAgent         string   `json:"userAgent,omitempty"`
 }
 
 type CacheConfig struct {
-	Directory    string `json:"directory"`
-	MaxSize      string `json:"maxSize"` 
-	Enabled      bool   `json:"enabled"`
-	CleanOnStart bool   `json:"cleanOnStart"` 
-	
-	DefaultTTL Duration `json:"defaultTTL"`
-	
-	
-	RevalidateOnHitTTL Duration `json:"revalidateOnHitTTL"`
-	
-	NegativeCacheTTL Duration `json:"negativeCacheTTL"`
+	Dir              string   `json:"directory"`
+	MaxSize          string   `json:"maxSize"`
+	Enabled          bool     `json:"enabled"`
+	CleanOnStart     bool     `json:"cleanOnStart"`
+	DefaultTTL       Duration `json:"defaultTTL"`
+	RevalidateHitTTL Duration `json:"revalidateOnHitTTL"`
+	NegativeTTL      Duration `json:"negativeCacheTTL"`
 }
 
 type Config struct {
-	Server       ServerConfig          `json:"server"`
-	Cache        CacheConfig           `json:"cache"`
-	Logging      logging.LoggingConfig `json:"logging"` 
-	Repositories []Repository          `json:"repositories"`
+	Server       ServerConfig   `json:"server"`
+	Cache        CacheConfig    `json:"cache"`
+	Logging      logging.Config `json:"logging"`
+	Repositories []Repository   `json:"repositories"`
 }
 
 func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
-			ListenAddress:         ":8080",
-			UnixSocketPath:        "", 
-			UnixSocketPermissions: 0660,
-			RequestTimeout:        Duration(30 * time.Second),
-			ShutdownTimeout:       Duration(15 * time.Second),
-			IdleTimeout:           Duration(120 * time.Second),
-			ReadHeaderTimeout:     Duration(10 * time.Second),
-			MaxConcurrentFetches:  20,
-			UserAgent:             "go-apt-proxy/2.0 (+https:
+			ListenAddr:        ":8080",
+			UnixPerms:         0660,
+			ReqTimeout:        Duration(60 * time.Second),
+			ShutdownTimeout:   Duration(15 * time.Second),
+			IdleTimeout:       Duration(120 * time.Second),
+			ReadHeaderTimeout: Duration(10 * time.Second),
+			MaxConcurrent:     20,
+			UserAgent:         "go-apt-proxy/2.1 (+https://github.com/yolkispalkis/go-apt-cache)",
 		},
 		Cache: CacheConfig{
-			Directory:          "./apt_cache_data",
-			MaxSize:            "10GB",
-			Enabled:            true,
-			CleanOnStart:       false,
-			DefaultTTL:         Duration(1 * time.Hour),
-			RevalidateOnHitTTL: Duration(0), 
-			NegativeCacheTTL:   Duration(5 * time.Minute),
+			Dir:              "./apt_cache_data",
+			MaxSize:          "10GB",
+			Enabled:          true,
+			CleanOnStart:     false,
+			DefaultTTL:       Duration(1 * time.Hour),
+			RevalidateHitTTL: Duration(0),
+			NegativeTTL:      Duration(5 * time.Minute),
 		},
-		Logging: logging.DefaultConfig(), 
+		Logging: DefaultLogging(),
 		Repositories: []Repository{
-			{Name: "ubuntu", URL: "http:
-			{Name: "debian", URL: "http:
+			{Name: "ubuntu", URL: "http://archive.ubuntu.com/ubuntu/", Enabled: true},
+			{Name: "debian", URL: "http://deb.debian.org/debian/", Enabled: false},
 		},
 	}
 }
 
-func Load(filePath string) (*Config, error) {
-	absFilePath, err := filepath.Abs(util.CleanPath(filePath))
-	if err != nil {
-		return nil, fmt.Errorf("failed to get absolute path for config file %s: %w", filePath, err)
+func DefaultLogging() logging.Config {
+	return logging.Config{
+		Level:           logging.LevelInfo,
+		Path:            "",
+		DisableTerminal: false,
+		MaxSizeMB:       100,
+		MaxBackups:      3,
+		MaxAgeDays:      7,
+		Compress:        true,
 	}
+}
 
-	data, err := os.ReadFile(absFilePath)
+func Load(path string) (*Config, error) {
+	absPath, err := filepath.Abs(util.CleanPath(path))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file %s: %w", absFilePath, err)
+		return nil, fmt.Errorf("abs path for %s: %w", path, err)
 	}
-
-	cfg := Default() 
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", absPath, err)
+	}
+	cfg := Default()
 	if err := json.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse config file %s: %w", absFilePath, err)
+		return nil, fmt.Errorf("parse config %s: %w", absPath, err)
 	}
 
-	
-	if cfg.Cache.Enabled && cfg.Cache.Directory != "" {
-		cfg.Cache.Directory = util.CleanPath(cfg.Cache.Directory)
+	if cfg.Cache.Enabled && cfg.Cache.Dir != "" {
+		cfg.Cache.Dir = util.CleanPath(cfg.Cache.Dir)
 	}
-	if cfg.Logging.FilePath != "" {
-		cfg.Logging.FilePath = util.CleanPath(cfg.Logging.FilePath)
+	if cfg.Logging.Path != "" {
+		cfg.Logging.Path = util.CleanPath(cfg.Logging.Path)
 	}
-	if cfg.Server.UnixSocketPath != "" {
-		cfg.Server.UnixSocketPath = util.CleanPath(cfg.Server.UnixSocketPath)
+	if cfg.Server.UnixPath != "" {
+		cfg.Server.UnixPath = util.CleanPath(cfg.Server.UnixPath)
 	}
-
 	return cfg, nil
 }
 
-func Save(cfg *Config, filePath string) error {
-	absFilePath, err := filepath.Abs(util.CleanPath(filePath))
+func Save(cfg *Config, path string) error {
+	absPath, err := filepath.Abs(util.CleanPath(path))
 	if err != nil {
-		return fmt.Errorf("failed to get absolute path for config file %s: %w", filePath, err)
+		return fmt.Errorf("abs path for %s: %w", path, err)
 	}
-
-	dir := filepath.Dir(absFilePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s for config: %w", dir, err)
+	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+		return fmt.Errorf("mkdir for config %s: %w", filepath.Dir(absPath), err)
 	}
-
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
+		return fmt.Errorf("marshal config: %w", err)
 	}
-
-	if err := os.WriteFile(absFilePath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write config file %s: %w", absFilePath, err)
-	}
-	return nil
+	return os.WriteFile(absPath, data, 0644)
 }
 
-func EnsureDefaultConfig(filePath string) error {
-	absFilePath, err := filepath.Abs(util.CleanPath(filePath))
+func EnsureDefault(path string) error {
+	absPath, err := filepath.Abs(util.CleanPath(path))
 	if err != nil {
-		return fmt.Errorf("failed to get absolute path for config file %s: %w", filePath, err)
+		return fmt.Errorf("abs path for %s: %w", path, err)
 	}
-	if _, err := os.Stat(absFilePath); err == nil {
-		return nil 
+	if _, err := os.Stat(absPath); err == nil {
+		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("failed to check config file status %s: %w", absFilePath, err)
+		return fmt.Errorf("stat config %s: %w", absPath, err)
 	}
 
-	
-	fmt.Printf("Config file not found at %s, creating default.\n", absFilePath)
-	return Save(Default(), absFilePath)
+	fmt.Printf("Config file not found at %s, creating default.\n", absPath)
+	return Save(Default(), absPath)
 }
 
 func Validate(cfg *Config) error {
-	if cfg.Server.ListenAddress == "" && cfg.Server.UnixSocketPath == "" {
-		return errors.New("server: must configure at least one of listenAddress or unixSocketPath")
+	s := &cfg.Server
+	if s.ListenAddr == "" && s.UnixPath == "" {
+		return errors.New("server: must set listenAddress or unixSocketPath")
 	}
-	if cfg.Server.RequestTimeout.Duration() <= 0 {
-		return errors.New("server.requestTimeout must be a positive duration")
+	if s.ReqTimeout.StdDuration() <= 0 {
+		return errors.New("server.requestTimeout must be > 0")
 	}
-	if cfg.Server.ShutdownTimeout.Duration() <= 0 {
-		return errors.New("server.shutdownTimeout must be a positive duration")
-	}
-	if cfg.Server.IdleTimeout.Duration() < 0 { 
-		return errors.New("server.idleTimeout cannot be negative")
-	}
-	if cfg.Server.ReadHeaderTimeout.Duration() <= 0 {
-		return errors.New("server.readHeaderTimeout must be a positive duration")
-	}
-	if cfg.Server.MaxConcurrentFetches <= 0 {
-		return errors.New("server.maxConcurrentFetches must be positive")
-	}
-	if cfg.Server.UserAgent == "" {
-		cfg.Server.UserAgent = Default().Server.UserAgent 
+	if s.ShutdownTimeout.StdDuration() <= 0 {
+		return errors.New("server.shutdownTimeout must be > 0")
 	}
 
-	if cfg.Cache.Enabled {
-		if cfg.Cache.Directory == "" {
-			return errors.New("cache.directory must be set when cache is enabled")
-		}
-		
-		if !filepath.IsAbs(cfg.Cache.Directory) && !strings.HasPrefix(cfg.Cache.Directory, "."+string(filepath.Separator)) && cfg.Cache.Directory != "." {
-			
-			
-			
-		}
-		if _, err := util.ParseSize(cfg.Cache.MaxSize); err != nil {
-			return fmt.Errorf("invalid cache.maxSize %q: %w", cfg.Cache.MaxSize, err)
-		}
-		if cfg.Cache.DefaultTTL.Duration() < 0 {
-			return errors.New("cache.defaultTTL cannot be negative")
-		}
-		if cfg.Cache.RevalidateOnHitTTL.Duration() < 0 {
-			return errors.New("cache.revalidateOnHitTTL cannot be negative")
-		}
-		if cfg.Cache.NegativeCacheTTL.Duration() < 0 {
-			return errors.New("cache.negativeCacheTTL cannot be negative")
-		}
+	if s.ReadHeaderTimeout.StdDuration() <= 0 {
+		return errors.New("server.readHeaderTimeout must be > 0")
+	}
+	if s.MaxConcurrent <= 0 {
+		return errors.New("server.maxConcurrentFetches must be > 0")
+	}
+	if s.UserAgent == "" {
+		s.UserAgent = Default().Server.UserAgent
 	}
 
-	if _, err := logging.ParseLevel(cfg.Logging.Level); err != nil { 
+	c := &cfg.Cache
+	if c.Enabled {
+		if c.Dir == "" {
+			return errors.New("cache.directory must be set if cache enabled")
+		}
+		if _, err := util.ParseSize(c.MaxSize); err != nil {
+			return fmt.Errorf("invalid cache.maxSize %q: %w", c.MaxSize, err)
+		}
+
+	}
+
+	if _, err := logging.ParseLevel(cfg.Logging.Level); err != nil {
 		return fmt.Errorf("invalid logging.level: %w", err)
 	}
 
 	repoNames := make(map[string]struct{})
-	hasEnabledRepo := false
-	for i, repo := range cfg.Repositories {
+	hasEnabled := false
+	for i := range cfg.Repositories {
+		repo := &cfg.Repositories[i]
 		if strings.TrimSpace(repo.Name) == "" {
-			return fmt.Errorf("repository %d: name cannot be empty", i)
+			return fmt.Errorf("repo %d: name empty", i)
 		}
-		if !util.IsRepoNameSafe(repo.Name) { 
-			return fmt.Errorf("repository %q: name contains invalid characters or is a reserved name", repo.Name)
+		if !util.IsRepoNameSafe(repo.Name) {
+			return fmt.Errorf("repo %q: name invalid", repo.Name)
 		}
 		if strings.TrimSpace(repo.URL) == "" {
-			return fmt.Errorf("repository %q: URL cannot be empty", repo.Name)
+			return fmt.Errorf("repo %q: URL empty", repo.Name)
 		}
-		parsedURL, err := url.Parse(repo.URL)
+		u, err := url.Parse(repo.URL)
 		if err != nil {
-			return fmt.Errorf("repository %q: invalid URL %q: %w", repo.Name, repo.URL, err)
+			return fmt.Errorf("repo %q: invalid URL %q: %w", repo.Name, repo.URL, err)
 		}
-		if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
-			return fmt.Errorf("repository %q: URL scheme must be http or https, got %q", repo.Name, parsedURL.Scheme)
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("repo %q: URL scheme must be http(s)", repo.Name)
 		}
-		if parsedURL.Host == "" {
-			return fmt.Errorf("repository %q: URL is missing a host", repo.Name)
+		if u.Host == "" {
+			return fmt.Errorf("repo %q: URL host missing", repo.Name)
 		}
-		
-		if !strings.HasSuffix(cfg.Repositories[i].URL, "/") {
-			cfg.Repositories[i].URL += "/"
+
+		if !strings.HasSuffix(repo.URL, "/") {
+			repo.URL += "/"
 		}
 
 		if _, exists := repoNames[repo.Name]; exists {
-			return fmt.Errorf("duplicate repository name %q found", repo.Name)
+			return fmt.Errorf("duplicate repo name %q", repo.Name)
 		}
 		repoNames[repo.Name] = struct{}{}
 		if repo.Enabled {
-			hasEnabledRepo = true
+			hasEnabled = true
 		}
 	}
+	if !hasEnabled && len(cfg.Repositories) > 0 {
 
-	if !hasEnabledRepo && len(cfg.Repositories) > 0 {
-		
-		
 	}
-
 	return nil
 }

@@ -18,91 +18,79 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
-type RepositoryHandler struct {
-	repoConfig   config.Repository
-	serverConfig config.ServerConfig
-	cacheConfig  config.CacheConfig
-	cacheManager cache.CacheManager
-	fetcher      *fetch.Coordinator
-	logger       zerolog.Logger
+type RepoHandler struct {
+	repoCfg  config.Repository
+	srvCfg   config.ServerConfig
+	cacheCfg config.CacheConfig
+	cm       cache.Manager
+	fetcher  *fetch.Coordinator
+	log      zerolog.Logger
 }
 
-func NewRepositoryHandler(
-	repoCfg config.Repository,
-	serverCfg config.ServerConfig,
-	cacheCfg config.CacheConfig,
-	cm cache.CacheManager,
-	fc *fetch.Coordinator,
-	parentLogger zerolog.Logger,
-) *RepositoryHandler {
-	return &RepositoryHandler{
-		repoConfig:   repoCfg,
-		serverConfig: serverCfg,
-		cacheConfig:  cacheCfg,
-		cacheManager: cm,
-		fetcher:      fc,
-		logger:       parentLogger.With().Str("repository", repoCfg.Name).Logger(),
+func newRepoHandler(rcfg config.Repository, scfg config.ServerConfig, ccfg config.CacheConfig,
+	cm cache.Manager, fc *fetch.Coordinator, parentLog zerolog.Logger) *RepoHandler {
+	return &RepoHandler{
+		repoCfg: rcfg, srvCfg: scfg, cacheCfg: ccfg, cm: cm, fetcher: fc,
+		log: parentLog.With().Str("repo", rcfg.Name).Logger(),
 	}
 }
 
-func (h *RepositoryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
-	relativePath := strings.TrimPrefix(r.URL.Path, "/")
-	if strings.Contains(relativePath, "..") {
-		h.logger.Warn().Str("path", relativePath).Msg("Path traversal attempt detected")
+func (h *RepoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	relPath := strings.TrimPrefix(r.URL.Path, "/")
+	if strings.Contains(relPath, "..") {
+		h.log.Warn().Str("path", relPath).Msg("Path traversal attempt detected")
 		http.Error(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
 
-	cacheKey, err := util.GenerateCacheKey(h.repoConfig.Name, relativePath)
+	cacheKey, err := util.GenerateCacheKey(h.repoCfg.Name, relPath)
 	if err != nil {
-		h.logger.Error().Err(err).Str("repo", h.repoConfig.Name).Str("relative_path", relativePath).Msg("Failed to generate cache key")
+		h.log.Error().Err(err).Str("repo", h.repoCfg.Name).Str("path", relPath).Msg("Failed to generate cache key")
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	upstreamURL := h.repoConfig.URL + relativePath
+	upstreamURL := h.repoCfg.URL + relPath
 
-	h.logger.Debug().Str("method", r.Method).Str("path", relativePath).Str("cache_key", cacheKey).Str("upstream_url", upstreamURL).Msg("Handling request")
+	h.log.Debug().Str("meth", r.Method).Str("path", relPath).Str("key", cacheKey).Str("url", upstreamURL).Msg("Handling request")
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		h.logger.Warn().Str("method", r.Method).Msg("Method not allowed")
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
 
-	cacheResult, err := h.cacheManager.Get(r.Context(), cacheKey)
+	cacheRes, err := h.cm.Get(r.Context(), cacheKey)
 	if err != nil && !errors.Is(err, cache.ErrNotFound) {
-		h.logger.Error().Err(err).Str("key", cacheKey).Msg("Error looking up item in cache")
+		h.log.Error().Err(err).Str("key", cacheKey).Msg("Cache get error")
 		http.Error(w, "Cache error", http.StatusInternalServerError)
 		return
 	}
 
-	if cacheResult != nil && cacheResult.Hit {
-		h.logger.Info().Str("key", cacheKey).Str("status", "HIT").Msg("Cache hit")
-		h.handleCacheHit(w, r, cacheKey, upstreamURL, relativePath, cacheResult)
+	if cacheRes != nil && cacheRes.Hit {
+		h.log.Info().Str("key", cacheKey).Str("status", "HIT").Msg("Cache hit")
+		h.handleCacheHit(w, r, cacheKey, upstreamURL, relPath, cacheRes)
 		return
 	}
 
-	h.logger.Info().Str("key", cacheKey).Str("status", "MISS").Msg("Cache miss")
-	h.handleCacheMiss(w, r, cacheKey, upstreamURL, relativePath)
+	h.log.Info().Str("key", cacheKey).Str("status", "MISS").Msg("Cache miss")
+	h.handleCacheMiss(w, r, cacheKey, upstreamURL, relPath)
 }
 
-func (h *RepositoryHandler) handleCacheHit(w http.ResponseWriter, r *http.Request, cacheKey, upstreamURL, relativePath string, cacheResult *cache.CacheResult) {
-	meta := cacheResult.Metadata
+func (h *RepoHandler) handleCacheHit(w http.ResponseWriter, r *http.Request,
+	key, upstreamURL, relPath string, cacheRes *cache.GetResult) {
 
-	if cacheResult.Content != nil {
-		defer cacheResult.Content.Close()
+	meta := cacheRes.Meta
+	if cacheRes.Content != nil {
+		defer cacheRes.Content.Close()
 	}
 
 	if meta.StatusCode == http.StatusNotFound {
-		h.logger.Debug().Str("key", cacheKey).Msg("Negative cache hit (404)")
+		h.log.Debug().Str("key", key).Msg("Negative cache hit (404)")
 
-		if h.cacheConfig.NegativeCacheTTL.Duration() > 0 && time.Since(meta.FetchedAt) > h.cacheConfig.NegativeCacheTTL.Duration() {
-			h.logger.Info().Str("key", cacheKey).Msg("Expired negative cache entry, treating as miss.")
-
-			go h.cacheManager.Delete(context.Background(), cacheKey)
-			h.handleCacheMiss(w, r, cacheKey, upstreamURL, relativePath)
+		if h.cacheCfg.NegativeTTL.StdDuration() > 0 && time.Since(meta.FetchedAt) > h.cacheCfg.NegativeTTL.StdDuration() {
+			h.log.Info().Str("key", key).Msg("Expired negative cache entry, re-fetching.")
+			go h.cm.Delete(context.Background(), key)
+			h.handleCacheMiss(w, r, key, upstreamURL, relPath)
 			return
 		}
 		w.Header().Set("X-Cache-Status", "HIT_NEGATIVE")
@@ -110,257 +98,227 @@ func (h *RepositoryHandler) handleCacheHit(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	needsRevalidation := false
+	needsReval := false
 	now := time.Now()
-
 	if meta.IsStale(now) {
-		h.logger.Debug().Str("key", cacheKey).Time("expires_at", meta.ExpiresAt).Msg("Item stale based on ExpiresAt/Cache-Control.")
-		needsRevalidation = true
+		h.log.Debug().Str("key", key).Time("expires_at", meta.ExpiresAt).Msg("Item stale based on ExpiresAt/Cache-Control.")
+		needsReval = true
 	}
 
-	if !needsRevalidation && h.cacheConfig.RevalidateOnHitTTL.Duration() > 0 {
-		if meta.ValidatedAt.IsZero() || now.Sub(meta.ValidatedAt) > h.cacheConfig.RevalidateOnHitTTL.Duration() {
-			h.logger.Debug().Str("key", cacheKey).Time("validated_at", meta.ValidatedAt).Msg("Item requires revalidation due to RevalidateOnHitTTL.")
-			needsRevalidation = true
+	if !needsReval && h.cacheCfg.RevalidateHitTTL.StdDuration() > 0 {
+		if meta.ValidatedAt.IsZero() || now.Sub(meta.ValidatedAt) > h.cacheCfg.RevalidateHitTTL.StdDuration() {
+			h.log.Debug().Str("key", key).Time("validated_at", meta.ValidatedAt).Msg("Item requires revalidation due to RevalidateOnHitTTL.")
+			needsReval = true
 		}
 	}
 
 	if clientCC := util.ParseCacheControl(r.Header.Get("Cache-Control")); clientCC["no-cache"] != "" {
-		h.logger.Debug().Str("key", cacheKey).Msg("Client requested no-cache, forcing revalidation.")
-		needsRevalidation = true
+		h.log.Debug().Str("key", key).Msg("Client requested no-cache, forcing revalidation.")
+		needsReval = true
 	}
 
-	if needsRevalidation {
-		h.logger.Debug().Str("key", cacheKey).Msg("Revalidating with upstream.")
-		w.Header().Set("X-Cache-Status", "REVALIDATING")
-		fetchOpts := &fetch.FetchOptions{}
-		if !meta.ModTime.IsZero() {
-			fetchOpts.IfModifiedSince = meta.ModTime
+	if needsReval {
+		h.revalidateAndServe(w, r, key, upstreamURL, relPath, meta)
+	} else {
+		w.Header().Set("X-Cache-Status", "HIT")
+		h.serveFromCache(w, r, key, relPath, meta)
+	}
+}
+
+func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
+	key, upstreamURL, relPath string, currentMeta *cache.ItemMeta) {
+
+	h.log.Debug().Str("key", key).Msg("Revalidating with upstream.")
+	w.Header().Set("X-Cache-Status", "REVALIDATING")
+
+	fetchOpts := &fetch.Options{}
+	if lmStr := currentMeta.Headers.Get("Last-Modified"); lmStr != "" {
+		if t, err := http.ParseTime(lmStr); err == nil {
+			fetchOpts.IfModSince = t
 		}
-		if etag := meta.Headers.Get("ETag"); etag != "" {
-			fetchOpts.IfNoneMatch = etag
-		}
+	} else if !currentMeta.FetchedAt.IsZero() && currentMeta.StatusCode == http.StatusOK {
+		fetchOpts.IfModSince = currentMeta.FetchedAt
+	}
+	if etag := currentMeta.Headers.Get("ETag"); etag != "" {
+		fetchOpts.IfNoneMatch = etag
+	}
 
-		revalKey := "revalidate:" + cacheKey
-		fetchResult, fetchErr := h.fetcher.Fetch(r.Context(), revalKey, upstreamURL, fetchOpts)
+	revalKey := "revalidate:" + key
+	fetchRes, fetchErr := h.fetcher.Fetch(r.Context(), revalKey, upstreamURL, fetchOpts)
 
-		if fetchErr == nil {
-			h.logger.Info().Str("key", cacheKey).Msg("Revalidation successful: new content fetched.")
-			defer fetchResult.Body.Close()
-
-			h.storeAndServe(w, r, cacheKey, relativePath, fetchResult, "UPDATED")
-			return
-		}
-
-		if errors.Is(fetchErr, fetch.ErrUpstreamNotModified) {
-			h.logger.Info().Str("key", cacheKey).Msg("Revalidation successful: item not modified (304).")
-
-			if err := h.cacheManager.UpdateValidatedAt(r.Context(), cacheKey, time.Now()); err != nil {
-				h.logger.Warn().Err(err).Str("key", cacheKey).Msg("Failed to update validation timestamp in cache.")
-			}
-			w.Header().Set("X-Cache-Status", "VALIDATED")
-
-			h.serveFromCache(w, r, cacheKey, relativePath, meta)
-			return
-		}
-
-		h.logger.Warn().Err(fetchErr).Str("key", cacheKey).Msg("Revalidation fetch failed. Serving stale content.")
-		w.Header().Set("X-Cache-Status", "STALE_REVAL_FAILED")
-
-		h.serveFromCache(w, r, cacheKey, relativePath, meta)
+	if fetchErr == nil {
+		h.log.Info().Str("key", key).Msg("Revalidation successful: new content fetched.")
+		defer fetchRes.Body.Close()
+		h.storeAndServe(w, r, key, relPath, fetchRes, "UPDATED")
 		return
 	}
 
-	w.Header().Set("X-Cache-Status", "HIT")
-	h.serveFromCache(w, r, cacheKey, relativePath, meta)
+	if errors.Is(fetchErr, fetch.ErrUpstreamNotModified) {
+		h.log.Info().Str("key", key).Msg("Revalidation successful: item not modified (304).")
+		if err := h.cm.UpdateValidatedAt(r.Context(), key, time.Now()); err != nil {
+			h.log.Warn().Err(err).Str("key", key).Msg("Failed to update validation timestamp in cache.")
+		}
+		w.Header().Set("X-Cache-Status", "VALIDATED")
+		h.serveFromCache(w, r, key, relPath, currentMeta)
+		return
+	}
+
+	h.log.Warn().Err(fetchErr).Str("key", key).Msg("Revalidation fetch failed. Serving stale content.")
+	w.Header().Set("X-Cache-Status", "STALE_REVAL_FAILED")
+	h.serveFromCache(w, r, key, relPath, currentMeta)
 }
 
-func (h *RepositoryHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request, cacheKey, upstreamURL, relativePath string) {
+func (h *RepoHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request,
+	key, upstreamURL, relPath string) {
 	w.Header().Set("X-Cache-Status", "MISS")
 
-	fetchOpts := &fetch.FetchOptions{}
+	fetchOpts := &fetch.Options{}
 	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
 		if t, err := http.ParseTime(ims); err == nil {
-			fetchOpts.IfModifiedSince = t
+			fetchOpts.IfModSince = t
 		}
 	}
 	if inm := r.Header.Get("If-None-Match"); inm != "" {
 		fetchOpts.IfNoneMatch = inm
 	}
 
-	fetchResult, fetchErr := h.fetcher.Fetch(r.Context(), cacheKey, upstreamURL, fetchOpts)
-
+	fetchRes, fetchErr := h.fetcher.Fetch(r.Context(), key, upstreamURL, fetchOpts)
 	if fetchErr != nil {
-		if errors.Is(fetchErr, fetch.ErrUpstreamNotModified) {
-
-			h.logger.Info().Str("key", cacheKey).Msg("Upstream returned 304 for MISS (client is current).")
-			w.Header().Set("X-Cache-Status", "MISS_UPSTREAM_NOT_MODIFIED")
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-		if errors.Is(fetchErr, fetch.ErrUpstreamNotFound) {
-			h.logger.Info().Str("key", cacheKey).Msg("Upstream returned 404 for MISS.")
-			w.Header().Set("X-Cache-Status", "MISS_UPSTREAM_NOT_FOUND")
-
-			if h.cacheConfig.NegativeCacheTTL.Duration() > 0 {
-				go func() {
-					putOpts := cache.CachePutOptions{
-						UpstreamURL: upstreamURL,
-						StatusCode:  http.StatusNotFound,
-						Headers:     make(http.Header),
-						Size:        0,
-						FetchedAt:   time.Now(),
-					}
-
-					if _, err := h.cacheManager.Put(context.Background(), cacheKey, nil, putOpts); err != nil {
-						h.logger.Warn().Err(err).Str("key", cacheKey).Msg("Failed to store negative cache entry for 404.")
-					}
-				}()
-			}
-			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
-			return
-		}
-
-		h.logger.Error().Err(fetchErr).Str("key", cacheKey).Msg("Failed to fetch item from upstream on MISS.")
-		status := http.StatusBadGateway
-		if errors.Is(fetchErr, fetch.ErrUpstreamServer) {
-			status = http.StatusBadGateway
-		}
-		if errors.Is(fetchErr, fetch.ErrUpstreamOtherClient) {
-			status = http.StatusBadGateway
-		}
-		if errors.Is(fetchErr, fetch.ErrNetwork) || errors.Is(fetchErr, context.DeadlineExceeded) {
-			status = http.StatusGatewayTimeout
-		}
-
-		http.Error(w, http.StatusText(status), status)
+		h.handleFetchError(w, r, key, upstreamURL, fetchErr)
 		return
 	}
-	defer fetchResult.Body.Close()
+	defer fetchRes.Body.Close()
 
-	h.storeAndServe(w, r, cacheKey, relativePath, fetchResult, "MISS_FETCHED")
+	h.storeAndServe(w, r, key, relPath, fetchRes, "MISS_FETCHED")
 }
 
-func (h *RepositoryHandler) storeAndServe(w http.ResponseWriter, r *http.Request, cacheKey, relativePath string, fetchResult *fetch.FetchResult, xCacheStatus string) {
+func (h *RepoHandler) handleFetchError(w http.ResponseWriter, _ *http.Request, key, upstreamURL string, err error) {
+	if errors.Is(err, fetch.ErrUpstreamNotModified) {
+		h.log.Info().Str("key", key).Msg("Upstream returned 304 for MISS (client has current).")
+		w.Header().Set("X-Cache-Status", "MISS_UPSTREAM_NOT_MODIFIED")
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	if errors.Is(err, fetch.ErrUpstreamNotFound) {
+		h.log.Info().Str("key", key).Msg("Upstream returned 404 for MISS.")
+		w.Header().Set("X-Cache-Status", "MISS_UPSTREAM_NOT_FOUND")
+		if h.cacheCfg.NegativeTTL.StdDuration() > 0 {
+			go func() {
+				popts := cache.PutOptions{
+					UpstreamURL: upstreamURL, StatusCode: http.StatusNotFound,
+					Headers: make(http.Header), FetchedAt: time.Now(),
+				}
+				if _, putErr := h.cm.Put(context.Background(), key, nil, popts); putErr != nil {
+					h.log.Warn().Err(putErr).Str("key", key).Msg("Failed to store negative cache entry for 404.")
+				}
+			}()
+		}
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		return
+	}
 
-	putOpts := cache.CachePutOptions{
-		UpstreamURL: fetchResult.Header.Get("X-Upstream-Url"),
-		StatusCode:  fetchResult.StatusCode,
-		Headers:     fetchResult.Header,
-		Size:        fetchResult.Size,
+	h.log.Error().Err(err).Str("key", key).Msg("Failed to fetch item from upstream on MISS.")
+	status := http.StatusBadGateway
+	if errors.Is(err, fetch.ErrUpstreamServerErr) {
+		status = http.StatusBadGateway
+	}
+	if errors.Is(err, fetch.ErrUpstreamClientErr) {
+		status = http.StatusBadGateway
+	}
+	if errors.Is(err, fetch.ErrNetwork) || errors.Is(err, context.DeadlineExceeded) {
+		status = http.StatusGatewayTimeout
+	}
+	http.Error(w, http.StatusText(status), status)
+}
+
+func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
+	key, relPath string, fetchRes *fetch.Result, xCacheStat string) {
+
+	popts := cache.PutOptions{
+		UpstreamURL: fetchRes.Header.Get("X-Upstream-Url"),
+		StatusCode:  fetchRes.Status,
+		Headers:     fetchRes.Header,
+		Size:        fetchRes.Size,
 		FetchedAt:   time.Now(),
 	}
-	if putOpts.UpstreamURL == "" {
-		putOpts.UpstreamURL = fetchResult.Header.Get("Content-Location")
+	if popts.UpstreamURL == "" {
+		popts.UpstreamURL = fetchRes.Header.Get("Content-Location")
 	}
 
 	pr, pw := io.Pipe()
-
-	var newCacheMeta *cache.CacheItemMetadata
-	var putErr error
-	var wg sync.WaitGroup
-	wg.Add(1)
+	var storeWg sync.WaitGroup
+	storeWg.Add(1)
 
 	go func() {
-		defer wg.Done()
-		defer pw.Close()
-		newCacheMeta, putErr = h.cacheManager.Put(r.Context(), cacheKey, pr, putOpts)
+		defer storeWg.Done()
+		_, putErr := h.cm.Put(context.Background(), key, pr, popts)
 		if putErr != nil {
-			h.logger.Error().Err(putErr).Str("key", cacheKey).Msg("Error storing item to cache during Tee.")
-
-			pr.CloseWithError(putErr)
+			h.log.Error().Err(putErr).Str("key", key).Msg("Error storing item to cache during Tee.")
+			_ = pr.CloseWithError(putErr)
 		}
 	}()
 
-	teeReader := io.TeeReader(fetchResult.Body, pw)
+	teeBody := io.TeeReader(fetchRes.Body, pw)
 
-	if h.checkClientConditionalHeaders(w, r, fetchResult.ModTime, fetchResult.Header.Get("ETag")) {
-		w.Header().Set("X-Cache-Status", xCacheStatus+"_CLIENT_NOT_MODIFIED")
-
-		io.Copy(io.Discard, teeReader)
-		pw.Close()
-		wg.Wait()
-
+	if h.checkClientConditional(w, r, fetchRes.ModTime, fetchRes.Header.Get("ETag")) {
+		w.Header().Set("X-Cache-Status", xCacheStat+"_CLIENT_NOT_MODIFIED")
+		_, _ = io.Copy(io.Discard, teeBody)
+		_ = pw.Close()
+		storeWg.Wait()
 		return
 	}
 
-	w.Header().Set("X-Cache-Status", xCacheStatus)
-	if contentType := fetchResult.Header.Get("Content-Type"); contentType != "" {
-		w.Header().Set("Content-Type", contentType)
-	} else {
-		w.Header().Set("Content-Type", util.GetContentType(relativePath))
-	}
-	if !fetchResult.ModTime.IsZero() {
-		w.Header().Set("Last-Modified", fetchResult.ModTime.UTC().Format(http.TimeFormat))
-	}
-	if etag := fetchResult.Header.Get("ETag"); etag != "" {
-		w.Header().Set("ETag", etag)
-	}
-
-	util.SelectProxyHeaders(w.Header(), fetchResult.Header)
+	w.Header().Set("X-Cache-Status", xCacheStat)
+	h.setResponseHeaders(w, relPath, fetchRes.Header, fetchRes.ModTime)
+	util.SelectProxyHeaders(w.Header(), fetchRes.Header)
 
 	if r.Method == http.MethodHead {
-		if fetchResult.Size >= 0 {
-			w.Header().Set("Content-Length", strconv.FormatInt(fetchResult.Size, 10))
+		if fetchRes.Size >= 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(fetchRes.Size, 10))
 		}
 		w.WriteHeader(http.StatusOK)
-		io.Copy(io.Discard, teeReader)
-		pw.Close()
-		wg.Wait()
-		return
-	}
-
-	if fetchResult.Size >= 0 {
-		w.Header().Set("Content-Length", strconv.FormatInt(fetchResult.Size, 10))
-	}
-	w.WriteHeader(http.StatusOK)
-
-	writtenBytes, copyErr := io.Copy(w, teeReader)
-
-	if copyErr != nil && !util.IsClientDisconnectedError(copyErr) {
-		h.logger.Error().Err(copyErr).Str("key", cacheKey).Msg("Error streaming response to client.")
-		pw.CloseWithError(copyErr)
+		_, _ = io.Copy(io.Discard, teeBody)
 	} else {
-		pw.Close()
-	}
-
-	wg.Wait()
-
-	if putErr != nil {
-		h.logger.Error().Err(putErr).Str("key", cacheKey).Msg("Caching failed after serving client (or during).")
-
-		if newCacheMeta != nil {
-			go h.cacheManager.Delete(context.Background(), cacheKey)
+		if fetchRes.Size >= 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(fetchRes.Size, 10))
 		}
-	} else {
-		h.logger.Debug().Str("key", cacheKey).Int64("bytes_served", writtenBytes).Msg("Successfully served and initiated caching.")
+		w.WriteHeader(http.StatusOK)
+
+		if _, err := io.Copy(w, teeBody); err != nil {
+			if !util.IsClientDisconnectedError(err) {
+				h.log.Error().Err(err).Str("key", key).Msg("Error streaming response to client.")
+			}
+			_ = pw.CloseWithError(err)
+		} else {
+			_ = pw.Close()
+		}
 	}
+	storeWg.Wait()
 }
 
-func (h *RepositoryHandler) serveFromCache(w http.ResponseWriter, r *http.Request, cacheKey, relativePath string, meta *cache.CacheItemMetadata) {
+func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
+	key, relPath string, meta *cache.ItemMeta) {
 
-	if h.checkClientConditionalHeaders(w, r, meta.ModTime, meta.Headers.Get("ETag")) {
+	var itemModTime time.Time
+	if lmStr := meta.Headers.Get("Last-Modified"); lmStr != "" {
+		if t, err := http.ParseTime(lmStr); err == nil {
+			itemModTime = t
+		}
+	}
+
+	if h.checkClientConditional(w, r, itemModTime, meta.Headers.Get("ETag")) {
 		return
 	}
 
-	cacheReadResult, err := h.cacheManager.Get(r.Context(), cacheKey)
-	if err != nil || !cacheReadResult.Hit || cacheReadResult.Content == nil {
-		h.logger.Error().Err(err).Str("key", cacheKey).Msg("Failed to re-open cache item for serving, or item vanished.")
-
-		h.handleCacheMiss(w, r, cacheKey, meta.UpstreamURL, relativePath)
+	cacheReadRes, err := h.cm.Get(r.Context(), key)
+	if err != nil || !cacheReadRes.Hit || cacheReadRes.Content == nil {
+		h.log.Error().Err(err).Str("key", key).Msg("Failed to re-open cache item for serving, or item vanished.")
+		h.handleCacheMiss(w, r, key, meta.UpstreamURL, relPath)
 		return
 	}
-	defer cacheReadResult.Content.Close()
+	defer cacheReadRes.Content.Close()
 
-	if contentType := meta.Headers.Get("Content-Type"); contentType != "" {
-		w.Header().Set("Content-Type", contentType)
-	} else {
-		w.Header().Set("Content-Type", util.GetContentType(relativePath))
-	}
-	if !meta.ModTime.IsZero() {
-		w.Header().Set("Last-Modified", meta.ModTime.UTC().Format(http.TimeFormat))
-	}
-
+	h.setResponseHeaders(w, relPath, meta.Headers, itemModTime)
 	util.SelectProxyHeaders(w.Header(), meta.Headers)
 
 	if r.Method == http.MethodHead {
@@ -371,48 +329,58 @@ func (h *RepositoryHandler) serveFromCache(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	contentSeeker, ok := cacheReadResult.Content.(io.ReadSeeker)
-	if ok {
-
-		serveName := filepath.Base(relativePath)
+	contentSeeker, isSeeker := cacheReadRes.Content.(io.ReadSeeker)
+	if isSeeker {
+		serveName := filepath.Base(relPath)
 		if serveName == "." || serveName == "/" {
 			serveName = ""
 		}
-
-		http.ServeContent(w, r, serveName, meta.ModTime, contentSeeker)
+		http.ServeContent(w, r, serveName, itemModTime, contentSeeker)
 	} else {
-
 		if meta.Size >= 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
 		}
 		w.WriteHeader(http.StatusOK)
-		if _, err := io.Copy(w, cacheReadResult.Content); err != nil {
+		if _, err := io.Copy(w, cacheReadRes.Content); err != nil {
 			if !util.IsClientDisconnectedError(err) {
-				h.logger.Error().Err(err).Str("key", cacheKey).Msg("Error streaming non-seekable cache content to client.")
+				h.log.Error().Err(err).Str("key", key).Msg("Error streaming non-seekable cache content to client.")
 			}
 		}
 	}
 }
 
-func (h *RepositoryHandler) checkClientConditionalHeaders(w http.ResponseWriter, r *http.Request, resourceModTime time.Time, resourceETag string) bool {
-
+func (h *RepoHandler) checkClientConditional(w http.ResponseWriter, r *http.Request, resModTime time.Time, resETag string) bool {
 	if inm := r.Header.Get("If-None-Match"); inm != "" {
-		if util.CompareETags(inm, resourceETag) {
-
+		if util.CompareETags(inm, resETag) {
 			w.WriteHeader(http.StatusNotModified)
 			return true
 		}
+		return false
 	}
 
-	if ims := r.Header.Get("If-Modified-Since"); ims != "" && r.Header.Get("If-None-Match") == "" {
+	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
 		if t, err := http.ParseTime(ims); err == nil {
-
-			if !resourceModTime.IsZero() && !resourceModTime.After(t) {
+			if !resModTime.IsZero() && !resModTime.After(t) {
 				w.WriteHeader(http.StatusNotModified)
 				return true
 			}
 		}
 	}
-
 	return false
+}
+
+func (h *RepoHandler) setResponseHeaders(w http.ResponseWriter, relPath string, itemHeaders http.Header, itemModTime time.Time) {
+	if ct := itemHeaders.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	} else {
+		w.Header().Set("Content-Type", util.GetContentType(relPath))
+	}
+
+	if !itemModTime.IsZero() {
+		w.Header().Set("Last-Modified", itemModTime.UTC().Format(http.TimeFormat))
+	}
+
+	if etag := itemHeaders.Get("ETag"); etag != "" {
+		w.Header().Set("ETag", etag)
+	}
 }
