@@ -5,10 +5,42 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
-const MetadataVersion = 2
+type UnixTime time.Time
+
+func (ut UnixTime) MarshalJSON() ([]byte, error) {
+	t := time.Time(ut)
+	return []byte(strconv.FormatInt(t.Unix(), 10)), nil
+}
+
+func (ut *UnixTime) UnmarshalJSON(b []byte) error {
+	s := string(b)
+	if s == "null" {
+		*ut = UnixTime(time.Time{})
+		return nil
+	}
+
+	i, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return err
+	}
+
+	if i == 0 {
+		*ut = UnixTime(time.Time{})
+		return nil
+	}
+	*ut = UnixTime(time.Unix(i, 0))
+	return nil
+}
+
+func (ut UnixTime) Time() time.Time {
+	return time.Time(ut)
+}
+
+const MetadataVersion = 3
 
 var ErrNotFound = os.ErrNotExist
 
@@ -17,24 +49,24 @@ type ItemMeta struct {
 	Key         string      `json:"key"`
 	Path        string      `json:"-"`
 	MetaPath    string      `json:"-"`
-	UpstreamURL string      `json:"upstream_url"`
-	FetchedAt   time.Time   `json:"fetched_at"`
-	LastUsedAt  time.Time   `json:"last_used_at"`
-	ValidatedAt time.Time   `json:"validated_at"`
-	StatusCode  int         `json:"status_code"`
+	UpstreamURL string      `json:"upstreamURL"`
+	FetchedAt   UnixTime    `json:"fetchedAt"`
+	LastUsedAt  UnixTime    `json:"lastUsedAt"`
+	ValidatedAt UnixTime    `json:"validatedAt"`
+	StatusCode  int         `json:"statusCode"`
 	Headers     http.Header `json:"headers"`
 	Size        int64       `json:"size"`
-	ExpiresAt   time.Time   `json:"expires_at,omitempty"`
+	ExpiresAt   UnixTime    `json:"expiresAt,omitempty"`
 }
 
 func (m *ItemMeta) IsStale(now time.Time) bool {
 	if m.StatusCode != http.StatusOK && m.StatusCode != http.StatusPartialContent {
 		return true
 	}
-	if m.ExpiresAt.IsZero() {
+	if m.ExpiresAt.Time().IsZero() {
 		return false
 	}
-	return now.After(m.ExpiresAt)
+	return now.After(m.ExpiresAt.Time())
 }
 
 type GetResult struct {

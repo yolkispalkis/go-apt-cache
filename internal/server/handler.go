@@ -110,7 +110,7 @@ func (h *RepoHandler) handleCacheHit(w http.ResponseWriter, r *http.Request,
 
 	if meta.StatusCode == http.StatusNotFound {
 		h.log.Debug().Str("key", key).Msg("Negative cache hit (404)")
-		if h.cacheCfg.NegativeTTL.StdDuration() > 0 && time.Since(meta.FetchedAt) > h.cacheCfg.NegativeTTL.StdDuration() {
+		if h.cacheCfg.NegativeTTL.StdDuration() > 0 && time.Since(meta.FetchedAt.Time()) > h.cacheCfg.NegativeTTL.StdDuration() {
 			h.log.Info().Str("key", key).Msg("Expired negative cache entry, re-fetching.")
 			go h.cm.Delete(context.Background(), key)
 			h.handleCacheMiss(w, r, key, upstreamURL)
@@ -124,13 +124,13 @@ func (h *RepoHandler) handleCacheHit(w http.ResponseWriter, r *http.Request,
 	needsReval := false
 	now := time.Now()
 	if meta.IsStale(now) {
-		h.log.Debug().Str("key", key).Time("expires_at", meta.ExpiresAt).Msg("Item stale based on ExpiresAt/Cache-Control.")
+		h.log.Debug().Str("key", key).Time("expires_at", meta.ExpiresAt.Time()).Msg("Item stale based on ExpiresAt/Cache-Control.")
 		needsReval = true
 	}
 
 	if !needsReval && h.cacheCfg.RevalidateHitTTL.StdDuration() > 0 {
-		if meta.ValidatedAt.IsZero() || now.Sub(meta.ValidatedAt) > h.cacheCfg.RevalidateHitTTL.StdDuration() {
-			h.log.Debug().Str("key", key).Time("validated_at", meta.ValidatedAt).Msg("Item requires revalidation due to RevalidateOnHitTTL.")
+		if meta.ValidatedAt.Time().IsZero() || now.Sub(meta.ValidatedAt.Time()) > h.cacheCfg.RevalidateHitTTL.StdDuration() {
+			h.log.Debug().Str("key", key).Time("validated_at", meta.ValidatedAt.Time()).Msg("Item requires revalidation due to RevalidateOnHitTTL.")
 			needsReval = true
 		}
 	}
@@ -159,8 +159,8 @@ func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
 		if t, err := http.ParseTime(lmStr); err == nil {
 			fetchOpts.IfModSince = t
 		}
-	} else if !currentMeta.FetchedAt.IsZero() && currentMeta.StatusCode == http.StatusOK {
-		fetchOpts.IfModSince = currentMeta.FetchedAt
+	} else if !currentMeta.FetchedAt.Time().IsZero() && currentMeta.StatusCode == http.StatusOK {
+		fetchOpts.IfModSince = currentMeta.FetchedAt.Time()
 	}
 	if etag := currentMeta.Headers.Get("ETag"); etag != "" {
 		fetchOpts.IfNoneMatch = etag
@@ -176,11 +176,7 @@ func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	derivedRelPath := strings.TrimPrefix(upstreamURL, h.repoCfg.URL)
-
-	if currentMeta.UpstreamURL != "" {
-		derivedRelPath = strings.TrimPrefix(currentMeta.UpstreamURL, h.repoCfg.URL)
-	}
+	derivedRelPath := strings.TrimPrefix(currentMeta.UpstreamURL, h.repoCfg.URL)
 
 	if errors.Is(fetchErr, fetch.ErrUpstreamNotModified) {
 		h.log.Info().Str("key", key).Msg("Revalidation successful: item not modified (304).")
@@ -278,6 +274,7 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 	if canonicalURL := fetchRes.Header.Get("X-Upstream-Url"); canonicalURL != "" {
 		popts.UpstreamURL = canonicalURL
 	} else if contentLoc := fetchRes.Header.Get("Content-Location"); contentLoc != "" {
+
 		popts.UpstreamURL = contentLoc
 	}
 
@@ -346,14 +343,15 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 	key, relPath string, meta *cache.ItemMeta) {
 
-	var itemModTime time.Time
-	if lmStr := meta.Headers.Get("Last-Modified"); lmStr != "" {
-		if t, err := http.ParseTime(lmStr); err == nil {
-			itemModTime = t
+	itemModTime := meta.Headers.Get("Last-Modified")
+	var modTimeForCheck time.Time
+	if itemModTime != "" {
+		if t, err := http.ParseTime(itemModTime); err == nil {
+			modTimeForCheck = t
 		}
 	}
 
-	if h.checkClientConditional(w, r, itemModTime, meta.Headers.Get("ETag")) {
+	if h.checkClientConditional(w, r, modTimeForCheck, meta.Headers.Get("ETag")) {
 		return
 	}
 
@@ -366,7 +364,7 @@ func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 	}
 	defer cacheReadRes.Content.Close()
 
-	h.setResponseHeaders(w, meta.Headers, itemModTime)
+	h.setResponseHeaders(w, meta.Headers, modTimeForCheck)
 	util.SelectProxyHeaders(w.Header(), meta.Headers)
 
 	if r.Method == http.MethodHead {
@@ -383,8 +381,10 @@ func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 		if serveName == "." || serveName == "/" {
 			serveName = ""
 		}
-		http.ServeContent(w, r, serveName, itemModTime, contentSeeker)
+
+		http.ServeContent(w, r, serveName, modTimeForCheck, contentSeeker)
 	} else {
+
 		if meta.Size >= 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
 		}
@@ -408,9 +408,11 @@ func (h *RepoHandler) checkClientConditional(w http.ResponseWriter, r *http.Requ
 
 	if imsHdr := r.Header.Get("If-Modified-Since"); imsHdr != "" {
 		if t, err := http.ParseTime(imsHdr); err == nil {
-			if !resModTime.IsZero() && !resModTime.After(t) {
-				w.WriteHeader(http.StatusNotModified)
-				return true
+			if !resModTime.IsZero() {
+				if !resModTime.After(t) {
+					w.WriteHeader(http.StatusNotModified)
+					return true
+				}
 			}
 		}
 	}

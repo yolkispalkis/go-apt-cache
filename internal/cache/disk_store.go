@@ -195,6 +195,16 @@ func (ds *diskStore) readMeta(mPath string) (*ItemMeta, error) {
 	if err = json.NewDecoder(bufio.NewReader(f)).Decode(&meta); err != nil {
 		return nil, fmt.Errorf("decode metadata from %s: %w", mPath, err)
 	}
+
+	if meta.Version < MetadataVersion {
+		ds.log.Warn().Str("path", mPath).Int("file_version", meta.Version).Int("expected_version", MetadataVersion).Msg("Outdated metadata version.")
+		return nil, fmt.Errorf("outdated metadata version in %s (version %d, expected >= %d)", mPath, meta.Version, MetadataVersion)
+	}
+	if meta.Key == "" {
+		ds.log.Warn().Str("path", mPath).Msg("Metadata file missing 'key' field or failed to parse due to format mismatch.")
+		return nil, fmt.Errorf("missing 'key' in metadata or format mismatch for %s", mPath)
+	}
+
 	return &meta, nil
 }
 

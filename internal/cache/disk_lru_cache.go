@@ -127,7 +127,7 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 			}
 
 			meta, err := c.store.readMeta(mPath)
-			if err != nil || meta.Key == "" {
+			if err != nil {
 				c.log.Warn().Str("path", mPath).Err(err).Msg("Failed to read/validate metadata, skipping/removing.")
 				_ = os.Remove(mPath)
 				_ = os.Remove(strings.TrimSuffix(mPath, metadataSuffix) + contentSuffix)
@@ -159,7 +159,7 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 		}
 
 		sort.Slice(itemsToLoad, func(i, j int) bool {
-			return itemsToLoad[i].meta.LastUsedAt.After(itemsToLoad[j].meta.LastUsedAt)
+			return itemsToLoad[i].meta.LastUsedAt.Time().After(itemsToLoad[j].meta.LastUsedAt.Time())
 		})
 
 		for _, item := range itemsToLoad {
@@ -215,7 +215,7 @@ func (c *DiskLRU) Get(ctx context.Context, key string) (*GetResult, error) {
 	meta := entry.meta
 
 	if meta.StatusCode == http.StatusNotFound {
-		if c.negTTL > 0 && time.Since(meta.FetchedAt) > c.negTTL {
+		if c.negTTL > 0 && time.Since(meta.FetchedAt.Time()) > c.negTTL {
 			c.log.Debug().Str("key", key).Msg("Negative cache entry expired.")
 			go c.Delete(context.Background(), key)
 			return nil, ErrNotFound
@@ -268,14 +268,14 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		Version:     MetadataVersion,
 		Key:         key,
 		UpstreamURL: opts.UpstreamURL,
-		FetchedAt:   opts.FetchedAt,
-		LastUsedAt:  now,
-		ValidatedAt: now,
+		FetchedAt:   UnixTime(opts.FetchedAt),
+		LastUsedAt:  UnixTime(now),
+		ValidatedAt: UnixTime(now),
 		StatusCode:  opts.StatusCode,
 		Headers:     util.CopyHeader(opts.Headers),
 		Size:        opts.Size,
 	}
-	meta.ExpiresAt = c.calculateExpiresAt(meta.Headers, meta.FetchedAt)
+	meta.ExpiresAt = UnixTime(c.calculateExpiresAt(meta.Headers, meta.FetchedAt.Time()))
 
 	writtenSize, cPath, mPath, err := c.store.write(key, r, meta)
 	if err != nil {
@@ -323,16 +323,16 @@ func (c *DiskLRU) putNegativeEntry(_ context.Context, key string, opts PutOption
 		Version:     MetadataVersion,
 		Key:         key,
 		UpstreamURL: opts.UpstreamURL,
-		FetchedAt:   opts.FetchedAt,
-		LastUsedAt:  now,
-		ValidatedAt: now,
+		FetchedAt:   UnixTime(opts.FetchedAt),
+		LastUsedAt:  UnixTime(now),
+		ValidatedAt: UnixTime(now),
 		StatusCode:  http.StatusNotFound,
 		Headers:     util.CopyHeader(opts.Headers),
 		Size:        0,
 	}
 
 	if c.negTTL > 0 {
-		meta.ExpiresAt = meta.FetchedAt.Add(c.negTTL)
+		meta.ExpiresAt = UnixTime(meta.FetchedAt.Time().Add(c.negTTL))
 	}
 
 	_, _, mPath, err := c.store.write(key, nil, meta)
@@ -444,7 +444,7 @@ func (c *DiskLRU) MarkUsed(ctx context.Context, key string) error {
 	}
 
 	entry := listElement.Value.(*lruEntry)
-	entry.meta.LastUsedAt = time.Now()
+	entry.meta.LastUsedAt = UnixTime(time.Now())
 
 	c.lruList.MoveToFront(listElement)
 
@@ -454,6 +454,7 @@ func (c *DiskLRU) MarkUsed(ctx context.Context, key string) error {
 
 	go func(mSnap ItemMeta) {
 		if err := c.store.writeMetadata(mSnap.MetaPath, &mSnap); err != nil {
+
 			c.log.Warn().Err(err).Str("key", mSnap.Key).Msg("Failed to update metadata file on MarkUsed (async)")
 		}
 	}(metaSnapshot)
@@ -477,8 +478,8 @@ func (c *DiskLRU) UpdateValidatedAt(ctx context.Context, key string, validatedAt
 	}
 
 	entry := listElement.Value.(*lruEntry)
-	entry.meta.ValidatedAt = validatedAt
-	entry.meta.LastUsedAt = time.Now()
+	entry.meta.ValidatedAt = UnixTime(validatedAt)
+	entry.meta.LastUsedAt = UnixTime(time.Now())
 
 	c.lruList.MoveToFront(listElement)
 
@@ -518,7 +519,7 @@ func (c *DiskLRU) evictItemsLocked(requiredSpaceToFree int64, deleteFiles bool) 
 			continue
 		}
 
-		c.log.Debug().Str("key", entryToEvict.key).Str("size", util.FormatSize(entryToEvict.meta.Size)).Time("last_used", entryToEvict.meta.LastUsedAt).Msg("Evicting item.")
+		c.log.Debug().Str("key", entryToEvict.key).Str("size", util.FormatSize(entryToEvict.meta.Size)).Time("last_used", entryToEvict.meta.LastUsedAt.Time()).Msg("Evicting item.")
 		c.removeItemLocked(entryToEvict.key, deleteFiles)
 
 		if entryToEvict.meta.StatusCode != http.StatusNotFound {
@@ -570,6 +571,7 @@ func (c *DiskLRU) Close() error {
 		return nil
 	}
 	c.log.Info().Msg("Closing cache manager.")
+
 	return nil
 }
 
