@@ -49,8 +49,6 @@ cat >"${CONFIG_DIR}/config.json" <<EOF
     "maxSize": "20GB",
     "enabled": true,
     "cleanOnStart": false,
-    "defaultTTL": "1h",
-    "revalidateOnHitTTL": "0s",
     "negativeCacheTTL": "5m"
   },
   "logging": {

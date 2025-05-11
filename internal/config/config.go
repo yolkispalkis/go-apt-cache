@@ -103,13 +103,11 @@ type ServerConfig struct {
 }
 
 type CacheConfig struct {
-	Dir              string   `json:"directory"`
-	MaxSize          string   `json:"maxSize"`
-	Enabled          bool     `json:"enabled"`
-	CleanOnStart     bool     `json:"cleanOnStart"`
-	DefaultTTL       Duration `json:"defaultTTL"`
-	RevalidateHitTTL Duration `json:"revalidateOnHitTTL"`
-	NegativeTTL      Duration `json:"negativeCacheTTL"`
+	Dir          string   `json:"directory"`
+	MaxSize      string   `json:"maxSize"`
+	Enabled      bool     `json:"enabled"`
+	CleanOnStart bool     `json:"cleanOnStart"`
+	NegativeTTL  Duration `json:"negativeCacheTTL"`
 }
 
 type Config struct {
@@ -133,13 +131,11 @@ func Default() *Config {
 			UserAgent:         appinfo.UserAgent(),
 		},
 		Cache: CacheConfig{
-			Dir:              "/var/cache/go-apt-cache",
-			MaxSize:          "10GB",
-			Enabled:          true,
-			CleanOnStart:     false,
-			DefaultTTL:       Duration(1 * time.Hour),
-			RevalidateHitTTL: Duration(0),
-			NegativeTTL:      Duration(5 * time.Minute),
+			Dir:          "/var/cache/go-apt-cache",
+			MaxSize:      "10GB",
+			Enabled:      true,
+			CleanOnStart: false,
+			NegativeTTL:  Duration(5 * time.Minute),
 		},
 		Logging: DefaultLogging(),
 		Repositories: []Repository{
@@ -253,7 +249,6 @@ func Validate(cfg *Config) error {
 	}
 
 	repoNames := make(map[string]struct{})
-	hasEnabled := false
 	for i := range cfg.Repositories {
 		repo := &cfg.Repositories[i]
 		if strings.TrimSpace(repo.Name) == "" {
@@ -284,11 +279,7 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("duplicate repo name %q", repo.Name)
 		}
 		repoNames[repo.Name] = struct{}{}
-		if repo.Enabled {
-			hasEnabled = true
-		}
 	}
-	if !hasEnabled && len(cfg.Repositories) > 0 {
-	}
+
 	return nil
 }

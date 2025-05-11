@@ -114,21 +114,21 @@ func (h *RepoHandler) handleCacheHit(w http.ResponseWriter, r *http.Request,
 
 	needsReval := false
 	now := time.Now()
-	if meta.IsStale(now) {
+
+	if clientCC := util.ParseCacheControl(r.Header.Get("Cache-Control")); clientCC["no-cache"] != "" {
+		h.log.Debug().Str("key", key).Msg("Client sent 'Cache-Control: no-cache', forcing revalidation.")
 		needsReval = true
 	}
 
-	if !needsReval && h.cacheCfg.RevalidateHitTTL.StdDuration() > 0 {
-		if meta.ValidatedAt.Time().IsZero() || now.Sub(meta.ValidatedAt.Time()) > h.cacheCfg.RevalidateHitTTL.StdDuration() {
+	if !needsReval {
+		if meta.IsStale(now) {
+			h.log.Debug().Str("key", key).Time("expiresAt", meta.ExpiresAt.Time()).Msg("Item is stale based on its expiresAt (from upstream headers), needs revalidation.")
 			needsReval = true
 		}
 	}
 
-	if clientCC := util.ParseCacheControl(r.Header.Get("Cache-Control")); clientCC["no-cache"] != "" {
-		needsReval = true
-	}
-
 	if needsReval {
+		h.log.Info().Str("key", key).Msg("Revalidation triggered by upstream headers or client 'no-cache'.")
 		h.revalidateAndServe(w, r, key, upstreamURL, meta)
 	} else {
 		w.Header().Set("X-Cache-Status", "HIT")

@@ -31,8 +31,8 @@ type DiskLRU struct {
 	log      zerolog.Logger
 	store    *diskStore
 	maxBytes int64
-	defTTL   time.Duration
-	negTTL   time.Duration
+
+	negTTL time.Duration
 
 	mu           sync.RWMutex
 	items        map[string]*list.Element
@@ -76,11 +76,44 @@ func NewDiskLRU(cfg config.CacheConfig, logger zerolog.Logger) (*DiskLRU, error)
 		log:      logger.With().Str("component", "DiskLRU").Logger(),
 		store:    store,
 		maxBytes: maxBytes,
-		defTTL:   cfg.DefaultTTL.StdDuration(),
-		negTTL:   cfg.NegativeTTL.StdDuration(),
-		items:    make(map[string]*list.Element),
-		lruList:  list.New(),
+
+		negTTL:  cfg.NegativeTTL.StdDuration(),
+		items:   make(map[string]*list.Element),
+		lruList: list.New(),
 	}, nil
+}
+
+func (c *DiskLRU) calculateExpiresAt(headers http.Header, fetchedAt time.Time) time.Time {
+	if ccHeader := headers.Get("Cache-Control"); ccHeader != "" {
+		directives := util.ParseCacheControl(ccHeader)
+
+		if _, ok := directives["no-store"]; ok {
+			return time.Unix(0, 0)
+		}
+
+		if sMaxAgeStr, ok := directives["s-maxage"]; ok {
+			if sMaxAgeSec, err := strconv.ParseInt(sMaxAgeStr, 10, 64); err == nil && sMaxAgeSec > 0 {
+				return fetchedAt.Add(time.Duration(sMaxAgeSec) * time.Second)
+			}
+		}
+
+		if maxAgeStr, ok := directives["max-age"]; ok {
+			if maxAgeSec, err := strconv.ParseInt(maxAgeStr, 10, 64); err == nil {
+				return fetchedAt.Add(time.Duration(maxAgeSec) * time.Second)
+			}
+		}
+
+		if _, ok := directives["no-cache"]; ok {
+			return fetchedAt
+		}
+	}
+
+	if expiresHeader := headers.Get("Expires"); expiresHeader != "" {
+		if expiresTime, err := http.ParseTime(expiresHeader); err == nil {
+			return expiresTime
+		}
+	}
+	return time.Time{}
 }
 
 func (c *DiskLRU) Init(ctx context.Context) error {
@@ -356,39 +389,6 @@ func (c *DiskLRU) putNegativeEntry(_ context.Context, key string, opts PutOption
 	return meta, nil
 }
 
-func (c *DiskLRU) calculateExpiresAt(headers http.Header, fetchedAt time.Time) time.Time {
-	if ccHeader := headers.Get("Cache-Control"); ccHeader != "" {
-		directives := util.ParseCacheControl(ccHeader)
-		if maxAgeStr, ok := directives["max-age"]; ok {
-			if maxAgeSec, err := strconv.ParseInt(maxAgeStr, 10, 64); err == nil && maxAgeSec > 0 {
-				return fetchedAt.Add(time.Duration(maxAgeSec) * time.Second)
-			}
-		}
-
-		if _, ok := directives["no-store"]; ok {
-			return time.Time{}
-		}
-
-		if _, ok := directives["no-cache"]; ok {
-			return fetchedAt
-		}
-	}
-
-	if expiresHeader := headers.Get("Expires"); expiresHeader != "" {
-		if expiresTime, err := http.ParseTime(expiresHeader); err == nil {
-			if expiresTime.Before(fetchedAt) || expiresTime.Equal(fetchedAt) {
-				return fetchedAt
-			}
-			return expiresTime
-		}
-	}
-
-	if c.defTTL > 0 {
-		return fetchedAt.Add(c.defTTL)
-	}
-	return time.Time{}
-}
-
 func (c *DiskLRU) Delete(ctx context.Context, key string) error {
 	if !c.cfg.Enabled {
 		return nil
@@ -445,16 +445,12 @@ func (c *DiskLRU) MarkUsed(ctx context.Context, key string) error {
 
 	entry := listElement.Value.(*lruEntry)
 	entry.meta.LastUsedAt = UnixTime(time.Now())
-
 	c.lruList.MoveToFront(listElement)
-
 	metaSnapshot := *entry.meta
-
 	c.mu.Unlock()
 
 	go func(mSnap ItemMeta) {
 		if err := c.store.writeMetadata(mSnap.MetaPath, &mSnap); err != nil {
-
 			c.log.Warn().Err(err).Str("key", mSnap.Key).Msg("Failed to update metadata file on MarkUsed (async)")
 		}
 	}(metaSnapshot)
@@ -480,9 +476,7 @@ func (c *DiskLRU) UpdateValidatedAt(ctx context.Context, key string, validatedAt
 	entry := listElement.Value.(*lruEntry)
 	entry.meta.ValidatedAt = UnixTime(validatedAt)
 	entry.meta.LastUsedAt = UnixTime(time.Now())
-
 	c.lruList.MoveToFront(listElement)
-
 	metaSnapshot := *entry.meta
 	c.mu.Unlock()
 
