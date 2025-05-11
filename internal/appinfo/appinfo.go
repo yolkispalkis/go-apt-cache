@@ -2,7 +2,7 @@ package appinfo
 
 import "fmt"
 
-const AppName = "go-apt-proxy"
+const AppName = "go-apt-cache"
 
 var AppVersion = "dev"
 

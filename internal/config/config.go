@@ -123,6 +123,7 @@ func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
 			ListenAddr:        ":8080",
+			UnixPath:          "/run/go-apt-cache/go-apt-cache.sock",
 			UnixPerms:         0660,
 			ReqTimeout:        Duration(60 * time.Second),
 			ShutdownTimeout:   Duration(15 * time.Second),
@@ -132,7 +133,7 @@ func Default() *Config {
 			UserAgent:         appinfo.UserAgent(),
 		},
 		Cache: CacheConfig{
-			Dir:              "./apt_cache_data",
+			Dir:              "/var/cache/go-apt-cache",
 			MaxSize:          "10GB",
 			Enabled:          true,
 			CleanOnStart:     false,
@@ -151,7 +152,7 @@ func Default() *Config {
 func DefaultLogging() logging.Config {
 	return logging.Config{
 		Level:           logging.LevelInfo,
-		Path:            "",
+		Path:            "/var/log/go-apt-cache/go-apt-cache.log",
 		DisableTerminal: false,
 		MaxSizeMB:       100,
 		MaxBackups:      3,

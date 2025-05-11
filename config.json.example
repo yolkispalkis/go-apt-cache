@@ -1,7 +1,7 @@
 {
   "server": {
     "listenAddress": ":8080",
-    "unixSocketPath": "/run/go-apt-proxy/apt-proxy.sock",
+    "unixSocketPath": "/run/go-apt-cache/go-apt-cache.sock",
     "unixSocketPermissions": "0660",
     "requestTimeout": "30s",
     "shutdownTimeout": "15s",
@@ -10,7 +10,7 @@
     "maxConcurrentFetches": 20
   },
   "cache": {
-    "directory": "/var/cache/go-apt-proxy/data",
+    "directory": "/var/cache/go-apt-cache",
     "maxSize": "20GB",
     "enabled": true,
     "cleanOnStart": false,
@@ -20,7 +20,7 @@
   },
   "logging": {
     "level": "info",
-    "filePath": "/var/log/go-apt-proxy/proxy.log",
+    "filePath": "/var/log/go-apt-cache/go-apt-cache.log",
     "disableTerminal": false,
     "maxSizeMB": 100,
     "maxBackups": 5,

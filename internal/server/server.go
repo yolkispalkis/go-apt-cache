@@ -34,7 +34,7 @@ func New(cfg *config.Config, cm cache.Manager, fc *fetch.Coordinator, logger zer
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = fmt.Fprintln(w, "Go APT Proxy operational. Endpoints are per configured repository name (e.g. /ubuntu/...).")
+		_, _ = fmt.Fprintln(w, "Go APT Cache operational. Endpoints are per configured repository name (e.g. /ubuntu/...).")
 	})
 
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +121,7 @@ func (s *Server) Start(ctx context.Context) error {
 		}()
 	}
 
-	s.log.Info().Msg("Go APT Proxy server started and listening.")
+	s.log.Info().Msg("Go APT Cache server started and listening.")
 
 	select {
 	case err := <-errChan:
