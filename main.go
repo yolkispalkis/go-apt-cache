@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/rs/zerolog"
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/fetch"
@@ -22,71 +23,82 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	var mainLogger zerolog.Logger = logging.L()
+
 	if err := run(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		mainLogger.Error().Err(err).Msg("Application run failed")
 		_ = logging.Sync()
 		os.Exit(1)
 	}
-	fmt.Println("Shutdown complete.")
+	mainLogger.Info().Msg("Shutdown complete.")
 	_ = logging.Sync()
 }
 
 func run(ctx context.Context) error {
-	cfgPath, createCfg, logLevel, listenAddr := parseFlags()
+	cfgPath, createCfg, logLevelOverride, listenAddrOverride := parseFlags()
+
+	var currentLogger zerolog.Logger = logging.L()
 
 	if createCfg {
 		if err := config.EnsureDefault(cfgPath); err != nil {
+			currentLogger.Error().Err(err).Str("path", cfgPath).Msg("Failed to ensure default config")
 			return fmt.Errorf("ensure default config at %s: %w", cfgPath, err)
 		}
-		fmt.Printf("Default config ensured/created at %s. Review and adjust.\n", cfgPath)
+		currentLogger.Info().Str("path", cfgPath).Msg("Default config ensured/created. Review and adjust.")
 		return nil
 	}
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		_ = logging.Setup(config.DefaultLogging())
-		localLog := logging.L()
-		localLog.Fatal().Err(err).Str("file", cfgPath).Msg("Failed to load config")
+		currentLogger.Error().Err(err).Str("file", cfgPath).Msg("Failed to load config")
 		return fmt.Errorf("load config %s: %w", cfgPath, err)
 	}
 
-	applyOverrides(cfg, logLevel, listenAddr)
+	applyOverrides(cfg, logLevelOverride, listenAddrOverride)
+
+	if setupErr := logging.Setup(cfg.Logging); setupErr != nil {
+
+		var setupLogger zerolog.Logger = logging.L()
+		setupLogger.Warn().Err(setupErr).Msg("Failed to fully setup logging from config, using previous/best-effort logger settings.")
+	}
+
+	var log zerolog.Logger = logging.L()
 
 	if err := config.Validate(cfg); err != nil {
-		_ = logging.Setup(cfg.Logging)
-		localLog := logging.L()
-		localLog.Fatal().Err(err).Msg("Invalid config")
+		log.Error().Err(err).Msg("Invalid config")
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	if err := logging.Setup(cfg.Logging); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to setup logging: %v\n", err)
-		return fmt.Errorf("setup logging: %w", err)
-	}
-	log := logging.L()
 	log.Info().Str("file", cfgPath).Msg("Config loaded and validated")
 
-	cm, err := cache.NewDiskLRU(cfg.Cache, log)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to init cache manager")
-		return fmt.Errorf("init cache: %w", err)
+	cm, diskLRUErr := cache.NewDiskLRU(cfg.Cache, log)
+	if diskLRUErr != nil {
+		log.Error().Err(diskLRUErr).Msg("Failed to init cache manager")
+		return fmt.Errorf("init cache: %w", diskLRUErr)
 	}
-	if err := cm.Init(ctx); err != nil {
-		log.Error().Err(err).Msg("Cache manager init warning (continuing)")
+
+	if initErr := cm.Init(ctx); initErr != nil {
+		log.Error().Err(initErr).Msg("Cache manager init failed. Application will continue, but cache might be inconsistent or empty.")
 	} else {
 		log.Info().Str("dir", cfg.Cache.Dir).Str("size", cfg.Cache.MaxSize).
 			Int64("items", cm.ItemCount()).Str("used", util.FormatSize(cm.CurrentSize())).
 			Msg("Cache manager initialized")
 	}
-	defer cm.Close()
+	defer func() {
+
+		var deferLogger zerolog.Logger = logging.L()
+		if closeErr := cm.Close(); closeErr != nil {
+			deferLogger.Warn().Err(closeErr).Msg("Error closing cache manager")
+		}
+	}()
 
 	fc := fetch.NewCoordinator(cfg.Server, log)
 	log.Info().Str("ua", cfg.Server.UserAgent).Int("max_fetches", cfg.Server.MaxConcurrent).Msg("Fetch coordinator initialized")
 
-	srv, err := server.New(cfg, cm, fc, log)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to create HTTP server")
-		return fmt.Errorf("create server: %w", err)
+	srv, serverNewErr := server.New(cfg, cm, fc, log)
+	if serverNewErr != nil {
+		log.Error().Err(serverNewErr).Msg("Failed to create HTTP server")
+		return fmt.Errorf("create server: %w", serverNewErr)
 	}
 
 	errChan := make(chan error, 1)
@@ -94,38 +106,49 @@ func run(ctx context.Context) error {
 		errChan <- srv.Start(ctx)
 	}()
 
+	var selectErr error
 	select {
-	case err = <-errChan:
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, http.ErrServerClosed) {
-			log.Error().Err(err).Msg("Server error")
-			_ = srv.Shutdown()
-			return err
+	case selectErr = <-errChan:
+		if selectErr != nil && !errors.Is(selectErr, context.Canceled) && !errors.Is(selectErr, http.ErrServerClosed) {
+			log.Error().Err(selectErr).Msg("Server error during start/run")
+			shutdownErr := srv.Shutdown()
+			if shutdownErr != nil {
+				log.Error().Err(shutdownErr).Msg("Error during server shutdown after a start error")
+			}
+			return selectErr
 		}
+		log.Info().Msg("Server Start goroutine exited gracefully or with ignored error.")
 	case <-ctx.Done():
-		log.Info().Msg("Shutdown signal received...")
-		if err = srv.Shutdown(); err != nil {
-			log.Error().Err(err).Msg("Server shutdown error")
-			return err
+		log.Info().Msg("Shutdown signal received, stopping server...")
+		if shutdownErr := srv.Shutdown(); shutdownErr != nil {
+			log.Error().Err(shutdownErr).Msg("Server shutdown error")
+			return shutdownErr
 		}
+		log.Info().Msg("Server gracefully shut down.")
 	}
 
 	if cfg.Cache.Enabled {
 		log.Info().Int64("items", cm.ItemCount()).Str("used", util.FormatSize(cm.CurrentSize())).Msg("Final cache status")
 	}
-	return nil
+	return selectErr
 }
 
 func parseFlags() (cfgPath string, createCfg bool, logLevel, listenAddr string) {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		fs.PrintDefaults()
+	}
+
 	fs.StringVar(&cfgPath, "config", "config.json", "Path to config file")
 	fs.BoolVar(&createCfg, "create-config", false, "Create default config file and exit")
 	fs.StringVar(&logLevel, "log-level", "", "Override log level (debug, info, warn, error)")
 	fs.StringVar(&listenAddr, "listen", "", "Override server listen address (e.g., :8080)")
-	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage of %s:\n", os.Args[0])
-		fs.PrintDefaults()
+
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
+		os.Exit(2)
 	}
-	_ = fs.Parse(os.Args[1:])
 	return
 }
 
