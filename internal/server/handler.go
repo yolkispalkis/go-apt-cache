@@ -30,8 +30,12 @@ type RepoHandler struct {
 func newRepoHandler(rcfg config.Repository, scfg config.ServerConfig, ccfg config.CacheConfig,
 	cm cache.Manager, fc *fetch.Coordinator, parentLog zerolog.Logger) *RepoHandler {
 	return &RepoHandler{
-		repoCfg: rcfg, srvCfg: scfg, cacheCfg: ccfg, cm: cm, fetcher: fc,
-		log: parentLog.With().Str("repo", rcfg.Name).Logger(),
+		repoCfg:  rcfg,
+		srvCfg:   scfg,
+		cacheCfg: ccfg,
+		cm:       cm,
+		fetcher:  fc,
+		log:      parentLog.With().Str("repo", rcfg.Name).Logger(),
 	}
 }
 
@@ -50,8 +54,9 @@ func (h *RepoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if strings.Contains(relPath, "..") {
 		cleanedPath := filepath.Clean(relPath)
-		if strings.HasPrefix(cleanedPath, "..") || cleanedPath == ".." {
-			h.log.Warn().Str("path", relPath).Str("cleaned_path", cleanedPath).Msg("Path traversal attempt detected and blocked")
+		if strings.HasPrefix(cleanedPath, "..") || cleanedPath == ".." ||
+			(relPath != cleanedPath && strings.HasPrefix(cleanedPath, "../")) {
+			h.log.Warn().Str("original_path", r.URL.Path).Str("rel_path", relPath).Str("cleaned_path", cleanedPath).Msg("Path traversal attempt detected and blocked")
 			http.Error(w, "Invalid path (traversal attempt)", http.StatusBadRequest)
 			return
 		}
@@ -83,7 +88,7 @@ func (h *RepoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if cacheRes != nil && cacheRes.Hit {
-		h.log.Info().Str("key", cacheKey).Str("status", "HIT").Msg("Cache hit")
+		h.log.Debug().Str("key", cacheKey).Str("status", "HIT").Msg("Cache hit")
 		h.handleCacheHit(w, r, cacheKey, upstreamURL, relPath, cacheRes)
 		return
 	}
@@ -107,7 +112,6 @@ func (h *RepoHandler) handleCacheHit(w http.ResponseWriter, r *http.Request,
 			h.handleCacheMiss(w, r, key, upstreamURL)
 			return
 		}
-
 		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
@@ -120,18 +124,15 @@ func (h *RepoHandler) handleCacheHit(w http.ResponseWriter, r *http.Request,
 		needsReval = true
 	}
 
-	if !needsReval {
-		if meta.IsStale(now) {
-			h.log.Debug().Str("key", key).Time("expiresAt", meta.ExpiresAt.Time()).Msg("Item is stale based on its expiresAt (from upstream headers), needs revalidation.")
-			needsReval = true
-		}
+	if !needsReval && meta.IsStale(now) {
+		h.log.Debug().Str("key", key).Time("expiresAt", meta.ExpiresAt.Time()).Msg("Item is stale based on its expiresAt, needs revalidation.")
+		needsReval = true
 	}
 
 	if needsReval {
-		h.log.Info().Str("key", key).Msg("Revalidation triggered by upstream headers or client 'no-cache'.")
+		h.log.Info().Str("key", key).Msg("Revalidation triggered for cached item.")
 		h.revalidateAndServe(w, r, key, upstreamURL, meta)
 	} else {
-
 		h.serveFromCache(w, r, key, relPath, meta)
 	}
 }
@@ -147,32 +148,46 @@ func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
 	} else if !currentMeta.FetchedAt.Time().IsZero() && currentMeta.StatusCode == http.StatusOK {
 		fetchOpts.IfModSince = currentMeta.FetchedAt.Time()
 	}
+
 	if etag := currentMeta.Headers.Get("ETag"); etag != "" {
 		fetchOpts.IfNoneMatch = etag
 	}
 
-	revalKey := "revalidate:" + key
-	fetchRes, fetchErr := h.fetcher.Fetch(r.Context(), revalKey, upstreamURL, fetchOpts)
+	h.log.Debug().Str("key", key).Str("upstreamURL", upstreamURL).
+		Time("if_mod_since", fetchOpts.IfModSince).Str("if_none_match", fetchOpts.IfNoneMatch).
+		Msg("Revalidating item with conditional fetch")
+
+	fetchRes, fetchErr := h.fetcher.Fetch(r.Context(), key, upstreamURL, fetchOpts)
+
+	derivedRelPath := ""
+	if strings.HasPrefix(currentMeta.UpstreamURL, h.repoCfg.URL) {
+		derivedRelPath = strings.TrimPrefix(currentMeta.UpstreamURL, h.repoCfg.URL)
+	} else {
+		parts := strings.SplitN(key, "/", 2)
+		if len(parts) == 2 {
+			derivedRelPath = parts[1]
+		} else {
+			derivedRelPath = ""
+		}
+	}
 
 	if fetchErr == nil {
 		defer fetchRes.Body.Close()
+		h.log.Info().Str("key", key).Int("status", fetchRes.Status).Msg("Revalidation successful, got new content.")
 		h.storeAndServe(w, r, key, upstreamURL, fetchRes)
 		return
 	}
 
-	derivedRelPath := strings.TrimPrefix(currentMeta.UpstreamURL, h.repoCfg.URL)
-
 	if errors.Is(fetchErr, fetch.ErrUpstreamNotModified) {
+		h.log.Info().Str("key", key).Msg("Revalidation returned 304 Not Modified. Serving from cache.")
 		if errUpd := h.cm.UpdateValidatedAt(r.Context(), key, time.Now()); errUpd != nil {
-			h.log.Warn().Err(errUpd).Str("key", key).Msg("Failed to update validation timestamp in cache.")
+			h.log.Warn().Err(errUpd).Str("key", key).Msg("Failed to update validation timestamp in cache after 304.")
 		}
-
 		h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
 		return
 	}
 
-	h.log.Warn().Err(fetchErr).Str("key", key).Msg("Revalidation fetch failed. Serving stale content if possible.")
-
+	h.log.Warn().Err(fetchErr).Str("key", key).Msg("Revalidation fetch failed. Serving stale content if available.")
 	h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
 }
 
@@ -191,7 +206,7 @@ func (h *RepoHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request,
 
 	fetchRes, fetchErr := h.fetcher.Fetch(r.Context(), key, upstreamURL, fetchOpts)
 	if fetchErr != nil {
-		h.handleFetchError(w, r, key, upstreamURL, fetchErr)
+		h.handleFetchError(w, key, upstreamURL, fetchErr)
 		return
 	}
 	defer fetchRes.Body.Close()
@@ -199,14 +214,12 @@ func (h *RepoHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request,
 	h.storeAndServe(w, r, key, upstreamURL, fetchRes)
 }
 
-func (h *RepoHandler) handleFetchError(w http.ResponseWriter, _ *http.Request, key, upstreamURL string, err error) {
+func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL string, err error) {
 	if errors.Is(err, fetch.ErrUpstreamNotModified) {
-
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	if errors.Is(err, fetch.ErrUpstreamNotFound) {
-
 		if h.cacheCfg.NegativeTTL.StdDuration() > 0 {
 			go func() {
 				emptyHeaders := make(http.Header)
@@ -219,6 +232,8 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, _ *http.Request, k
 				}
 				if _, putErr := h.cm.Put(context.Background(), key, nil, popts); putErr != nil {
 					h.log.Warn().Err(putErr).Str("key", key).Msg("Failed to store negative cache entry for 404.")
+				} else {
+					h.log.Debug().Str("key", key).Msg("Stored negative cache entry for 404.")
 				}
 			}()
 		}
@@ -228,9 +243,9 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, _ *http.Request, k
 
 	h.log.Error().Err(err).Str("key", key).Str("upstreamURL", upstreamURL).Msg("Failed to fetch item from upstream on MISS.")
 	status := http.StatusBadGateway
-	if errors.Is(err, fetch.ErrUpstreamServerErr) {
+	if errors.Is(err, fetch.ErrUpstreamClientErr) {
 		status = http.StatusBadGateway
-	} else if errors.Is(err, fetch.ErrUpstreamClientErr) {
+	} else if errors.Is(err, fetch.ErrUpstreamServerErr) {
 		status = http.StatusBadGateway
 	} else if errors.Is(err, fetch.ErrNetwork) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		status = http.StatusGatewayTimeout
@@ -252,7 +267,12 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 	if canonicalURL := fetchRes.Header.Get("X-Upstream-Url"); canonicalURL != "" {
 		popts.UpstreamURL = canonicalURL
 	} else if contentLoc := fetchRes.Header.Get("Content-Location"); contentLoc != "" {
-		popts.UpstreamURL = contentLoc
+		resolvedContentLoc, err := util.ResolveURL(fetchedUpstreamURL, contentLoc)
+		if err == nil {
+			popts.UpstreamURL = resolvedContentLoc
+		} else {
+			h.log.Warn().Str("key", key).Str("base_url", fetchedUpstreamURL).Str("content_location", contentLoc).Err(err).Msg("Failed to resolve Content-Location, using original fetch URL for cache metadata.")
+		}
 	}
 
 	pr, pw := io.Pipe()
@@ -265,16 +285,22 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 		_, putErr := h.cm.Put(context.Background(), key, pr, popts)
 		if putErr != nil {
 			putErrGlobal = putErr
-			if !errors.Is(putErr, io.ErrClosedPipe) && !strings.Contains(putErr.Error(), "write content to temp: broken pipe") && !strings.Contains(putErr.Error(), "write content to temp: read tcp") {
+			if !errors.Is(putErr, io.ErrClosedPipe) &&
+				!strings.Contains(putErr.Error(), "broken pipe") &&
+				!strings.Contains(putErr.Error(), "read tcp") {
 				h.log.Error().Err(putErr).Str("key", key).Msg("Error storing item to cache during Tee.")
+			} else {
+				h.log.Debug().Err(putErr).Str("key", key).Msg("Cache Put failed due to pipe closure, likely client disconnect.")
 			}
+		} else {
+			h.log.Debug().Str("key", key).Msg("Item successfully stored in cache via Tee.")
 		}
 	}()
 
 	teeBody := io.TeeReader(fetchRes.Body, pw)
 
 	if h.checkClientConditional(w, r, fetchRes.ModTime, fetchRes.Header.Get("ETag")) {
-
+		h.log.Debug().Str("key", key).Msg("Client conditional GET matched newly fetched resource (304). Discarding body, closing pipe to cache.")
 		_, copyErr := io.Copy(io.Discard, teeBody)
 		if copyErr != nil {
 			_ = pw.CloseWithError(copyErr)
@@ -318,8 +344,8 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 	storeWg.Wait()
 
 	if putErrGlobal != nil && util.IsClientDisconnectedError(clientCopyError) {
-		if strings.Contains(putErrGlobal.Error(), "broken pipe") || strings.Contains(putErrGlobal.Error(), "read tcp") {
-			h.log.Debug().Err(putErrGlobal).Str("key", key).Msg("Cache store failed due to client disconnect, as expected.")
+		if errors.Is(putErrGlobal, io.ErrClosedPipe) || strings.Contains(putErrGlobal.Error(), "broken pipe") || strings.Contains(putErrGlobal.Error(), "read tcp") {
+			h.log.Debug().Err(putErrGlobal).Str("key", key).Msg("Cache store failed due to client disconnect (pipe closed), as expected after clientCopyError.")
 		}
 	}
 }
@@ -336,12 +362,13 @@ func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 	}
 
 	if h.checkClientConditional(w, r, modTimeForCheck, meta.Headers.Get("ETag")) {
+		h.log.Debug().Str("key", key).Msg("Serving 304 Not Modified from cache based on client conditionals.")
 		return
 	}
 
 	cacheReadRes, err := h.cm.Get(r.Context(), key)
 	if err != nil || !cacheReadRes.Hit || cacheReadRes.Content == nil {
-		h.log.Error().Err(err).Str("key", key).Msg("Failed to re-open cache item for serving, or item vanished.")
+		h.log.Error().Err(err).Str("key", key).Msg("Failed to re-open cache item for serving, or item vanished. Treating as miss.")
 		h.handleCacheMiss(w, r, key, meta.UpstreamURL)
 		return
 	}
@@ -363,8 +390,12 @@ func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 	contentSeeker, isSeeker := cacheReadRes.Content.(io.ReadSeeker)
 	if isSeeker {
 		serveName := filepath.Base(relPath)
-		if serveName == "." || serveName == "/" {
-			serveName = ""
+		if serveName == "." || serveName == "/" || serveName == "" {
+			if relPath == "" {
+				serveName = "index"
+			} else {
+				serveName = "resource"
+			}
 		}
 		http.ServeContent(w, r, serveName, modTimeForCheck, contentSeeker)
 	} else {

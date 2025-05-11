@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -72,6 +74,8 @@ func ParseSize(s string) (int64, error) {
 		mult = 1024 * 1024 * 1024
 	case "T":
 		mult = 1024 * 1024 * 1024 * 1024
+	case "":
+		mult = 1.0
 	}
 	byteSize := int64(val * mult)
 
@@ -134,8 +138,11 @@ func GenerateCacheKey(repo, relPath string) (string, error) {
 
 	cleanRelPath := filepath.ToSlash(filepath.Clean(relPath))
 	cleanRelPath = strings.TrimPrefix(cleanRelPath, "/")
+	if cleanRelPath == "." {
+		cleanRelPath = ""
+	}
 
-	if cleanRelPath == "." || cleanRelPath == "" {
+	if cleanRelPath == "" {
 		return SanitizeFSComponent(repo), nil
 	}
 
@@ -144,7 +151,11 @@ func GenerateCacheKey(repo, relPath string) (string, error) {
 		if p == "" || p == "." || p == ".." {
 			continue
 		}
-		parts = append(parts, SanitizeFSComponent(p))
+		sanitizedPart := SanitizeFSComponent(p)
+		if sanitizedPart == "" || sanitizedPart == "_" && p != "_" {
+			continue
+		}
+		parts = append(parts, sanitizedPart)
 	}
 	return strings.Join(parts, "/"), nil
 }
@@ -169,7 +180,7 @@ func CopyWhitelistedHeaders(dst, src http.Header) {
 	for keySrc, valuesSrc := range src {
 		canonicalKey := http.CanonicalHeaderKey(keySrc)
 		if _, ok := headerProxyWhitelist[canonicalKey]; ok {
-			dst[canonicalKey] = valuesSrc
+			dst[canonicalKey] = append([]string(nil), valuesSrc...)
 		}
 	}
 }
@@ -198,19 +209,31 @@ func IsClientDisconnectedError(err error) bool {
 		return false
 	}
 
-	if errors.Is(err, context.Canceled) ||
-		errors.Is(err, http.ErrAbortHandler) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, http.ErrAbortHandler) {
+		return true
+	}
+	if errors.Is(err, io.ErrClosedPipe) {
 		return true
 	}
 
-	errStr := err.Error()
+	errStr := strings.ToLower(err.Error())
 	if strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "connection reset by peer") {
+		strings.Contains(errStr, "connection reset by peer") ||
+		strings.Contains(errStr, "client disconnected") ||
+		strings.Contains(errStr, "protocol wrong type for socket") {
 		return true
 	}
 
-	var netErr net.Error
-	return errors.As(err, &netErr) && (netErr.Timeout() || !netErr.Temporary())
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if IsClientDisconnectedError(opErr.Err) {
+			return true
+		}
+	}
+	return false
 }
 
 func FormatDuration(d time.Duration) string {
@@ -240,12 +263,12 @@ func CompareETags(clientETagsStr string, resourceETag string) bool {
 
 	clientTags := strings.Split(clientETagsStr, ",")
 	for _, cTag := range clientTags {
-		cTag = strings.TrimSpace(cTag)
-		if cTag == "" {
+		cTagTrimmed := strings.TrimSpace(cTag)
+		if cTagTrimmed == "" {
 			continue
 		}
 
-		normClientTag := strings.TrimPrefix(cTag, "W/")
+		normClientTag := strings.TrimPrefix(cTagTrimmed, "W/")
 		normClientTag = strings.Trim(normClientTag, "\"")
 
 		if normClientTag == normResourceETag {
@@ -253,4 +276,26 @@ func CompareETags(clientETagsStr string, resourceETag string) bool {
 		}
 	}
 	return false
+}
+
+func ResolveURL(base, ref string) (string, error) {
+	if ref == "" {
+		return base, nil
+	}
+
+	refURL, err := url.Parse(ref)
+	if err != nil {
+		return "", fmt.Errorf("parsing reference URL %q: %w", ref, err)
+	}
+
+	if refURL.IsAbs() {
+		return ref, nil
+	}
+
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("parsing base URL %q: %w", base, err)
+	}
+
+	return baseURL.ResolveReference(refURL).String(), nil
 }

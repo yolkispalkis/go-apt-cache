@@ -46,9 +46,9 @@ func (ds *diskStore) metadataPath(key string) string {
 func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 	writtenSize int64, cPath, mPath string, err error) {
 
-	cPath = ds.contentPath(key)
-	mPath = ds.metadataPath(key)
-	itemDir := filepath.Dir(cPath)
+	finalCPath := ds.contentPath(key)
+	finalMPath := ds.metadataPath(key)
+	itemDir := filepath.Dir(finalCPath)
 
 	if err = os.MkdirAll(itemDir, 0750); err != nil {
 		return 0, "", "", fmt.Errorf("mkdir %s: %w", itemDir, err)
@@ -98,10 +98,15 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 						Int64("actual_written_size", writtenSize).
 						Msg("Upstream Content-Length mismatch with bytes read. File from upstream is likely incomplete or server misreported size. Not caching.")
 					_ = tmpCFileHandle.Close()
-
 					err = fmt.Errorf("upstream Content-Length %d did not match received bytes %d for key %s", originalContentLength, writtenSize, meta.Key)
 					return 0, "", "", err
 				}
+			} else {
+				ds.log.Warn().
+					Str("key", meta.Key).
+					Str("content_length_header", originalContentLengthStr).
+					Err(parseErr).
+					Msg("Upstream Content-Length header present but invalid (unparseable or negative). Proceeding with actual written size.")
 			}
 		}
 
@@ -120,8 +125,8 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 	}
 
 	meta.Size = writtenSize
-	meta.Path = cPath
-	meta.MetaPath = mPath
+	meta.Path = finalCPath
+	meta.MetaPath = finalMPath
 
 	var tmpMFileHandle *os.File
 	tmpMFileHandle, err = os.CreateTemp(itemDir, tempPrefix+"*"+metadataSuffix)
@@ -143,21 +148,19 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 		return 0, "", "", fmt.Errorf("close temp metadata file: %w", err)
 	}
 
-	if err = os.Rename(tmpMPath, mPath); err != nil {
-		_ = os.Remove(tmpMPath)
-		return 0, "", "", fmt.Errorf("rename temp metadata to %s: %w", mPath, err)
+	if err = os.Rename(tmpMPath, finalMPath); err != nil {
+		return 0, "", "", fmt.Errorf("rename temp metadata to %s: %w", finalMPath, err)
 	}
 	tmpMPath = ""
 
 	if r != nil && tmpCPath != "" {
-		if err = os.Rename(tmpCPath, cPath); err != nil {
-			_ = os.Remove(mPath)
-			_ = os.Remove(tmpCPath)
-			return 0, "", "", fmt.Errorf("rename temp content to %s: %w", cPath, err)
+		if err = os.Rename(tmpCPath, finalCPath); err != nil {
+			_ = os.Remove(finalMPath)
+			return 0, "", "", fmt.Errorf("rename temp content to %s: %w", finalCPath, err)
 		}
 		tmpCPath = ""
 	}
-	return writtenSize, cPath, mPath, nil
+	return writtenSize, finalCPath, finalMPath, nil
 }
 
 func (ds *diskStore) writeMetadata(mPath string, meta *ItemMeta) error {
@@ -199,7 +202,6 @@ func (ds *diskStore) writeMetadata(mPath string, meta *ItemMeta) error {
 	}
 
 	if err = os.Rename(tmpMPath, mPath); err != nil {
-		_ = os.Remove(tmpMPath)
 		return fmt.Errorf("rename temp metadata to %s for update: %w", mPath, err)
 	}
 	tmpMPath = ""
@@ -214,6 +216,7 @@ func (ds *diskStore) readMeta(mPath string) (*ItemMeta, error) {
 	defer f.Close()
 
 	var meta ItemMeta
+
 	if err = json.NewDecoder(bufio.NewReader(f)).Decode(&meta); err != nil {
 		return nil, fmt.Errorf("decode metadata from %s: %w", mPath, err)
 	}
