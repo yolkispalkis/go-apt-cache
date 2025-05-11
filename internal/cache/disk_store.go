@@ -53,36 +53,48 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 		return 0, "", "", fmt.Errorf("mkdir %s: %w", itemDir, err)
 	}
 
-	var tmpCFile *os.File
 	var tmpCPath string
+	var tmpMPath string
+
+	defer func() {
+		if err != nil {
+			if tmpCPath != "" {
+				if rmErr := os.Remove(tmpCPath); rmErr != nil && !os.IsNotExist(rmErr) {
+					ds.log.Warn().Err(rmErr).Str("path", tmpCPath).Msg("Failed to remove temp content file on error")
+				}
+			}
+			if tmpMPath != "" {
+				if rmErr := os.Remove(tmpMPath); rmErr != nil && !os.IsNotExist(rmErr) {
+					ds.log.Warn().Err(rmErr).Str("path", tmpMPath).Msg("Failed to remove temp metadata file on error")
+				}
+			}
+		}
+	}()
 
 	if r != nil {
-		tmpCFile, err = os.CreateTemp(itemDir, tempPrefix+"*"+contentSuffix)
+		var tmpCFileHandle *os.File
+		tmpCFileHandle, err = os.CreateTemp(itemDir, tempPrefix+"*"+contentSuffix)
 		if err != nil {
 			return 0, "", "", fmt.Errorf("create temp content file: %w", err)
 		}
-		defer func() {
-			if tmpCFile != nil {
-				tmpCFile.Close()
-				os.Remove(tmpCFile.Name())
-			}
-		}()
+		tmpCPath = tmpCFileHandle.Name()
 
-		bufW := bufio.NewWriter(tmpCFile)
-		if writtenSize, err = io.Copy(bufW, r); err != nil {
+		bufW := bufio.NewWriter(tmpCFileHandle)
+		writtenSize, err = io.Copy(bufW, r)
+		if err != nil {
+			_ = tmpCFileHandle.Close()
 			return 0, "", "", fmt.Errorf("write content to temp: %w", err)
 		}
 		if err = bufW.Flush(); err != nil {
+			_ = tmpCFileHandle.Close()
 			return 0, "", "", fmt.Errorf("flush content buffer: %w", err)
 		}
-		if err = tmpCFile.Sync(); err != nil {
-			ds.log.Warn().Err(err).Str("path", tmpCFile.Name()).Msg("Sync temp content file failed")
+		if syncErr := tmpCFileHandle.Sync(); syncErr != nil {
+			ds.log.Warn().Err(syncErr).Str("path", tmpCPath).Msg("Sync temp content file failed")
 		}
-		tmpCPath = tmpCFile.Name()
-		if err = tmpCFile.Close(); err != nil {
+		if err = tmpCFileHandle.Close(); err != nil {
 			return 0, "", "", fmt.Errorf("close temp content file: %w", err)
 		}
-		tmpCFile = nil
 	} else {
 		writtenSize = 0
 	}
@@ -91,55 +103,39 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 	meta.Path = cPath
 	meta.MetaPath = mPath
 
-	tmpMFile, err := os.CreateTemp(itemDir, tempPrefix+"*"+metadataSuffix)
+	var tmpMFileHandle *os.File
+	tmpMFileHandle, err = os.CreateTemp(itemDir, tempPrefix+"*"+metadataSuffix)
 	if err != nil {
-		if tmpCPath != "" {
-			os.Remove(tmpCPath)
-		}
 		return 0, "", "", fmt.Errorf("create temp metadata file: %w", err)
 	}
-	defer func() {
-		if tmpMFile != nil {
-			tmpMFile.Close()
-			os.Remove(tmpMFile.Name())
-		}
-	}()
+	tmpMPath = tmpMFileHandle.Name()
 
-	enc := json.NewEncoder(tmpMFile)
+	enc := json.NewEncoder(tmpMFileHandle)
 	enc.SetIndent("", "  ")
 	if err = enc.Encode(meta); err != nil {
-		if tmpCPath != "" {
-			os.Remove(tmpCPath)
-		}
+		_ = tmpMFileHandle.Close()
 		return 0, "", "", fmt.Errorf("encode metadata: %w", err)
 	}
-	if err = tmpMFile.Sync(); err != nil {
-		ds.log.Warn().Err(err).Str("path", tmpMFile.Name()).Msg("Sync temp metadata file failed")
+	if syncErr := tmpMFileHandle.Sync(); syncErr != nil {
+		ds.log.Warn().Err(syncErr).Str("path", tmpMPath).Msg("Sync temp metadata file failed")
 	}
-
-	tmpMPath := tmpMFile.Name()
-	if err = tmpMFile.Close(); err != nil {
-		if tmpCPath != "" {
-			os.Remove(tmpCPath)
-		}
+	if err = tmpMFileHandle.Close(); err != nil {
 		return 0, "", "", fmt.Errorf("close temp metadata file: %w", err)
 	}
-	tmpMFile = nil
 
 	if err = os.Rename(tmpMPath, mPath); err != nil {
-		if tmpCPath != "" {
-			os.Remove(tmpCPath)
-		}
-		os.Remove(tmpMPath)
+		_ = os.Remove(tmpMPath)
 		return 0, "", "", fmt.Errorf("rename temp metadata to %s: %w", mPath, err)
 	}
+	tmpMPath = ""
 
 	if r != nil && tmpCPath != "" {
 		if err = os.Rename(tmpCPath, cPath); err != nil {
-			os.Remove(mPath)
-			os.Remove(tmpCPath)
+			_ = os.Remove(mPath)
+			_ = os.Remove(tmpCPath)
 			return 0, "", "", fmt.Errorf("rename temp content to %s: %w", cPath, err)
 		}
+		tmpCPath = ""
 	}
 	return writtenSize, cPath, mPath, nil
 }
@@ -151,36 +147,42 @@ func (ds *diskStore) writeMetadata(mPath string, meta *ItemMeta) error {
 		return fmt.Errorf("mkdir %s for metadata update: %w", itemDir, err)
 	}
 
-	tmpMFile, err := os.CreateTemp(itemDir, tempPrefix+"*"+metadataSuffix)
-	if err != nil {
-		return fmt.Errorf("create temp metadata for update: %w", err)
-	}
+	var tmpMPath string
+	var err error
+
 	defer func() {
-		if tmpMFile != nil {
-			tmpMFile.Close()
-			os.Remove(tmpMFile.Name())
+		if err != nil && tmpMPath != "" {
+			if rmErr := os.Remove(tmpMPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				ds.log.Warn().Err(rmErr).Str("path", tmpMPath).Msg("Failed to remove temp metadata file for update on error")
+			}
 		}
 	}()
 
-	enc := json.NewEncoder(tmpMFile)
+	var tmpMFileHandle *os.File
+	tmpMFileHandle, err = os.CreateTemp(itemDir, tempPrefix+"*"+metadataSuffix)
+	if err != nil {
+		return fmt.Errorf("create temp metadata for update: %w", err)
+	}
+	tmpMPath = tmpMFileHandle.Name()
+
+	enc := json.NewEncoder(tmpMFileHandle)
 	enc.SetIndent("", "  ")
 	if err = enc.Encode(meta); err != nil {
+		_ = tmpMFileHandle.Close()
 		return fmt.Errorf("encode metadata for update: %w", err)
 	}
-	if err = tmpMFile.Sync(); err != nil {
-		ds.log.Warn().Err(err).Str("path", tmpMFile.Name()).Msg("Sync temp metadata for update failed")
+	if syncErr := tmpMFileHandle.Sync(); syncErr != nil {
+		ds.log.Warn().Err(syncErr).Str("path", tmpMPath).Msg("Sync temp metadata for update failed")
 	}
-
-	tmpPath := tmpMFile.Name()
-	if err = tmpMFile.Close(); err != nil {
+	if err = tmpMFileHandle.Close(); err != nil {
 		return fmt.Errorf("close temp metadata for update: %w", err)
 	}
-	tmpMFile = nil
 
-	if err = os.Rename(tmpPath, mPath); err != nil {
-		os.Remove(tmpPath)
+	if err = os.Rename(tmpMPath, mPath); err != nil {
+		_ = os.Remove(tmpMPath)
 		return fmt.Errorf("rename temp metadata to %s for update: %w", mPath, err)
 	}
+	tmpMPath = ""
 	return nil
 }
 

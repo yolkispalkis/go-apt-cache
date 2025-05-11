@@ -4,11 +4,11 @@ set -e
 export PATH=$PATH:/usr/local/go/bin
 
 PKG_NAME="go-apt-proxy"
-PKG_VERSION="2.1.0"
+PKG_VERSION="2.2.0"
 PKG_ARCH="amd64"
 PKG_MAINTAINER="yolkispalkis <me@w3h.su>"
 PKG_DESCRIPTION="Высокопроизводительный прокси-сервер для APT, написанный на Go"
-APP_REPO_URL="https://github.com/yolkispalkis/go-apt-cache"
+APP_MAIN_PACKAGE="github.com/yolkispalkis/go-apt-cache"
 
 BUILD_DIR="$(pwd)/build"
 STAGE_DIR="${BUILD_DIR}/staging"
@@ -28,7 +28,8 @@ echo "Создание структуры директорий..."
 mkdir -p "${DEBIAN_DIR}" "${BIN_DIR}" "${CONFIG_DIR}" "${SYSTEMD_DIR}" "${CACHE_DIR}" "${LOG_DIR}" "${DOC_DIR}"
 
 echo "Сборка go-apt-proxy..."
-go build -ldflags="-s -w" -o "${BIN_DIR}/${PKG_NAME}" main.go
+LD_FLAGS="-s -w -X '${APP_MAIN_PACKAGE}/internal/appinfo.AppVersion=${PKG_VERSION}'"
+go build -ldflags="${LD_FLAGS}" -o "${BIN_DIR}/${PKG_NAME}" main.go
 
 echo "Создание конфигурационного файла..."
 cat >"${CONFIG_DIR}/config.json" <<EOF
