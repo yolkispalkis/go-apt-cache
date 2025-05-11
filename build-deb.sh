@@ -89,7 +89,7 @@ echo "Создание systemd service файла..."
 cat >"${SYSTEMD_DIR}/go-apt-proxy.service" <<EOF
 [Unit]
 Description=Go APT Proxy Service
-Documentation=${APP_REPO_URL}
+Documentation=${APP_MAIN_PACKAGE}
 After=network.target
 
 [Service]
@@ -233,7 +233,7 @@ Description: ${PKG_DESCRIPTION}
   * Поддержка HTTP и Unix socket подключений (/run/${RUN_DIR_NAME}/apt-proxy.sock)
 Section: net
 Priority: optional
-Homepage: ${APP_REPO_URL}
+Homepage: ${APP_MAIN_PACKAGE}
 EOF
 
 echo "Создание conffiles..."
@@ -243,7 +243,7 @@ echo "Создание copyright файла..."
 cat >"${DOC_DIR}/copyright" <<EOF
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: ${PKG_NAME}
-Source: ${APP_REPO_URL}
+Source: ${APP_MAIN_PACKAGE}
 
 Files: *
 Copyright: $(date +%Y) ${PKG_MAINTAINER}
