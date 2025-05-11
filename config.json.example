@@ -7,8 +7,7 @@
     "shutdownTimeout": "15s",
     "idleTimeout": "120s",
     "readHeaderTimeout": "10s",
-    "maxConcurrentFetches": 20,
-    "userAgent": "go-apt-proxy/2.0 (+https://github.com/yolkispalkis/go-apt-cache)"
+    "maxConcurrentFetches": 20
   },
   "cache": {
     "directory": "/var/cache/go-apt-proxy/data",

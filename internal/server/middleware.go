@@ -42,9 +42,7 @@ func LoggingMiddleware(log zerolog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
-
 			iw := &respWriterInterceptor{ResponseWriter: w}
-
 			next.ServeHTTP(iw, r)
 
 			duration := time.Since(start)
@@ -59,7 +57,6 @@ func LoggingMiddleware(log zerolog.Logger) func(http.Handler) http.Handler {
 			case statusCode >= 400:
 				logEvent = log.Warn()
 			case clientDisconnected:
-
 				logEvent = log.Debug()
 			default:
 				logEvent = log.Info()
@@ -99,12 +96,9 @@ func RecoveryMiddleware(log zerolog.Logger) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if rec := recover(); rec != nil {
-
 					headersSent := false
 					if rwi, ok := w.(*respWriterInterceptor); ok {
 						headersSent = rwi.status != 0
-					} else {
-
 					}
 
 					if !headersSent {

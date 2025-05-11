@@ -48,7 +48,6 @@ type Coordinator struct {
 }
 
 func NewCoordinator(cfg config.ServerConfig, logger zerolog.Logger) *Coordinator {
-
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -67,22 +66,43 @@ func NewCoordinator(cfg config.ServerConfig, logger zerolog.Logger) *Coordinator
 
 	client := &http.Client{
 		Transport: transport,
-
-		Timeout: cfg.ReqTimeout.StdDuration() + (5 * time.Second),
+		Timeout:   cfg.ReqTimeout.StdDuration() + (5 * time.Second),
 	}
 
-	dummyReqURL, _ := url.Parse("http://example.com")
-	proxyURL, _ := http.ProxyFromEnvironment(&http.Request{URL: dummyReqURL})
-	if proxyURL != nil {
-		safeProxyURL := *proxyURL
-		safeProxyURL.User = nil
-		logger.Info().Str("proxy_url", safeProxyURL.String()).Msg("Using system proxy for upstream requests")
-	}
+	logProxyInfo(logger)
 
 	return &Coordinator{
 		client:    client,
 		userAgent: cfg.UserAgent,
 		log:       logger.With().Str("component", "fetchCoordinator").Logger(),
+	}
+}
+
+func logProxyInfo(logger zerolog.Logger) {
+	targets := []struct {
+		name string
+		url  string
+	}{
+		{"HTTP", "http://example.com"},
+		{"HTTPS", "https://example.com"},
+	}
+
+	for _, t := range targets {
+		reqURL, _ := url.Parse(t.url)
+		proxyURL, err := http.ProxyFromEnvironment(&http.Request{URL: reqURL})
+
+		if err != nil {
+			logger.Error().Err(err).Str("target_url", t.url).Msgf("Error getting proxy from environment for %s target", t.name)
+			continue
+		}
+
+		if proxyURL != nil {
+			safeProxyURL := *proxyURL
+			safeProxyURL.User = nil
+			logger.Info().Str("proxy_url", safeProxyURL.String()).Str("target_type", t.name).Msgf("System proxy configured for upstream %s requests", t.name)
+		} else {
+			logger.Info().Str("target_type", t.name).Msgf("No system proxy configured for upstream %s requests, or target is in NO_PROXY", t.name)
+		}
 	}
 }
 
@@ -104,7 +124,6 @@ func (c *Coordinator) Fetch(ctx context.Context, key, upstreamURL string, opts *
 
 	result, ok := resInterface.(*Result)
 	if !ok {
-
 		c.log.Error().Str("key", key).Str("type", fmt.Sprintf("%T", resInterface)).Msg("Internal error: unexpected type from singleflight")
 		return nil, fmt.Errorf("%w: unexpected type %T from singleflight", ErrInternal, resInterface)
 	}
@@ -135,35 +154,39 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Opt
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-
 		if errors.Is(err, context.Canceled) {
+			c.log.Warn().Err(err).Str("url", upstreamURL).Msg("Upstream request canceled")
 			return nil, context.Canceled
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
+			c.log.Warn().Err(err).Str("url", upstreamURL).Msg("Upstream request deadline exceeded")
 			return nil, context.DeadlineExceeded
 		}
-
 		c.log.Error().Err(err).Str("url", upstreamURL).Msg("Upstream HTTP request failed")
 		return nil, fmt.Errorf("%w: %w", ErrNetwork, err)
 	}
-	c.log.Debug().Str("url", upstreamURL).Int("status", resp.StatusCode).Msg("Received upstream response")
+	c.log.Debug().Str("url", upstreamURL).Int("status_code", resp.StatusCode).Msg("Received upstream response")
 
 	switch {
 	case resp.StatusCode == http.StatusNotModified:
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		return nil, ErrUpstreamNotModified
 	case resp.StatusCode == http.StatusNotFound:
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		return nil, ErrUpstreamNotFound
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		return nil, fmt.Errorf("%w (status %d)", ErrUpstreamClientErr, resp.StatusCode)
 	case resp.StatusCode >= 500:
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		return nil, fmt.Errorf("%w (status %d)", ErrUpstreamServerErr, resp.StatusCode)
 	default:
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		return nil, fmt.Errorf("%w: unexpected status %d", ErrInternal, resp.StatusCode)
 	}

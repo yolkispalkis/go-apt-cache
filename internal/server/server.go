@@ -39,15 +39,17 @@ func New(cfg *config.Config, cm cache.Manager, fc *fetch.Coordinator, logger zer
 
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		statusStr := "OK\n"
+		var statusBuilder strings.Builder
+		statusBuilder.WriteString("OK\n")
+
 		if cfg.Cache.Enabled && cm != nil {
-			statusStr += fmt.Sprintf("Cache Items: %d\n", cm.ItemCount())
-			statusStr += fmt.Sprintf("Cache Size: %s / %s\n",
-				util.FormatSize(cm.CurrentSize()), cfg.Cache.MaxSize)
+			statusBuilder.WriteString(fmt.Sprintf("Cache Items: %d\n", cm.ItemCount()))
+			statusBuilder.WriteString(fmt.Sprintf("Cache Size: %s / %s\n",
+				util.FormatSize(cm.CurrentSize()), cfg.Cache.MaxSize))
 		} else {
-			statusStr += "Cache: Disabled\n"
+			statusBuilder.WriteString("Cache: Disabled\n")
 		}
-		_, _ = w.Write([]byte(statusStr))
+		_, _ = w.Write([]byte(statusBuilder.String()))
 	})
 
 	registeredCount := 0
@@ -57,16 +59,16 @@ func New(cfg *config.Config, cm cache.Manager, fc *fetch.Coordinator, logger zer
 			continue
 		}
 
-		rh := newRepoHandler(repoCfg, cfg.Server, cfg.Cache, cm, fc, log)
+		currentRepoCfg := repoCfg
+		rh := newRepoHandler(currentRepoCfg, cfg.Server, cfg.Cache, cm, fc, log)
 
-		pathPrefix := "/" + strings.Trim(repoCfg.Name, "/") + "/"
-
-		mux.Handle(pathPrefix, http.StripPrefix(pathPrefix, rh))
+		pathPrefix := "/" + strings.Trim(currentRepoCfg.Name, "/") + "/"
+		mux.Handle(pathPrefix, http.StripPrefix(strings.TrimSuffix(pathPrefix, "/"), rh))
 
 		log.Info().
-			Str("repo", repoCfg.Name).
+			Str("repo", currentRepoCfg.Name).
 			Str("prefix", pathPrefix).
-			Str("upstream", repoCfg.URL).
+			Str("upstream", currentRepoCfg.URL).
 			Msg("Registered repository handler")
 		registeredCount++
 	}
@@ -124,7 +126,6 @@ func (s *Server) Start(ctx context.Context) error {
 	select {
 	case err := <-errChan:
 		s.log.Error().Err(err).Msg("Listener failed, initiating shutdown.")
-
 		return fmt.Errorf("listener error: %w", err)
 	case <-ctx.Done():
 		s.log.Info().Msg("Shutdown signal received, stopping server...")
@@ -148,40 +149,49 @@ func (s *Server) setupListeners() error {
 	if sockPath := s.cfg.Server.UnixPath; sockPath != "" {
 		cleanSockPath := util.CleanPath(sockPath)
 		sockDir := filepath.Dir(cleanSockPath)
+		var opFailed bool
 
 		if err := os.MkdirAll(sockDir, 0755); err != nil {
 			errs = append(errs, fmt.Sprintf("mkdir for unix socket dir %s: %v", sockDir, err))
-		} else {
+			opFailed = true
+		}
 
-			if _, err := os.Stat(cleanSockPath); err == nil {
-				if rmErr := os.Remove(cleanSockPath); rmErr != nil {
-					errs = append(errs, fmt.Sprintf("remove existing unix socket %s: %v", cleanSockPath, rmErr))
+		if !opFailed {
+			if fi, err := os.Stat(cleanSockPath); err == nil {
+				if fi.Mode()&os.ModeSocket == 0 {
+					errs = append(errs, fmt.Sprintf("path %s exists and is not a socket", cleanSockPath))
+					opFailed = true
+				} else {
+					if rmErr := os.Remove(cleanSockPath); rmErr != nil {
+						errs = append(errs, fmt.Sprintf("remove existing unix socket %s: %v", cleanSockPath, rmErr))
+						opFailed = true
+					}
 				}
 			} else if !os.IsNotExist(err) {
 				errs = append(errs, fmt.Sprintf("stat unix socket %s: %v", cleanSockPath, err))
+				opFailed = true
 			}
+		}
 
-			if len(errs) == 0 || (len(errs) > 0 && !strings.Contains(errs[len(errs)-1], cleanSockPath)) {
-				unixLn, err := net.Listen("unix", cleanSockPath)
-				if err != nil {
-					errs = append(errs, fmt.Sprintf("unix listen on %s: %v", cleanSockPath, err))
+		if !opFailed {
+			unixLn, err := net.Listen("unix", cleanSockPath)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("unix listen on %s: %v", cleanSockPath, err))
+			} else {
+				perms := s.cfg.Server.UnixPerms.StdFileMode()
+				if err := os.Chmod(cleanSockPath, perms); err != nil {
+					_ = unixLn.Close()
+					_ = os.Remove(cleanSockPath)
+					errs = append(errs, fmt.Sprintf("chmod unix socket %s to %0o: %v", cleanSockPath, perms, err))
 				} else {
-					perms := s.cfg.Server.UnixPerms.StdFileMode()
-					if err := os.Chmod(cleanSockPath, perms); err != nil {
-						_ = unixLn.Close()
-						_ = os.Remove(cleanSockPath)
-						errs = append(errs, fmt.Sprintf("chmod unix socket %s to %0o: %v", cleanSockPath, perms, err))
-					} else {
-						s.listeners = append(s.listeners, unixLn)
-						s.log.Info().Str("path", cleanSockPath).Str("perms", fmt.Sprintf("0%o", perms)).Msg("Unix socket listener created")
-					}
+					s.listeners = append(s.listeners, unixLn)
+					s.log.Info().Str("path", cleanSockPath).Str("perms", fmt.Sprintf("0%o", perms)).Msg("Unix socket listener created")
 				}
 			}
 		}
 	}
 
 	if len(errs) > 0 {
-
 		for _, l := range s.listeners {
 			_ = l.Close()
 		}
@@ -207,22 +217,27 @@ func (s *Server) Shutdown() error {
 
 	if s.cfg.Server.UnixPath != "" {
 		cleanSockPath := util.CleanPath(s.cfg.Server.UnixPath)
-
-		wasListening := false
+		wasListeningOnSocket := false
 		for _, l := range s.listeners {
 			if l.Addr().Network() == "unix" && l.Addr().String() == cleanSockPath {
-				wasListening = true
+				wasListeningOnSocket = true
 				break
 			}
 		}
-		if wasListening {
-			s.log.Debug().Str("path", cleanSockPath).Msg("Removing Unix socket file.")
 
-			if rmErr := os.Remove(cleanSockPath); rmErr != nil && !os.IsNotExist(rmErr) {
-				s.log.Warn().Err(rmErr).Str("path", cleanSockPath).Msg("Failed to remove unix socket file during shutdown.")
-				if mainErr == nil {
-					mainErr = rmErr
+		if wasListeningOnSocket {
+			s.log.Debug().Str("path", cleanSockPath).Msg("Checking Unix socket file for removal after shutdown.")
+			if _, err := os.Stat(cleanSockPath); err == nil {
+				if rmErr := os.Remove(cleanSockPath); rmErr != nil && !os.IsNotExist(rmErr) {
+					s.log.Warn().Err(rmErr).Str("path", cleanSockPath).Msg("Failed to remove unix socket file during shutdown.")
+					if mainErr == nil {
+						mainErr = fmt.Errorf("remove unix socket %s: %w", cleanSockPath, rmErr)
+					}
+				} else if rmErr == nil {
+					s.log.Info().Str("path", cleanSockPath).Msg("Unix socket file removed.")
 				}
+			} else if !os.IsNotExist(err) {
+				s.log.Warn().Err(err).Str("path", cleanSockPath).Msg("Error stating unix socket file during shutdown for removal check.")
 			}
 		}
 	}

@@ -35,7 +35,6 @@ func newDiskStore(baseDir string, logger zerolog.Logger) (*diskStore, error) {
 }
 
 func (ds *diskStore) contentPath(key string) string {
-
 	return filepath.Join(ds.baseDir, key+contentSuffix)
 }
 
@@ -62,7 +61,6 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 		if err != nil {
 			return 0, "", "", fmt.Errorf("create temp content file: %w", err)
 		}
-
 		defer func() {
 			if tmpCFile != nil {
 				tmpCFile.Close()
@@ -80,7 +78,6 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 		if err = tmpCFile.Sync(); err != nil {
 			ds.log.Warn().Err(err).Str("path", tmpCFile.Name()).Msg("Sync temp content file failed")
 		}
-
 		tmpCPath = tmpCFile.Name()
 		if err = tmpCFile.Close(); err != nil {
 			return 0, "", "", fmt.Errorf("close temp content file: %w", err)
@@ -136,6 +133,7 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 		os.Remove(tmpMPath)
 		return 0, "", "", fmt.Errorf("rename temp metadata to %s: %w", mPath, err)
 	}
+
 	if r != nil && tmpCPath != "" {
 		if err = os.Rename(tmpCPath, cPath); err != nil {
 			os.Remove(mPath)
@@ -194,7 +192,6 @@ func (ds *diskStore) readMeta(mPath string) (*ItemMeta, error) {
 	defer f.Close()
 
 	var meta ItemMeta
-
 	if err = json.NewDecoder(bufio.NewReader(f)).Decode(&meta); err != nil {
 		return nil, fmt.Errorf("decode metadata from %s: %w", mPath, err)
 	}
@@ -258,7 +255,6 @@ func (ds *diskStore) cleanDir() error {
 	for _, entry := range entries {
 		p := filepath.Join(ds.baseDir, entry.Name())
 		if err := os.RemoveAll(p); err != nil {
-
 			ds.log.Error().Err(err).Str("path", p).Msg("Failed to remove item during cache clean.")
 		}
 	}

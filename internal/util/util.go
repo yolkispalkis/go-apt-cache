@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"mime"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -15,11 +14,9 @@ import (
 )
 
 var (
-	sizeRe     = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT])?B?$`)
-	repoNameRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
-
-	fsUnsafeRe = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F\s]+`)
-
+	sizeRe          = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT])?B?$`)
+	repoNameRe      = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+	fsUnsafeRe      = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F\s]+`)
 	reservedFsNames = map[string]struct{}{
 		"con": {}, "prn": {}, "aux": {}, "nul": {},
 		"com1": {}, "com2": {}, "com3": {}, "com4": {}, "com5": {}, "com6": {}, "com7": {}, "com8": {}, "com9": {},
@@ -27,22 +24,28 @@ var (
 	}
 )
 
+func RepoNameRegexString() string {
+	return repoNameRe.String()
+}
+
 func ParseSize(s string) (int64, error) {
 	if s == "" {
 		return 0, errors.New("size string empty")
 	}
-	m := sizeRe.FindStringSubmatch(strings.ToUpper(strings.TrimSpace(s)))
-	if m == nil {
+	trimmedSizeStr := strings.ToUpper(strings.TrimSpace(s))
+	m := sizeRe.FindStringSubmatch(trimmedSizeStr)
 
-		b, err := strconv.ParseInt(s, 10, 64)
+	if m == nil {
+		b, err := strconv.ParseInt(trimmedSizeStr, 10, 64)
 		if err == nil && b >= 0 {
 			return b, nil
 		}
 		return 0, fmt.Errorf("invalid size format: %q (expected e.g., '10GB', '500MB', '1024')", s)
 	}
+
 	val, err := strconv.ParseFloat(m[1], 64)
 	if err != nil || val < 0 {
-		return 0, fmt.Errorf("invalid numeric value in size %q", s)
+		return 0, fmt.Errorf("invalid numeric value in size %q: %w", s, err)
 	}
 
 	var mult float64 = 1.0
@@ -59,14 +62,14 @@ func ParseSize(s string) (int64, error) {
 	byteSize := int64(val * mult)
 
 	if val > 0 && byteSize <= 0 && mult > 1.0 {
-		return 0, fmt.Errorf("size value %q resulted in non-positive bytes or overflow", s)
+		return 0, fmt.Errorf("size value %q (%f * %f) resulted in non-positive bytes or overflow (%d)", s, val, mult, byteSize)
 	}
 	return byteSize, nil
 }
 
 func FormatSize(b int64) string {
 	if b < 0 {
-		return fmt.Sprintf("%d B (Negative)", b)
+		return fmt.Sprintf("%dB (Negative)", b)
 	}
 	const unit = 1024
 	if b < unit {
@@ -112,77 +115,24 @@ func SanitizeFSComponent(name string) string {
 
 func GenerateCacheKey(repo, relPath string) (string, error) {
 	if !IsRepoNameSafe(repo) {
-		return "", fmt.Errorf("invalid repo name for cache key: %s", repo)
+		return "", fmt.Errorf("invalid repo name for cache key: %q", repo)
 	}
 
 	cleanRelPath := filepath.ToSlash(filepath.Clean(relPath))
-	if strings.HasPrefix(cleanRelPath, "/") {
-		cleanRelPath = strings.TrimPrefix(cleanRelPath, "/")
-	}
+	cleanRelPath = strings.TrimPrefix(cleanRelPath, "/")
+
 	if cleanRelPath == "." || cleanRelPath == "" {
 		return SanitizeFSComponent(repo), nil
 	}
 
-	var sb strings.Builder
-	sb.WriteString(SanitizeFSComponent(repo))
-
+	parts := []string{SanitizeFSComponent(repo)}
 	for _, p := range strings.Split(cleanRelPath, "/") {
 		if p == "" || p == "." || p == ".." {
 			continue
 		}
-		sb.WriteByte('/')
-		sb.WriteString(SanitizeFSComponent(p))
+		parts = append(parts, SanitizeFSComponent(p))
 	}
-	return sb.String(), nil
-}
-
-func GetContentType(path string) string {
-	ext := strings.ToLower(filepath.Ext(path))
-	base := strings.ToLower(filepath.Base(path))
-
-	switch base {
-	case "release", "inrelease":
-		return "text/plain; charset=utf-8"
-	}
-
-	if strings.HasPrefix(base, "packages") ||
-		strings.HasPrefix(base, "sources") ||
-		strings.HasPrefix(base, "translation") ||
-		strings.HasPrefix(base, "contents") {
-
-	}
-
-	switch ext {
-	case ".deb", ".udeb", ".ddeb":
-		return "application/vnd.debian.binary-package"
-	case ".dsc", ".changes", ".list":
-		return "text/plain; charset=utf-8"
-	case ".gz":
-		return "application/gzip"
-	case ".bz2":
-		return "application/x-bzip2"
-	case ".xz":
-		return "application/x-xz"
-	case ".lz4":
-		return "application/x-lz4"
-	case ".zst", ".zstd":
-		return "application/zstd"
-	case ".diff", ".patch":
-		return "text/x-diff; charset=utf-8"
-	}
-
-	ct := mime.TypeByExtension(ext)
-	if ct == "" {
-
-		if strings.HasPrefix(base, "packages") ||
-			strings.HasPrefix(base, "sources") ||
-			strings.HasPrefix(base, "translation") ||
-			strings.HasPrefix(base, "contents") {
-			return "text/plain; charset=utf-8"
-		}
-		return "application/octet-stream"
-	}
-	return ct
+	return strings.Join(parts, "/"), nil
 }
 
 func CopyHeader(h http.Header) http.Header {
@@ -199,7 +149,6 @@ func CopyHeader(h http.Header) http.Header {
 }
 
 func SelectProxyHeaders(dst, src http.Header) {
-
 	toConsider := []string{
 		"Cache-Control", "Content-Disposition", "Content-Language", "Date", "ETag",
 		"Expires", "Last-Modified", "Link", "Pragma", "Retry-After", "Server",
@@ -207,7 +156,6 @@ func SelectProxyHeaders(dst, src http.Header) {
 	}
 	for _, key := range toConsider {
 		if vals := src.Values(key); len(vals) > 0 {
-
 			dst[http.CanonicalHeaderKey(key)] = vals
 		}
 	}
@@ -238,19 +186,24 @@ func IsClientDisconnectedError(err error) bool {
 	}
 
 	if errors.Is(err, context.Canceled) ||
-		errors.Is(err, http.ErrAbortHandler) ||
-		strings.Contains(err.Error(), "broken pipe") ||
-		strings.Contains(err.Error(), "connection reset by peer") {
+		errors.Is(err, http.ErrAbortHandler) {
+		return true
+	}
+
+	errStr := err.Error()
+	if strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "connection reset by peer") {
 		return true
 	}
 
 	var netErr net.Error
-
 	return errors.As(err, &netErr) && (netErr.Timeout() || !netErr.Temporary())
 }
 
 func FormatDuration(d time.Duration) string {
 	switch {
+	case d < time.Microsecond:
+		return fmt.Sprintf("%dns", d.Nanoseconds())
 	case d < time.Millisecond:
 		return fmt.Sprintf("%.3fµs", float64(d.Nanoseconds())/1e3)
 	case d < time.Second:

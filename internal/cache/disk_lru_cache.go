@@ -376,7 +376,6 @@ func (c *DiskLRU) calculateExpiresAt(headers http.Header, fetchedAt time.Time) t
 
 	if expiresHeader := headers.Get("Expires"); expiresHeader != "" {
 		if expiresTime, err := http.ParseTime(expiresHeader); err == nil {
-
 			if expiresTime.Before(fetchedAt) || expiresTime.Equal(fetchedAt) {
 				return fetchedAt
 			}
@@ -423,7 +422,6 @@ func (c *DiskLRU) removeItemLocked(key string, deleteFilesFromDisk bool) {
 	}
 
 	if deleteFilesFromDisk {
-
 		if err := c.store.deleteFiles(meta.Path, meta.MetaPath); err != nil {
 			c.log.Error().Err(err).Str("key", key).Msg("Failed to delete cache files from disk.")
 		}
@@ -495,7 +493,6 @@ func (c *DiskLRU) UpdateValidatedAt(ctx context.Context, key string, validatedAt
 }
 
 func (c *DiskLRU) evictItemsLocked(requiredSpaceToFree int64, deleteFiles bool) {
-
 	if requiredSpaceToFree <= 0 && c.currentBytes.Load() <= c.maxBytes {
 		return
 	}
@@ -573,7 +570,6 @@ func (c *DiskLRU) Close() error {
 		return nil
 	}
 	c.log.Info().Msg("Closing cache manager.")
-
 	return nil
 }
 

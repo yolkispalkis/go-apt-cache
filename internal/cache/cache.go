@@ -28,9 +28,7 @@ type ItemMeta struct {
 }
 
 func (m *ItemMeta) IsStale(now time.Time) bool {
-
 	if m.StatusCode != http.StatusOK && m.StatusCode != http.StatusPartialContent {
-
 		return true
 	}
 	if m.ExpiresAt.IsZero() {

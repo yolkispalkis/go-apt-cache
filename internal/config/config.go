@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yolkispalkis/go-apt-cache/internal/appinfo"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
@@ -31,7 +32,6 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	case string:
 		td, err := time.ParseDuration(val)
 		if err != nil {
-
 			s, errInt := json.Number(val).Int64()
 			if errInt == nil && s >= 0 {
 				td = time.Duration(s) * time.Second
@@ -65,7 +65,6 @@ func (fm *FileMode) UnmarshalJSON(b []byte) error {
 
 	if _, err := fmt.Sscanf(s, "0%o", &mode); err != nil {
 		if _, err2 := fmt.Sscanf(s, "%o", &mode); err2 != nil {
-
 			mDecimal, errDecimal := json.Number(s).Int64()
 			if errDecimal == nil {
 				mode = uint32(mDecimal)
@@ -130,7 +129,7 @@ func Default() *Config {
 			IdleTimeout:       Duration(120 * time.Second),
 			ReadHeaderTimeout: Duration(10 * time.Second),
 			MaxConcurrent:     20,
-			UserAgent:         "go-apt-proxy/2.1 (+https://github.com/yolkispalkis/go-apt-cache)",
+			UserAgent:         appinfo.UserAgent(),
 		},
 		Cache: CacheConfig{
 			Dir:              "./apt_cache_data",
@@ -228,7 +227,6 @@ func Validate(cfg *Config) error {
 	if s.ShutdownTimeout.StdDuration() <= 0 {
 		return errors.New("server.shutdownTimeout must be > 0")
 	}
-
 	if s.ReadHeaderTimeout.StdDuration() <= 0 {
 		return errors.New("server.readHeaderTimeout must be > 0")
 	}
@@ -236,7 +234,7 @@ func Validate(cfg *Config) error {
 		return errors.New("server.maxConcurrentFetches must be > 0")
 	}
 	if s.UserAgent == "" {
-		s.UserAgent = Default().Server.UserAgent
+		s.UserAgent = appinfo.UserAgent()
 	}
 
 	c := &cfg.Cache
@@ -247,7 +245,6 @@ func Validate(cfg *Config) error {
 		if _, err := util.ParseSize(c.MaxSize); err != nil {
 			return fmt.Errorf("invalid cache.maxSize %q: %w", c.MaxSize, err)
 		}
-
 	}
 
 	if _, err := logging.ParseLevel(cfg.Logging.Level); err != nil {
@@ -262,7 +259,7 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("repo %d: name empty", i)
 		}
 		if !util.IsRepoNameSafe(repo.Name) {
-			return fmt.Errorf("repo %q: name invalid", repo.Name)
+			return fmt.Errorf("repo %q: name invalid, must match %s", repo.Name, util.RepoNameRegexString())
 		}
 		if strings.TrimSpace(repo.URL) == "" {
 			return fmt.Errorf("repo %q: URL empty", repo.Name)
@@ -272,7 +269,7 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("repo %q: invalid URL %q: %w", repo.Name, repo.URL, err)
 		}
 		if u.Scheme != "http" && u.Scheme != "https" {
-			return fmt.Errorf("repo %q: URL scheme must be http(s)", repo.Name)
+			return fmt.Errorf("repo %q: URL scheme must be http or https", repo.Name)
 		}
 		if u.Host == "" {
 			return fmt.Errorf("repo %q: URL host missing", repo.Name)
@@ -291,7 +288,6 @@ func Validate(cfg *Config) error {
 		}
 	}
 	if !hasEnabled && len(cfg.Repositories) > 0 {
-
 	}
 	return nil
 }
