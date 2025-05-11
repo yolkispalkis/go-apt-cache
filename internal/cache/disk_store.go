@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -85,6 +86,25 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 			_ = tmpCFileHandle.Close()
 			return 0, "", "", fmt.Errorf("write content to temp: %w", err)
 		}
+
+		originalContentLengthStr := meta.Headers.Get("Content-Length")
+		if originalContentLengthStr != "" {
+			originalContentLength, parseErr := strconv.ParseInt(originalContentLengthStr, 10, 64)
+			if parseErr == nil && originalContentLength >= 0 {
+				if writtenSize != originalContentLength {
+					ds.log.Error().
+						Str("key", meta.Key).
+						Int64("expected_size_upstream", originalContentLength).
+						Int64("actual_written_size", writtenSize).
+						Msg("Upstream Content-Length mismatch with bytes read. File from upstream is likely incomplete or server misreported size. Not caching.")
+					_ = tmpCFileHandle.Close()
+
+					err = fmt.Errorf("upstream Content-Length %d did not match received bytes %d for key %s", originalContentLength, writtenSize, meta.Key)
+					return 0, "", "", err
+				}
+			}
+		}
+
 		if err = bufW.Flush(); err != nil {
 			_ = tmpCFileHandle.Close()
 			return 0, "", "", fmt.Errorf("flush content buffer: %w", err)
