@@ -107,7 +107,7 @@ func (h *RepoHandler) handleCacheHit(w http.ResponseWriter, r *http.Request,
 			h.handleCacheMiss(w, r, key, upstreamURL)
 			return
 		}
-		w.Header().Set("X-Cache-Status", "HIT_NEGATIVE")
+
 		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
@@ -131,15 +131,13 @@ func (h *RepoHandler) handleCacheHit(w http.ResponseWriter, r *http.Request,
 		h.log.Info().Str("key", key).Msg("Revalidation triggered by upstream headers or client 'no-cache'.")
 		h.revalidateAndServe(w, r, key, upstreamURL, meta)
 	} else {
-		w.Header().Set("X-Cache-Status", "HIT")
+
 		h.serveFromCache(w, r, key, relPath, meta)
 	}
 }
 
 func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
 	key, upstreamURL string, currentMeta *cache.ItemMeta) {
-
-	w.Header().Set("X-Cache-Status", "REVALIDATING")
 
 	fetchOpts := &fetch.Options{}
 	if lmStr := currentMeta.Headers.Get("Last-Modified"); lmStr != "" {
@@ -158,7 +156,7 @@ func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
 
 	if fetchErr == nil {
 		defer fetchRes.Body.Close()
-		h.storeAndServe(w, r, key, upstreamURL, fetchRes, "UPDATED")
+		h.storeAndServe(w, r, key, upstreamURL, fetchRes)
 		return
 	}
 
@@ -168,19 +166,18 @@ func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
 		if errUpd := h.cm.UpdateValidatedAt(r.Context(), key, time.Now()); errUpd != nil {
 			h.log.Warn().Err(errUpd).Str("key", key).Msg("Failed to update validation timestamp in cache.")
 		}
-		w.Header().Set("X-Cache-Status", "VALIDATED")
+
 		h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
 		return
 	}
 
 	h.log.Warn().Err(fetchErr).Str("key", key).Msg("Revalidation fetch failed. Serving stale content if possible.")
-	w.Header().Set("X-Cache-Status", "STALE_REVAL_FAILED")
+
 	h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
 }
 
 func (h *RepoHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request,
 	key, upstreamURL string) {
-	w.Header().Set("X-Cache-Status", "MISS")
 
 	fetchOpts := &fetch.Options{}
 	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
@@ -199,17 +196,17 @@ func (h *RepoHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request,
 	}
 	defer fetchRes.Body.Close()
 
-	h.storeAndServe(w, r, key, upstreamURL, fetchRes, "MISS_FETCHED")
+	h.storeAndServe(w, r, key, upstreamURL, fetchRes)
 }
 
 func (h *RepoHandler) handleFetchError(w http.ResponseWriter, _ *http.Request, key, upstreamURL string, err error) {
 	if errors.Is(err, fetch.ErrUpstreamNotModified) {
-		w.Header().Set("X-Cache-Status", "MISS_UPSTREAM_NOT_MODIFIED")
+
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	if errors.Is(err, fetch.ErrUpstreamNotFound) {
-		w.Header().Set("X-Cache-Status", "MISS_UPSTREAM_NOT_FOUND")
+
 		if h.cacheCfg.NegativeTTL.StdDuration() > 0 {
 			go func() {
 				emptyHeaders := make(http.Header)
@@ -242,7 +239,7 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, _ *http.Request, k
 }
 
 func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
-	key, fetchedUpstreamURL string, fetchRes *fetch.Result, xCacheStat string) {
+	key, fetchedUpstreamURL string, fetchRes *fetch.Result) {
 
 	popts := cache.PutOptions{
 		UpstreamURL: fetchedUpstreamURL,
@@ -277,7 +274,7 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 	teeBody := io.TeeReader(fetchRes.Body, pw)
 
 	if h.checkClientConditional(w, r, fetchRes.ModTime, fetchRes.Header.Get("ETag")) {
-		w.Header().Set("X-Cache-Status", xCacheStat+"_CLIENT_NOT_MODIFIED")
+
 		_, copyErr := io.Copy(io.Discard, teeBody)
 		if copyErr != nil {
 			_ = pw.CloseWithError(copyErr)
@@ -288,9 +285,10 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	w.Header().Set("X-Cache-Status", xCacheStat)
-	h.setResponseHeaders(w, fetchRes.Header, fetchRes.ModTime)
-	util.SelectProxyHeaders(w.Header(), fetchRes.Header)
+	util.CopyWhitelistedHeaders(w.Header(), fetchRes.Header)
+	if !fetchRes.ModTime.IsZero() {
+		w.Header().Set("Last-Modified", fetchRes.ModTime.UTC().Format(http.TimeFormat))
+	}
 
 	var clientCopyError error
 	if r.Method == http.MethodHead {
@@ -329,10 +327,10 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 	key, relPath string, meta *cache.ItemMeta) {
 
-	itemModTime := meta.Headers.Get("Last-Modified")
+	itemModTimeStr := meta.Headers.Get("Last-Modified")
 	var modTimeForCheck time.Time
-	if itemModTime != "" {
-		if t, errLMP := http.ParseTime(itemModTime); errLMP == nil {
+	if itemModTimeStr != "" {
+		if t, errLMP := http.ParseTime(itemModTimeStr); errLMP == nil {
 			modTimeForCheck = t
 		}
 	}
@@ -349,8 +347,10 @@ func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 	}
 	defer cacheReadRes.Content.Close()
 
-	h.setResponseHeaders(w, meta.Headers, modTimeForCheck)
-	util.SelectProxyHeaders(w.Header(), meta.Headers)
+	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
+	if !modTimeForCheck.IsZero() {
+		w.Header().Set("Last-Modified", modTimeForCheck.UTC().Format(http.TimeFormat))
+	}
 
 	if r.Method == http.MethodHead {
 		if meta.Size >= 0 {
@@ -402,22 +402,4 @@ func (h *RepoHandler) checkClientConditional(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	return false
-}
-
-func (h *RepoHandler) setResponseHeaders(w http.ResponseWriter, itemHeaders http.Header, itemModTime time.Time) {
-	if ct := itemHeaders.Get("Content-Type"); ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-
-	if !itemModTime.IsZero() {
-		w.Header().Set("Last-Modified", itemModTime.UTC().Format(http.TimeFormat))
-	}
-
-	if etag := itemHeaders.Get("ETag"); etag != "" {
-		w.Header().Set("ETag", etag)
-	}
-
-	if ar := itemHeaders.Get("Accept-Ranges"); ar != "" {
-		w.Header().Set("Accept-Ranges", ar)
-	}
 }

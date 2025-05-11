@@ -24,6 +24,20 @@ var (
 	}
 )
 
+var headerProxyWhitelist = map[string]struct{}{
+	"Accept-Ranges":       {},
+	"Cache-Control":       {},
+	"Content-Length":      {},
+	"Content-Type":        {},
+	"Date":                {},
+	"ETag":                {},
+	"Last-Modified":       {},
+	"Content-Disposition": {},
+	"Expires":             {},
+	"Vary":                {},
+	"Age":                 {},
+}
+
 func RepoNameRegexString() string {
 	return repoNameRe.String()
 }
@@ -148,15 +162,14 @@ func CopyHeader(h http.Header) http.Header {
 	return h2
 }
 
-func SelectProxyHeaders(dst, src http.Header) {
-	toConsider := []string{
-		"Cache-Control", "Content-Disposition", "Content-Language", "Date", "ETag",
-		"Expires", "Last-Modified", "Link", "Pragma", "Retry-After", "Server",
-		"Vary", "Age", "Accept-Ranges",
+func CopyWhitelistedHeaders(dst, src http.Header) {
+	if src == nil {
+		return
 	}
-	for _, key := range toConsider {
-		if vals := src.Values(key); len(vals) > 0 {
-			dst[http.CanonicalHeaderKey(key)] = vals
+	for keySrc, valuesSrc := range src {
+		canonicalKey := http.CanonicalHeaderKey(keySrc)
+		if _, ok := headerProxyWhitelist[canonicalKey]; ok {
+			dst[canonicalKey] = valuesSrc
 		}
 	}
 }
