@@ -39,54 +39,51 @@ go build -o "${BIN_DIR}/${PKG_NAME}" main.go
 
 # Создание модифицированного конфигурационного файла с правильными путями
 echo "Создание конфигурационного файла..."
-cat > "${CONFIG_DIR}/config.json" << EOF
+cat >"${CONFIG_DIR}/config.json" <<EOF
 {
   "server": {
     "listenAddress": ":8080",
     "unixSocketPath": "/run/${RUN_DIR_NAME}/apt-proxy.sock",
-    "unixSocketPermissions": "660",
-    "requestTimeout": "60s",
+    "unixSocketPermissions": "0660",
+    "requestTimeout": "30s",
     "shutdownTimeout": "15s",
     "idleTimeout": "120s",
     "readHeaderTimeout": "10s",
-    "maxConcurrentFetches": 10
+    "maxConcurrentFetches": 20,
+    "userAgent": "go-apt-proxy/2.0"
   },
   "cache": {
     "directory": "/var/cache/go-apt-proxy",
-    "maxSize": "10GB",
+    "maxSize": "20GB",
     "enabled": true,
     "cleanOnStart": false,
-    "validationTTL": "5m",
-    "skipValidationExtensions": [".deb", ".udeb", ".ddeb"]
+    "defaultTTL": "1h",
+    "revalidateOnHitTTL": "0s",
+    "negativeCacheTTL": "5m"
   },
   "logging": {
     "level": "info",
     "filePath": "/var/log/go-apt-proxy/apt_cache.log",
     "disableTerminal": false,
     "maxSizeMB": 100,
-    "maxBackups": 3,
-    "maxAgeDays": 7,
+    "maxBackups": 5,
+    "maxAgeDays": 30,
     "compress": true
   },
   "repositories": [
     {
       "name": "ubuntu",
-      "url": "http://archive.ubuntu.com/ubuntu",
+      "url": "http://archive.ubuntu.com/ubuntu/",
       "enabled": true
     },
     {
       "name": "debian",
-      "url": "http://deb.debian.org/debian",
-      "enabled": false
+      "url": "http://deb.debian.org/debian/",
+      "enabled": true
     },
     {
-      "name": "security",
-      "url": "http://security.ubuntu.com/ubuntu",
-      "enabled": false
-    },
-    {
-      "name": "ppa-example",
-      "url": "http://ppa.launchpadcontent.net/example/ppa/ubuntu",
+      "name": "raspbian",
+      "url": "http://archive.raspberrypi.org/raspbian/",
       "enabled": false
     }
   ]
@@ -99,7 +96,7 @@ chmod 644 "${CONFIG_DIR}/config.json"
 
 # Создание файла systemd service с использованием RuntimeDirectory
 echo "Создание systemd service файла..."
-cat > "${SYSTEMD_DIR}/go-apt-proxy.service" << EOF
+cat >"${SYSTEMD_DIR}/go-apt-proxy.service" <<EOF
 [Unit]
 Description=Go APT Proxy Service
 After=network.target
@@ -131,7 +128,7 @@ chmod 644 "${SYSTEMD_DIR}/go-apt-proxy.service"
 
 # Создание postinst скрипта
 echo "Создание postinst скрипта..."
-cat > "${DEBIAN_DIR}/postinst" << EOF
+cat >"${DEBIAN_DIR}/postinst" <<EOF
 #!/bin/bash
 set -e
 
@@ -180,7 +177,7 @@ chmod 755 "${DEBIAN_DIR}/postinst"
 
 # Создание prerm скрипта
 echo "Создание prerm скрипта..."
-cat > "${DEBIAN_DIR}/prerm" << EOF
+cat >"${DEBIAN_DIR}/prerm" <<EOF
 #!/bin/bash
 set -e
 
@@ -204,7 +201,7 @@ chmod 755 "${DEBIAN_DIR}/prerm"
 
 # Создание postrm скрипта
 echo "Создание postrm скрипта..."
-cat > "${DEBIAN_DIR}/postrm" << EOF
+cat >"${DEBIAN_DIR}/postrm" <<EOF
 #!/bin/bash
 set -e
 
@@ -250,7 +247,7 @@ chmod 755 "${DEBIAN_DIR}/postrm"
 
 # Создание control-файла
 echo "Создание control файла..."
-cat > "${DEBIAN_DIR}/control" << EOF
+cat >"${DEBIAN_DIR}/control" <<EOF
 Package: ${PKG_NAME}
 Version: ${PKG_VERSION}
 Architecture: ${PKG_ARCH}
@@ -275,13 +272,13 @@ EOF
 
 # Создание conffiles для отслеживания файлов конфигурации
 echo "Создание conffiles..."
-cat > "${DEBIAN_DIR}/conffiles" << EOF
+cat >"${DEBIAN_DIR}/conffiles" <<EOF
 /etc/go-apt-proxy/config.json
 EOF
 
 # Создание copyright файла
 echo "Создание copyright файла..."
-cat > "${DOC_DIR}/copyright" << EOF
+cat >"${DOC_DIR}/copyright" <<EOF
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: ${PKG_NAME}
 Source: https://github.com/yolkispalkis/go-apt-cache
@@ -315,7 +312,7 @@ EOF
 
 # Создание changelog
 echo "Создание changelog файла..."
-cat > "${DOC_DIR}/changelog.Debian" << EOF
+cat >"${DOC_DIR}/changelog.Debian" <<EOF
 ${PKG_NAME} (${PKG_VERSION}-1) unstable; urgency=medium
 
   * Initial release.
