@@ -159,7 +159,7 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 		}
 
 		sort.Slice(itemsToLoad, func(i, j int) bool {
-			return itemsToLoad[i].meta.LastUsedAt.Time().After(itemsToLoad[j].meta.LastUsedAt.Time())
+			return itemsToLoad[i].meta.LastUsedAt.Time().Before(itemsToLoad[j].meta.LastUsedAt.Time())
 		})
 
 		for _, item := range itemsToLoad {
