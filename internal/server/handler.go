@@ -157,8 +157,6 @@ func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
 		Time("if_mod_since", fetchOpts.IfModSince).Str("if_none_match", fetchOpts.IfNoneMatch).
 		Msg("Revalidating item with conditional fetch")
 
-	fetchRes, fetchErr := h.fetcher.Fetch(r.Context(), key, upstreamURL, fetchOpts)
-
 	derivedRelPath := ""
 	if strings.HasPrefix(currentMeta.UpstreamURL, h.repoCfg.URL) {
 		derivedRelPath = strings.TrimPrefix(currentMeta.UpstreamURL, h.repoCfg.URL)
@@ -166,29 +164,63 @@ func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
 		parts := strings.SplitN(key, "/", 2)
 		if len(parts) == 2 {
 			derivedRelPath = parts[1]
-		} else {
-			derivedRelPath = ""
 		}
 	}
 
-	if fetchErr == nil {
+	fetchRes, fetchErr := h.fetcher.Fetch(r.Context(), key, upstreamURL, fetchOpts)
+	if fetchRes != nil && fetchRes.Body != nil {
 		defer fetchRes.Body.Close()
-		h.log.Info().Str("key", key).Int("status", fetchRes.Status).Msg("Revalidation successful, got new content.")
+	}
+
+	if errors.Is(fetchErr, fetch.ErrUpstreamNotModified) {
+		if fetchRes == nil || fetchRes.Header == nil {
+			h.log.Error().Str("key", key).Msg("Internal error: 304 Not Modified but no headers available from fetcher.")
+			h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
+			return
+		}
+
+		h.log.Info().Str("key", key).Msg("Revalidation returned 304 Not Modified. Updating meta and serving from cache.")
+		validationTime := time.Now()
+		updatedMeta, errUpdate := h.cm.UpdateAfterValidation(r.Context(), key, validationTime, fetchRes.Header, currentMeta.StatusCode, currentMeta.Size)
+		if errUpdate != nil {
+			h.log.Warn().Err(errUpdate).Str("key", key).Msg("Failed to update cache metadata after 304. Serving with old meta.")
+			h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
+		} else {
+			h.serveFromCache(w, r, key, derivedRelPath, updatedMeta)
+		}
+		return
+	}
+
+	if fetchErr == nil {
+		h.log.Info().Str("key", key).Int("status", fetchRes.Status).Msg("Revalidation successful, got new content (2xx).")
 		h.storeAndServe(w, r, key, upstreamURL, fetchRes)
 		return
 	}
 
-	if errors.Is(fetchErr, fetch.ErrUpstreamNotModified) {
-		h.log.Info().Str("key", key).Msg("Revalidation returned 304 Not Modified. Serving from cache.")
-		if errUpd := h.cm.UpdateValidatedAt(r.Context(), key, time.Now()); errUpd != nil {
-			h.log.Warn().Err(errUpd).Str("key", key).Msg("Failed to update validation timestamp in cache after 304.")
+	h.log.Warn().Err(fetchErr).Str("key", key).Msg("Revalidation fetch failed (not 304 or 2xx).")
+
+	ccDirectives := util.ParseCacheControl(currentMeta.Headers.Get("Cache-Control"))
+	_, mustRevalidate := ccDirectives["must-revalidate"]
+	_, proxyRevalidate := ccDirectives["proxy-revalidate"]
+
+	if mustRevalidate || proxyRevalidate {
+		isNetErr := errors.Is(fetchErr, fetch.ErrNetwork) || errors.Is(fetchErr, context.DeadlineExceeded) || errors.Is(fetchErr, context.Canceled)
+		isServerErr := errors.Is(fetchErr, fetch.ErrUpstreamServerErr)
+
+		if isNetErr || isServerErr {
+			h.log.Warn().Str("key", key).Msg("Item has must-revalidate/proxy-revalidate and revalidation failed due to upstream/network error. Returning 504.")
+			http.Error(w, http.StatusText(http.StatusGatewayTimeout), http.StatusGatewayTimeout)
+			return
 		}
-		h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
-		return
 	}
 
-	h.log.Warn().Err(fetchErr).Str("key", key).Msg("Revalidation fetch failed. Serving stale content if available.")
-	h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
+	if errors.Is(fetchErr, fetch.ErrUpstreamNotFound) || errors.Is(fetchErr, fetch.ErrUpstreamClientErr) || errors.Is(fetchErr, fetch.ErrUpstreamServerErr) {
+		h.log.Info().Str("key", key).Msg("Serving stale content as revalidation failed with upstream error (or no must-revalidate).")
+		h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
+	} else {
+		h.log.Error().Err(fetchErr).Str("key", key).Msg("Unhandled revalidation fetch error. Returning 500.")
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+	}
 }
 
 func (h *RepoHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request,
@@ -205,16 +237,19 @@ func (h *RepoHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request,
 	}
 
 	fetchRes, fetchErr := h.fetcher.Fetch(r.Context(), key, upstreamURL, fetchOpts)
+	if fetchRes != nil && fetchRes.Body != nil {
+		defer fetchRes.Body.Close()
+	}
+
 	if fetchErr != nil {
-		h.handleFetchError(w, key, upstreamURL, fetchErr)
+		h.handleFetchError(w, key, upstreamURL, fetchErr, fetchRes)
 		return
 	}
-	defer fetchRes.Body.Close()
 
 	h.storeAndServe(w, r, key, upstreamURL, fetchRes)
 }
 
-func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL string, err error) {
+func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL string, err error, fetchResOnError *fetch.Result) {
 	if errors.Is(err, fetch.ErrUpstreamNotModified) {
 		w.WriteHeader(http.StatusNotModified)
 		return
@@ -222,11 +257,14 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 	if errors.Is(err, fetch.ErrUpstreamNotFound) {
 		if h.cacheCfg.NegativeTTL.StdDuration() > 0 {
 			go func() {
-				emptyHeaders := make(http.Header)
+				negativeHeaders := make(http.Header)
+				if fetchResOnError != nil && fetchResOnError.Header != nil {
+					negativeHeaders = fetchResOnError.Header
+				}
 				popts := cache.PutOptions{
 					UpstreamURL: upstreamURL,
 					StatusCode:  http.StatusNotFound,
-					Headers:     emptyHeaders,
+					Headers:     negativeHeaders,
 					FetchedAt:   time.Now(),
 					Size:        0,
 				}
@@ -244,9 +282,17 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 	h.log.Error().Err(err).Str("key", key).Str("upstreamURL", upstreamURL).Msg("Failed to fetch item from upstream on MISS.")
 	status := http.StatusBadGateway
 	if errors.Is(err, fetch.ErrUpstreamClientErr) {
-		status = http.StatusBadGateway
+		if fetchResOnError != nil && fetchResOnError.Status != 0 {
+			status = http.StatusBadGateway
+		} else {
+			status = http.StatusBadGateway
+		}
 	} else if errors.Is(err, fetch.ErrUpstreamServerErr) {
-		status = http.StatusBadGateway
+		if fetchResOnError != nil && fetchResOnError.Status != 0 {
+			status = http.StatusBadGateway
+		} else {
+			status = http.StatusBadGateway
+		}
 	} else if errors.Is(err, fetch.ErrNetwork) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		status = http.StatusGatewayTimeout
 	}
@@ -368,7 +414,12 @@ func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 
 	cacheReadRes, err := h.cm.Get(r.Context(), key)
 	if err != nil || !cacheReadRes.Hit || cacheReadRes.Content == nil {
-		h.log.Error().Err(err).Str("key", key).Msg("Failed to re-open cache item for serving, or item vanished. Treating as miss.")
+		if errors.Is(err, cache.ErrNotFound) {
+			h.log.Warn().Err(err).Str("key", key).Msg("Cache item vanished before serving. Treating as miss.")
+			h.handleCacheMiss(w, r, key, meta.UpstreamURL)
+			return
+		}
+		h.log.Error().Err(err).Str("key", key).Msg("Failed to re-open cache item for serving. Treating as miss.")
 		h.handleCacheMiss(w, r, key, meta.UpstreamURL)
 		return
 	}

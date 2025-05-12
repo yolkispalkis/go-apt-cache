@@ -64,7 +64,7 @@ func (m *ItemMeta) IsStale(now time.Time) bool {
 		return true
 	}
 	if m.ExpiresAt.Time().IsZero() {
-		return false
+		return true
 	}
 	return now.After(m.ExpiresAt.Time())
 }
@@ -89,7 +89,7 @@ type Manager interface {
 	Put(ctx context.Context, key string, r io.Reader, opts PutOptions) (*ItemMeta, error)
 	Delete(ctx context.Context, key string) error
 	MarkUsed(ctx context.Context, key string) error
-	UpdateValidatedAt(ctx context.Context, key string, validatedAt time.Time) error
+	UpdateAfterValidation(ctx context.Context, key string, validationTime time.Time, newHeaders http.Header, newStatusCode int, newSizeIfChanged int64) (*ItemMeta, error)
 	Purge(ctx context.Context) error
 	Close() error
 	CurrentSize() int64

@@ -117,15 +117,21 @@ func (c *Coordinator) Fetch(ctx context.Context, key, upstreamURL string, opts *
 	if shared {
 		c.log.Debug().Str("key", key).Msg("Shared fetch result with other goroutines")
 	}
-	if err != nil {
-		c.log.Warn().Err(err).Str("key", key).Str("url", upstreamURL).Bool("shared", shared).Msg("Fetch returned error")
-		return nil, err
-	}
 
 	result, ok := resInterface.(*Result)
-	if !ok {
-		c.log.Error().Str("key", key).Str("type", fmt.Sprintf("%T", resInterface)).Msg("Internal error: unexpected type from singleflight")
+	if !ok && resInterface != nil {
+		c.log.Error().Str("key", key).Str("type", fmt.Sprintf("%T", resInterface)).Msg("Internal error: unexpected type from singleflight (non-Result)")
 		return nil, fmt.Errorf("%w: unexpected type %T from singleflight", ErrInternal, resInterface)
+	}
+
+	if err != nil {
+		c.log.Warn().Err(err).Str("key", key).Str("url", upstreamURL).Bool("shared", shared).Msg("Fetch returned error")
+		return result, err
+	}
+
+	if result == nil {
+		c.log.Error().Str("key", key).Msg("Internal error: nil result without error from singleflight")
+		return nil, fmt.Errorf("%w: nil result from singleflight without error", ErrInternal)
 	}
 
 	c.log.Debug().Str("key", key).Int("status", result.Status).Msg("Fetch successful")
@@ -167,51 +173,58 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Opt
 	}
 	c.log.Debug().Str("url", upstreamURL).Int("status_code", resp.StatusCode).Msg("Received upstream response")
 
+	responseHeaders := util.CopyHeader(resp.Header)
+
 	switch {
 	case resp.StatusCode == http.StatusNotModified:
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		return nil, ErrUpstreamNotModified
+		return &Result{
+			Status: http.StatusNotModified,
+			Header: responseHeaders,
+			Body:   nil,
+		}, ErrUpstreamNotModified
 	case resp.StatusCode == http.StatusNotFound:
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		return nil, ErrUpstreamNotFound
+		return &Result{
+			Status: http.StatusNotFound,
+			Header: responseHeaders,
+			Body:   nil,
+		}, ErrUpstreamNotFound
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		fetchRes := &Result{
+			Status: resp.StatusCode,
+			Header: responseHeaders,
+			Body:   resp.Body,
+			Size:   -1,
+		}
+		if cl := resp.Header.Get("Content-Length"); cl != "" {
+			if size, err := strconv.ParseInt(cl, 10, 64); err == nil && size >= 0 {
+				fetchRes.Size = size
+			} else {
+				c.log.Warn().Str("url", upstreamURL).Str("content_length", cl).Err(err).Msg("Invalid Content-Length header from upstream")
+			}
+		}
+		if lm := resp.Header.Get("Last-Modified"); lm != "" {
+			if modTime, err := http.ParseTime(lm); err == nil {
+				fetchRes.ModTime = modTime
+			} else {
+				c.log.Warn().Str("url", upstreamURL).Str("last_modified", lm).Err(err).Msg("Invalid Last-Modified header from upstream")
+			}
+		}
+		return fetchRes, nil
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("%w (status %d)", ErrUpstreamClientErr, resp.StatusCode)
+		return &Result{Status: resp.StatusCode, Header: responseHeaders}, fmt.Errorf("%w (status %d)", ErrUpstreamClientErr, resp.StatusCode)
 	case resp.StatusCode >= 500:
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("%w (status %d)", ErrUpstreamServerErr, resp.StatusCode)
+		return &Result{Status: resp.StatusCode, Header: responseHeaders}, fmt.Errorf("%w (status %d)", ErrUpstreamServerErr, resp.StatusCode)
 	default:
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("%w: unexpected status %d", ErrInternal, resp.StatusCode)
+		return &Result{Status: resp.StatusCode, Header: responseHeaders}, fmt.Errorf("%w: unexpected status %d", ErrInternal, resp.StatusCode)
 	}
-
-	fetchRes := &Result{
-		Status: resp.StatusCode,
-		Header: util.CopyHeader(resp.Header),
-		Body:   resp.Body,
-		Size:   -1,
-	}
-
-	if cl := resp.Header.Get("Content-Length"); cl != "" {
-		if size, err := strconv.ParseInt(cl, 10, 64); err == nil && size >= 0 {
-			fetchRes.Size = size
-		} else {
-			c.log.Warn().Str("url", upstreamURL).Str("content_length", cl).Err(err).Msg("Invalid Content-Length header from upstream")
-		}
-	}
-
-	if lm := resp.Header.Get("Last-Modified"); lm != "" {
-		if modTime, err := http.ParseTime(lm); err == nil {
-			fetchRes.ModTime = modTime
-		} else {
-			c.log.Warn().Str("url", upstreamURL).Str("last_modified", lm).Err(err).Msg("Invalid Last-Modified header from upstream")
-		}
-	}
-	return fetchRes, nil
 }

@@ -83,7 +83,18 @@ func NewDiskLRU(cfg config.CacheConfig, logger zerolog.Logger) (*DiskLRU, error)
 	}, nil
 }
 
-func (c *DiskLRU) calculateExpiresAt(headers http.Header, fetchedAt time.Time) time.Time {
+func (c *DiskLRU) calculateExpiresAt(headers http.Header, dateValueTime time.Time) time.Time {
+	ageSec := int64(0)
+	if ageHeader := headers.Get("Age"); ageHeader != "" {
+		if ageVal, err := strconv.ParseInt(ageHeader, 10, 64); err == nil && ageVal >= 0 {
+			ageSec = ageVal
+		} else {
+			c.log.Warn().Str("age_header", ageHeader).Err(err).Msg("Invalid Age header, ignoring.")
+		}
+	}
+
+	var freshnessLifetimeSec int64 = -1
+
 	if ccHeader := headers.Get("Cache-Control"); ccHeader != "" {
 		directives := util.ParseCacheControl(ccHeader)
 
@@ -92,28 +103,62 @@ func (c *DiskLRU) calculateExpiresAt(headers http.Header, fetchedAt time.Time) t
 		}
 
 		if sMaxAgeStr, ok := directives["s-maxage"]; ok {
-			if sMaxAgeSec, err := strconv.ParseInt(sMaxAgeStr, 10, 64); err == nil && sMaxAgeSec > 0 {
-				return fetchedAt.Add(time.Duration(sMaxAgeSec) * time.Second)
+			if sMaxAgeVal, err := strconv.ParseInt(sMaxAgeStr, 10, 64); err == nil && sMaxAgeVal >= 0 {
+				freshnessLifetimeSec = sMaxAgeVal
 			}
 		}
 
-		if maxAgeStr, ok := directives["max-age"]; ok {
-			if maxAgeSec, err := strconv.ParseInt(maxAgeStr, 10, 64); err == nil {
-				return fetchedAt.Add(time.Duration(maxAgeSec) * time.Second)
+		if freshnessLifetimeSec == -1 {
+			if maxAgeStr, ok := directives["max-age"]; ok {
+				if maxAgeVal, err := strconv.ParseInt(maxAgeStr, 10, 64); err == nil && maxAgeVal >= 0 {
+					freshnessLifetimeSec = maxAgeVal
+				}
 			}
 		}
 
 		if _, ok := directives["no-cache"]; ok {
-			return fetchedAt
+			return dateValueTime
 		}
 	}
 
-	if expiresHeader := headers.Get("Expires"); expiresHeader != "" {
-		if expiresTime, err := http.ParseTime(expiresHeader); err == nil {
-			return expiresTime
+	if freshnessLifetimeSec == -1 {
+		if expiresHeader := headers.Get("Expires"); expiresHeader != "" {
+			if expiresTime, err := http.ParseTime(expiresHeader); err == nil {
+				if expiresTime.After(dateValueTime) {
+					freshnessLifetimeSec = int64(expiresTime.Sub(dateValueTime).Seconds())
+				} else {
+					freshnessLifetimeSec = 0
+				}
+			}
 		}
 	}
-	return time.Time{}
+
+	if freshnessLifetimeSec != -1 {
+		currentFreshnessSec := freshnessLifetimeSec - ageSec
+		if currentFreshnessSec < 0 {
+			currentFreshnessSec = 0
+		}
+		return dateValueTime.Add(time.Duration(currentFreshnessSec) * time.Second)
+	}
+
+	if lmStr := headers.Get("Last-Modified"); lmStr != "" {
+		if lastModTime, err := http.ParseTime(lmStr); err == nil {
+			if dateValueTime.After(lastModTime) {
+				heuristicLifetime := dateValueTime.Sub(lastModTime) / 10
+				heuristicLifetimeSec := int64(heuristicLifetime.Seconds()) - ageSec
+				if heuristicLifetimeSec < 0 {
+					heuristicLifetimeSec = 0
+				}
+				keyForLog := ""
+				if headers != nil {
+					keyForLog = headers.Get("X-Cache-Key-Debug")
+				}
+				c.log.Debug().Str("key", keyForLog).Dur("heuristic_ttl", time.Duration(heuristicLifetimeSec)*time.Second).Msg("Applying heuristic caching TTL")
+				return dateValueTime.Add(time.Duration(heuristicLifetimeSec) * time.Second)
+			}
+		}
+	}
+	return dateValueTime
 }
 
 func (c *DiskLRU) Init(ctx context.Context) error {
@@ -305,6 +350,10 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		Headers:     util.CopyHeader(opts.Headers),
 		Size:        opts.Size,
 	}
+	if prelimMetaForWrite.Headers == nil {
+		prelimMetaForWrite.Headers = make(http.Header)
+	}
+	prelimMetaForWrite.Headers.Set("X-Cache-Key-Debug", key)
 
 	writtenSize, cPath, mPath, err := c.store.write(key, r, prelimMetaForWrite)
 	if err != nil {
@@ -325,7 +374,17 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		Headers:     util.CopyHeader(prelimMetaForWrite.Headers),
 		Size:        writtenSize,
 	}
-	finalNewMeta.ExpiresAt = UnixTime(c.calculateExpiresAt(finalNewMeta.Headers, finalNewMeta.FetchedAt.Time()))
+
+	var dateValueTime time.Time
+	if dateStr := finalNewMeta.Headers.Get("Date"); dateStr != "" {
+		if t, errDate := http.ParseTime(dateStr); errDate == nil {
+			dateValueTime = t
+		}
+	}
+	if dateValueTime.IsZero() {
+		dateValueTime = opts.FetchedAt
+	}
+	finalNewMeta.ExpiresAt = UnixTime(c.calculateExpiresAt(finalNewMeta.Headers, dateValueTime))
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -384,6 +443,10 @@ func (c *DiskLRU) putNegativeEntry(_ context.Context, key string, opts PutOption
 		Headers:     util.CopyHeader(opts.Headers),
 		Size:        0,
 	}
+	if meta.Headers == nil {
+		meta.Headers = make(http.Header)
+	}
+	meta.Headers.Set("X-Cache-Key-Debug", key)
 
 	if c.negTTL > 0 {
 		meta.ExpiresAt = UnixTime(meta.FetchedAt.Time().Add(c.negTTL))
@@ -486,33 +549,81 @@ func (c *DiskLRU) MarkUsed(ctx context.Context, key string) error {
 	return nil
 }
 
-func (c *DiskLRU) UpdateValidatedAt(ctx context.Context, key string, validatedAt time.Time) error {
+func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validationTime time.Time, newHeaders http.Header, newStatusCode int, newSizeIfChanged int64) (*ItemMeta, error) {
 	if !c.cfg.Enabled {
-		return nil
+		return nil, errors.New("cache disabled")
 	}
 	if err := c.checkReady(); err != nil {
-		return err
+		return nil, err
 	}
 
 	c.mu.Lock()
 	listElement, exists := c.items[key]
 	if !exists {
 		c.mu.Unlock()
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
 
 	entry := listElement.Value.(*lruEntry)
-	entry.meta.ValidatedAt = UnixTime(validatedAt)
-	entry.meta.LastUsedAt = UnixTime(time.Now())
+	metaToUpdate := entry.meta
+
+	if val := newHeaders.Get("Date"); val != "" {
+		if _, err := http.ParseTime(val); err == nil {
+			metaToUpdate.Headers.Set("Date", val)
+		} else {
+			c.log.Warn().Str("key", key).Str("date_header", val).Err(err).Msg("Invalid Date header in validation response, using current time.")
+			metaToUpdate.Headers.Set("Date", validationTime.UTC().Format(http.TimeFormat))
+		}
+	} else {
+		metaToUpdate.Headers.Set("Date", validationTime.UTC().Format(http.TimeFormat))
+		c.log.Warn().Str("key", key).Msg("Date header missing in validation response, using current time.")
+	}
+
+	if val := newHeaders.Get("Cache-Control"); val != "" {
+		metaToUpdate.Headers.Set("Cache-Control", val)
+	}
+	if val := newHeaders.Get("ETag"); val != "" {
+		metaToUpdate.Headers.Set("ETag", val)
+	}
+	if val := newHeaders.Get("Expires"); val != "" {
+		metaToUpdate.Headers.Set("Expires", val)
+	}
+	if val := newHeaders.Get("Last-Modified"); val != "" {
+		metaToUpdate.Headers.Set("Last-Modified", val)
+	}
+	if val := newHeaders.Get("Age"); val != "" {
+		metaToUpdate.Headers.Set("Age", val)
+	}
+	metaToUpdate.Headers.Set("X-Cache-Key-Debug", key)
+
+	var baseTimeForExpiryCalc time.Time
+	if dateStr := metaToUpdate.Headers.Get("Date"); dateStr != "" {
+		if t, err := http.ParseTime(dateStr); err == nil {
+			baseTimeForExpiryCalc = t
+		}
+	}
+	if baseTimeForExpiryCalc.IsZero() {
+		baseTimeForExpiryCalc = validationTime
+	}
+	metaToUpdate.ExpiresAt = UnixTime(c.calculateExpiresAt(metaToUpdate.Headers, baseTimeForExpiryCalc))
+
+	metaToUpdate.ValidatedAt = UnixTime(validationTime)
+	metaToUpdate.LastUsedAt = UnixTime(validationTime)
+
 	c.lruList.MoveToFront(listElement)
-	metaSnapshot := *entry.meta
+
+	metaSnapshot := *metaToUpdate
 	c.mu.Unlock()
 
-	if err := c.store.writeMetadata(metaSnapshot.MetaPath, &metaSnapshot); err != nil {
-		c.log.Warn().Err(err).Str("key", key).Msg("Failed to update metadata file on UpdateValidatedAt")
-		return err
-	}
-	return nil
+	go func(mSnap ItemMeta) {
+		if err := c.store.writeMetadata(mSnap.MetaPath, &mSnap); err != nil {
+			c.log.Warn().Err(err).Str("key", mSnap.Key).Msg("Failed to update metadata file on UpdateAfterValidation (async)")
+		} else {
+			c.log.Debug().Str("key", mSnap.Key).Time("new_expires_at", mSnap.ExpiresAt.Time()).Msg("Cache metadata updated and written after validation.")
+		}
+	}(metaSnapshot)
+
+	return &metaSnapshot, nil
 }
 
 func (c *DiskLRU) evictItemsLocked(requiredSpaceToFree int64, deleteFiles bool) {
@@ -594,7 +705,6 @@ func (c *DiskLRU) Close() error {
 		return nil
 	}
 	c.log.Info().Msg("Closing cache manager.")
-
 	return nil
 }
 
