@@ -4,7 +4,7 @@ set -e
 export PATH=$PATH:/usr/local/go/bin
 
 PKG_NAME="go-apt-cache"
-PKG_VERSION="2.2.8"
+PKG_VERSION="2.2.9"
 PKG_ARCH="amd64"
 PKG_MAINTAINER="yolkispalkis <me@w3h.su>"
 PKG_DESCRIPTION="Высокопроизводительный прокси-сервер для APT, написанный на Go"
@@ -221,12 +221,19 @@ SERVICE_NAME="${PKG_NAME}.service"
 case "\$1" in
     purge)
         echo "Очистка после полного удаления пакета ${PKG_NAME}..."
+        
+        if getent passwd "\${PROXY_USER}" > /dev/null; then
+            echo "Завершение процессов пользователя \${PROXY_USER}..."
+            pkill -KILL -u "\${PROXY_USER}" || true 
+            sleep 1
+        fi
+
         rm -rf "/etc/${PKG_NAME}"
         rm -rf "/var/cache/${PKG_NAME}"
         rm -rf "/var/log/${PKG_NAME}"
 
         if getent passwd "\${PROXY_USER}" > /dev/null; then
-            deluser --quiet --system "\${PROXY_USER}" || echo "Предупреждение: не удалось удалить пользователя \${PROXY_USER}"
+            deluser --quiet --system "\${PROXY_USER}" || echo "Предупреждение: не удалось удалить пользователя \${PROXY_USER} (возможно, процессы еще активны)."
         fi
         if getent group "\${PROXY_GROUP}" > /dev/null; then
             if [ -z "\$(getent group "\${PROXY_GROUP}" | cut -d: -f4)" ]; then
@@ -256,7 +263,7 @@ Package: ${PKG_NAME}
 Version: ${PKG_VERSION}
 Architecture: ${PKG_ARCH}
 Maintainer: ${PKG_MAINTAINER}
-Depends: systemd, adduser, libc6 (>= 2.17)
+Depends: systemd, adduser, libc6 (>= 2.17), procps
 Description: ${PKG_DESCRIPTION}
  ${PKG_NAME} — это высокопроизводительный прокси-сервер для APT,
  написанный на языке Go. Позволяет кешировать пакеты и метаданные
