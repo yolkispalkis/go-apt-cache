@@ -4,7 +4,7 @@ set -e
 export PATH=$PATH:/usr/local/go/bin
 
 PKG_NAME="go-apt-cache"
-PKG_VERSION="2.2.6"
+PKG_VERSION="2.2.7"
 PKG_ARCH="amd64"
 PKG_MAINTAINER="yolkispalkis <me@w3h.su>"
 PKG_DESCRIPTION="Высокопроизводительный прокси-сервер для APT, написанный на Go"
@@ -125,6 +125,7 @@ PROXY_USER=${SERVICE_USER}
 PROXY_GROUP=${SERVICE_GROUP}
 LOG_DIR_PATH="/var/log/${PKG_NAME}"
 CACHE_DIR_PATH="/var/cache/${PKG_NAME}"
+SERVICE_NAME="${PKG_NAME}.service"
 
 if ! getent group "\${PROXY_GROUP}" > /dev/null; then
     addgroup --system "\${PROXY_GROUP}"
@@ -144,18 +145,35 @@ chmod 2750 "\${LOG_DIR_PATH}"
 
 systemctl daemon-reload
 
-if [ "\$1" = "configure" ]; then
-    systemctl enable ${PKG_NAME}.service
-    if [ "\$(stat -c %d:%i /)" != "\$(stat -c %d:%i /proc/1/root/.)" ]; then
-        echo "Обнаружен режим chroot, сервис не будет запущен автоматически."
-    elif systemctl is-system-running --quiet --wait; then
-        echo "Запуск ${PKG_NAME} сервиса..."
-        systemctl start ${PKG_NAME}.service || \
-          echo "Предупреждение: не удалось запустить сервис ${PKG_NAME}. Проверьте журнал: journalctl -u ${PKG_NAME}.service"
-    else
-        echo "Systemd не активен или система не полностью загружена, сервис не будет запущен автоматически."
-    fi
-fi
+case "\$1" in
+    configure)
+        if ! systemctl is-enabled --quiet "\${SERVICE_NAME}"; then
+            systemctl enable "\${SERVICE_NAME}"
+        fi
+
+        if [ "\$(stat -c %d:%i /)" != "\$(stat -c %d:%i /proc/1/root/.)" ]; then
+            echo "Обнаружен режим chroot, сервис не будет запущен/перезапущен автоматически."
+        elif systemctl is-system-running --quiet --wait; then
+            if systemctl is-active --quiet "\${SERVICE_NAME}"; then
+                echo "Сервис \${SERVICE_NAME} активен, перезапуск..."
+                systemctl try-restart "\${SERVICE_NAME}" || \
+                  echo "Предупреждение: не удалось перезапустить сервис \${SERVICE_NAME}. Проверьте журнал: journalctl -u \${SERVICE_NAME}"
+            else
+                echo "Запуск сервиса \${SERVICE_NAME}..."
+                systemctl start "\${SERVICE_NAME}" || \
+                  echo "Предупреждение: не удалось запустить сервис \${SERVICE_NAME}. Проверьте журнал: journalctl -u \${SERVICE_NAME}"
+            fi
+        else
+            echo "Systemd не активен или система не полностью загружена, сервис не будет запущен/перезапущен автоматически."
+        fi
+    ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+    *)
+        echo "postinst called with unknown argument \`\$1'" >&2
+        exit 1
+    ;;
+esac
 
 exit 0
 EOF
@@ -166,16 +184,26 @@ cat >"${DEBIAN_DIR}/prerm" <<EOF
 #!/bin/bash
 set -e
 
-if [ "\$1" = "remove" ]; then
-    if systemctl list-units --full --all | grep -q "^\${PKG_NAME}.service"; then
-        if systemctl is-active --quiet ${PKG_NAME}.service; then
-            systemctl stop ${PKG_NAME}.service
+SERVICE_NAME="${PKG_NAME}.service"
+
+case "\$1" in
+    remove|upgrade|deconfigure)
+        if systemctl list-units --full --all | grep -q "^\${SERVICE_NAME}"; then
+            if systemctl is-active --quiet "\${SERVICE_NAME}"; then
+                systemctl stop "\${SERVICE_NAME}"
+            fi
+            if systemctl is-enabled --quiet "\${SERVICE_NAME}"; then
+                systemctl disable "\${SERVICE_NAME}"
+            fi
         fi
-        if systemctl is-enabled --quiet ${PKG_NAME}.service; then
-            systemctl disable ${PKG_NAME}.service
-        fi
-    fi
-fi
+    ;;
+    failed-upgrade)
+    ;;
+    *)
+        echo "prerm called with unknown argument \`\$1'" >&2
+        exit 1
+    ;;
+esac
 
 exit 0
 EOF
@@ -188,26 +216,35 @@ set -e
 
 PROXY_USER=${SERVICE_USER}
 PROXY_GROUP=${SERVICE_GROUP}
+SERVICE_NAME="${PKG_NAME}.service"
 
-if [ "\$1" = "purge" ]; then
-    echo "Очистка после полного удаления пакета ${PKG_NAME}..."
-    rm -rf /etc/${PKG_NAME}
-    rm -rf /var/cache/${PKG_NAME}
-    rm -rf /var/log/${PKG_NAME}
+case "\$1" in
+    purge)
+        echo "Очистка после полного удаления пакета ${PKG_NAME}..."
+        rm -rf "/etc/${PKG_NAME}"
+        rm -rf "/var/cache/${PKG_NAME}"
+        rm -rf "/var/log/${PKG_NAME}"
 
-    if getent passwd "\${PROXY_USER}" > /dev/null; then
-        deluser --system "\${PROXY_USER}" || echo "Предупреждение: не удалось удалить пользователя \${PROXY_USER}"
-    fi
-    if getent group "\${PROXY_GROUP}" > /dev/null; then
-        if [ -z "\$(getent group "\${PROXY_GROUP}" | cut -d: -f4)" ]; then
-           delgroup --system "\${PROXY_GROUP}" || echo "Предупреждение: не удалось удалить группу \${PROXY_GROUP}"
-        else
-           echo "Группа \${PROXY_GROUP} не пуста, пропускаем удаление."
+        if getent passwd "\${PROXY_USER}" > /dev/null; then
+            deluser --quiet --system "\${PROXY_USER}" || echo "Предупреждение: не удалось удалить пользователя \${PROXY_USER}"
         fi
-    fi
-fi
-
-systemctl daemon-reload || true
+        if getent group "\${PROXY_GROUP}" > /dev/null; then
+            if [ -z "\$(getent group "\${PROXY_GROUP}" | cut -d: -f4)" ]; then
+               delgroup --quiet --system "\${PROXY_GROUP}" || echo "Предупреждение: не удалось удалить группу \${PROXY_GROUP}"
+            else
+               echo "Группа \${PROXY_GROUP} не пуста, пропускаем удаление."
+            fi
+        fi
+        systemctl daemon-reload || true
+    ;;
+    remove|upgrade|abort-install|abort-upgrade|disappear)
+        systemctl daemon-reload || true
+    ;;
+    *)
+        echo "postrm called with unknown argument \`\$1'" >&2
+        exit 1
+    ;;
+esac
 
 exit 0
 EOF
@@ -288,6 +325,7 @@ gzip -9 -n "${DOC_DIR}/changelog.Debian"
 
 echo "Установка финальных прав доступа..."
 find "${STAGE_DIR}" -type d -exec chmod 755 {} \;
+find "${DEBIAN_DIR}" -type f \( -name "postinst" -o -name "prerm" -o -name "postrm" -o -name "preinst" \) -exec chmod 755 {} \;
 
 echo "Сборка .deb пакета..."
 cd "${BUILD_DIR}"
