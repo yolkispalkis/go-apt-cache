@@ -83,13 +83,13 @@ func NewDiskLRU(cfg config.CacheConfig, logger zerolog.Logger) (*DiskLRU, error)
 	}, nil
 }
 
-func (c *DiskLRU) calculateExpiresAt(headers http.Header, dateValueTime time.Time) time.Time {
+func (c *DiskLRU) calculateExpiresAt(cacheKey string, headers http.Header, dateValueTime time.Time) time.Time {
 	ageSec := int64(0)
 	if ageHeader := headers.Get("Age"); ageHeader != "" {
 		if ageVal, err := strconv.ParseInt(ageHeader, 10, 64); err == nil && ageVal >= 0 {
 			ageSec = ageVal
 		} else {
-			c.log.Warn().Str("age_header", ageHeader).Err(err).Msg("Invalid Age header, ignoring.")
+			c.log.Warn().Str("key", cacheKey).Str("age_header", ageHeader).Err(err).Msg("Invalid Age header, ignoring.")
 		}
 	}
 
@@ -149,11 +149,7 @@ func (c *DiskLRU) calculateExpiresAt(headers http.Header, dateValueTime time.Tim
 				if heuristicLifetimeSec < 0 {
 					heuristicLifetimeSec = 0
 				}
-				keyForLog := ""
-				if headers != nil {
-					keyForLog = headers.Get("X-Cache-Key-Debug")
-				}
-				c.log.Debug().Str("key", keyForLog).Dur("heuristic_ttl", time.Duration(heuristicLifetimeSec)*time.Second).Msg("Applying heuristic caching TTL")
+				c.log.Debug().Str("key", cacheKey).Dur("heuristic_ttl", time.Duration(heuristicLifetimeSec)*time.Second).Msg("Applying heuristic caching TTL")
 				return dateValueTime.Add(time.Duration(heuristicLifetimeSec) * time.Second)
 			}
 		}
@@ -350,10 +346,6 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		Headers:     util.CopyHeader(opts.Headers),
 		Size:        opts.Size,
 	}
-	if prelimMetaForWrite.Headers == nil {
-		prelimMetaForWrite.Headers = make(http.Header)
-	}
-	prelimMetaForWrite.Headers.Set("X-Cache-Key-Debug", key)
 
 	writtenSize, cPath, mPath, err := c.store.write(key, r, prelimMetaForWrite)
 	if err != nil {
@@ -384,7 +376,7 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 	if dateValueTime.IsZero() {
 		dateValueTime = opts.FetchedAt
 	}
-	finalNewMeta.ExpiresAt = UnixTime(c.calculateExpiresAt(finalNewMeta.Headers, dateValueTime))
+	finalNewMeta.ExpiresAt = UnixTime(c.calculateExpiresAt(finalNewMeta.Key, finalNewMeta.Headers, dateValueTime))
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -443,10 +435,6 @@ func (c *DiskLRU) putNegativeEntry(_ context.Context, key string, opts PutOption
 		Headers:     util.CopyHeader(opts.Headers),
 		Size:        0,
 	}
-	if meta.Headers == nil {
-		meta.Headers = make(http.Header)
-	}
-	meta.Headers.Set("X-Cache-Key-Debug", key)
 
 	if c.negTTL > 0 {
 		meta.ExpiresAt = UnixTime(meta.FetchedAt.Time().Add(c.negTTL))
@@ -594,7 +582,6 @@ func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validat
 	if val := newHeaders.Get("Age"); val != "" {
 		metaToUpdate.Headers.Set("Age", val)
 	}
-	metaToUpdate.Headers.Set("X-Cache-Key-Debug", key)
 
 	var baseTimeForExpiryCalc time.Time
 	if dateStr := metaToUpdate.Headers.Get("Date"); dateStr != "" {
@@ -605,7 +592,7 @@ func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validat
 	if baseTimeForExpiryCalc.IsZero() {
 		baseTimeForExpiryCalc = validationTime
 	}
-	metaToUpdate.ExpiresAt = UnixTime(c.calculateExpiresAt(metaToUpdate.Headers, baseTimeForExpiryCalc))
+	metaToUpdate.ExpiresAt = UnixTime(c.calculateExpiresAt(key, metaToUpdate.Headers, baseTimeForExpiryCalc))
 
 	metaToUpdate.ValidatedAt = UnixTime(validationTime)
 	metaToUpdate.LastUsedAt = UnixTime(validationTime)

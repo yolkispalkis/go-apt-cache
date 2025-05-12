@@ -4,7 +4,7 @@ set -e
 export PATH=$PATH:/usr/local/go/bin
 
 PKG_NAME="go-apt-cache"
-PKG_VERSION="2.2.9"
+PKG_VERSION="2.2.10"
 PKG_ARCH="amd64"
 PKG_MAINTAINER="yolkispalkis <me@w3h.su>"
 PKG_DESCRIPTION="Высокопроизводительный прокси-сервер для APT, написанный на Go"
@@ -153,18 +153,16 @@ case "\$1" in
 
         if [ "\$(stat -c %d:%i /)" != "\$(stat -c %d:%i /proc/1/root/.)" ]; then
             echo "Обнаружен режим chroot, сервис не будет запущен/перезапущен автоматически."
-        elif systemctl is-system-running --quiet --wait; then
+        else
             if systemctl is-active --quiet "\${SERVICE_NAME}"; then
-                echo "Сервис \${SERVICE_NAME} активен, перезапуск..."
+                echo "Сервис \${SERVICE_NAME} активен, попытка перезапуска..."
                 systemctl try-restart "\${SERVICE_NAME}" || \
                   echo "Предупреждение: не удалось перезапустить сервис \${SERVICE_NAME}. Проверьте журнал: journalctl -u \${SERVICE_NAME}"
             else
-                echo "Запуск сервиса \${SERVICE_NAME}..."
+                echo "Попытка запуска сервиса \${SERVICE_NAME}..."
                 systemctl start "\${SERVICE_NAME}" || \
                   echo "Предупреждение: не удалось запустить сервис \${SERVICE_NAME}. Проверьте журнал: journalctl -u \${SERVICE_NAME}"
             fi
-        else
-            echo "Systemd не активен или система не полностью загружена, сервис не будет запущен/перезапущен автоматически."
         fi
     ;;
     abort-upgrade|abort-remove|abort-deconfigure)
