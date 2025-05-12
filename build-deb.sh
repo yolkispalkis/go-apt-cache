@@ -4,7 +4,7 @@ set -e
 export PATH=$PATH:/usr/local/go/bin
 
 PKG_NAME="go-apt-cache"
-PKG_VERSION="2.2.7"
+PKG_VERSION="2.2.8"
 PKG_ARCH="amd64"
 PKG_MAINTAINER="yolkispalkis <me@w3h.su>"
 PKG_DESCRIPTION="Высокопроизводительный прокси-сервер для APT, написанный на Go"
@@ -170,7 +170,7 @@ case "\$1" in
     abort-upgrade|abort-remove|abort-deconfigure)
     ;;
     *)
-        echo "postinst called with unknown argument \`\$1'" >&2
+        echo "postinst called with unknown argument '\$1'" >&2
         exit 1
     ;;
 esac
@@ -200,7 +200,7 @@ case "\$1" in
     failed-upgrade)
     ;;
     *)
-        echo "prerm called with unknown argument \`\$1'" >&2
+        echo "prerm called with unknown argument '\$1'" >&2
         exit 1
     ;;
 esac
@@ -241,7 +241,7 @@ case "\$1" in
         systemctl daemon-reload || true
     ;;
     *)
-        echo "postrm called with unknown argument \`\$1'" >&2
+        echo "postrm called with unknown argument '\$1'" >&2
         exit 1
     ;;
 esac
