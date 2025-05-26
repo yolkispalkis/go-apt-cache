@@ -18,12 +18,10 @@
   },
   "logging": {
     "level": "info",
-    "filePath": "/var/log/go-apt-cache/go-apt-cache.log",
-    "disableTerminal": false,
+    "file": "/var/log/go-apt-cache/go-apt-cache.log",
     "maxSizeMB": 100,
     "maxBackups": 5,
-    "maxAgeDays": 30,
-    "compress": true
+    "maxAgeDays": 30
   },
   "repositories": [
     {

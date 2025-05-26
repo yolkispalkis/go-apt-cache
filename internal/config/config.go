@@ -137,23 +137,17 @@ func Default() *Config {
 			CleanOnStart: false,
 			NegativeTTL:  Duration(5 * time.Minute),
 		},
-		Logging: DefaultLogging(),
+		Logging: logging.Config{
+			Level:      "info",
+			File:       "/var/log/go-apt-cache/go-apt-cache.log",
+			MaxSizeMB:  100,
+			MaxBackups: 3,
+			MaxAgeDays: 7,
+		},
 		Repositories: []Repository{
 			{Name: "ubuntu", URL: "http://archive.ubuntu.com/ubuntu/", Enabled: true},
 			{Name: "debian", URL: "http://deb.debian.org/debian/", Enabled: false},
 		},
-	}
-}
-
-func DefaultLogging() logging.Config {
-	return logging.Config{
-		Level:           logging.LevelInfo,
-		Path:            "/var/log/go-apt-cache/go-apt-cache.log",
-		DisableTerminal: false,
-		MaxSizeMB:       100,
-		MaxBackups:      3,
-		MaxAgeDays:      7,
-		Compress:        true,
 	}
 }
 
@@ -174,8 +168,8 @@ func Load(path string) (*Config, error) {
 	if cfg.Cache.Enabled && cfg.Cache.Dir != "" {
 		cfg.Cache.Dir = util.CleanPath(cfg.Cache.Dir)
 	}
-	if cfg.Logging.Path != "" {
-		cfg.Logging.Path = util.CleanPath(cfg.Logging.Path)
+	if cfg.Logging.File != "" {
+		cfg.Logging.File = util.CleanPath(cfg.Logging.File)
 	}
 	if cfg.Server.UnixPath != "" {
 		cfg.Server.UnixPath = util.CleanPath(cfg.Server.UnixPath)
@@ -242,10 +236,6 @@ func Validate(cfg *Config) error {
 		if _, err := util.ParseSize(c.MaxSize); err != nil {
 			return fmt.Errorf("invalid cache.maxSize %q: %w", c.MaxSize, err)
 		}
-	}
-
-	if _, err := logging.ParseLevel(cfg.Logging.Level); err != nil {
-		return fmt.Errorf("invalid logging.level: %w", err)
 	}
 
 	repoNames := make(map[string]struct{})

@@ -53,12 +53,10 @@ cat >"${CONFIG_DIR}/config.json" <<EOF
   },
   "logging": {
     "level": "info",
-    "filePath": "/var/log/${PKG_NAME}/${PKG_NAME}.log",
-    "disableTerminal": false,
+    "file": "/var/log/${PKG_NAME}/${PKG_NAME}.log",
     "maxSizeMB": 100,
     "maxBackups": 5,
-    "maxAgeDays": 30,
-    "compress": true
+    "maxAgeDays": 30
   },
   "repositories": [
     {
