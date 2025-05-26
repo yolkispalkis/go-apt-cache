@@ -2,6 +2,8 @@ package cache
 
 import (
 	"bufio"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,12 +37,25 @@ func newDiskStore(baseDir string, logger zerolog.Logger) (*diskStore, error) {
 	}, nil
 }
 
+// hashPath создает MD5 хеш от ключа и возвращает путь вида /aa/bb/hash
+func (ds *diskStore) hashPath(key string) string {
+	hash := md5.Sum([]byte(key))
+	hashStr := hex.EncodeToString(hash[:])
+
+	// Создаем структуру /aa/bb/hash
+	return filepath.Join(
+		hashStr[:2],  // первые 2 символа
+		hashStr[2:4], // следующие 2 символа
+		hashStr,      // полный хеш как имя файла
+	)
+}
+
 func (ds *diskStore) contentPath(key string) string {
-	return filepath.Join(ds.baseDir, key+contentSuffix)
+	return filepath.Join(ds.baseDir, ds.hashPath(key)+contentSuffix)
 }
 
 func (ds *diskStore) metadataPath(key string) string {
-	return filepath.Join(ds.baseDir, key+metadataSuffix)
+	return filepath.Join(ds.baseDir, ds.hashPath(key)+metadataSuffix)
 }
 
 func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
@@ -96,7 +111,7 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 						Str("key", meta.Key).
 						Int64("expected_size_upstream", originalContentLength).
 						Int64("actual_written_size", writtenSize).
-						Msg("Upstream Content-Length mismatch with bytes read. File from upstream is likely incomplete or server misreported size. Not caching.")
+						Msg("Upstream Content-Length mismatch with bytes read")
 					_ = tmpCFileHandle.Close()
 					err = fmt.Errorf("upstream Content-Length %d did not match received bytes %d for key %s", originalContentLength, writtenSize, meta.Key)
 					return 0, "", "", err
@@ -106,7 +121,7 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 					Str("key", meta.Key).
 					Str("content_length_header", originalContentLengthStr).
 					Err(parseErr).
-					Msg("Upstream Content-Length header present but invalid (unparseable or negative). Proceeding with actual written size.")
+					Msg("Invalid Content-Length header, proceeding with actual written size")
 			}
 		}
 
@@ -222,12 +237,12 @@ func (ds *diskStore) readMeta(mPath string) (*ItemMeta, error) {
 	}
 
 	if meta.Version < MetadataVersion {
-		ds.log.Warn().Str("path", mPath).Int("file_version", meta.Version).Int("expected_version", MetadataVersion).Msg("Outdated metadata version.")
+		ds.log.Warn().Str("path", mPath).Int("file_version", meta.Version).Int("expected_version", MetadataVersion).Msg("Outdated metadata version")
 		return nil, fmt.Errorf("outdated metadata version in %s (version %d, expected >= %d)", mPath, meta.Version, MetadataVersion)
 	}
 	if meta.Key == "" {
-		ds.log.Warn().Str("path", mPath).Msg("Metadata file missing 'key' field or failed to parse due to format mismatch.")
-		return nil, fmt.Errorf("missing 'key' in metadata or format mismatch for %s", mPath)
+		ds.log.Warn().Str("path", mPath).Msg("Metadata file missing 'key' field")
+		return nil, fmt.Errorf("missing 'key' in metadata for %s", mPath)
 	}
 
 	return &meta, nil
@@ -266,7 +281,7 @@ func (ds *diskStore) scanMetaFiles() ([]string, error) {
 	var metaFiles []string
 	err := filepath.WalkDir(ds.baseDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			ds.log.Warn().Err(err).Str("path", path).Msg("Error accessing path during scan, skipping.")
+			ds.log.Warn().Err(err).Str("path", path).Msg("Error accessing path during scan, skipping")
 			return nil
 		}
 		if !d.IsDir() && strings.HasSuffix(d.Name(), metadataSuffix) &&
@@ -282,7 +297,7 @@ func (ds *diskStore) scanMetaFiles() ([]string, error) {
 }
 
 func (ds *diskStore) cleanDir() error {
-	ds.log.Info().Str("dir", ds.baseDir).Msg("Cleaning all contents of cache directory.")
+	ds.log.Info().Str("dir", ds.baseDir).Msg("Cleaning all contents of cache directory")
 	entries, err := os.ReadDir(ds.baseDir)
 	if err != nil {
 		return fmt.Errorf("read cache directory %s for cleaning: %w", ds.baseDir, err)
@@ -290,12 +305,12 @@ func (ds *diskStore) cleanDir() error {
 	for _, entry := range entries {
 		p := filepath.Join(ds.baseDir, entry.Name())
 		if err := os.RemoveAll(p); err != nil {
-			ds.log.Error().Err(err).Str("path", p).Msg("Failed to remove item during cache clean.")
+			ds.log.Error().Err(err).Str("path", p).Msg("Failed to remove item during cache clean")
 		}
 	}
 
 	if err := os.MkdirAll(ds.baseDir, 0750); err != nil {
-		ds.log.Error().Err(err).Str("path", ds.baseDir).Msg("Failed to recreate base directory after cleaning.")
+		ds.log.Error().Err(err).Str("path", ds.baseDir).Msg("Failed to recreate base directory after cleaning")
 		return fmt.Errorf("recreate base directory %s after cleaning: %w", ds.baseDir, err)
 	}
 	return nil

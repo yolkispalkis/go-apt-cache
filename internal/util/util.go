@@ -16,14 +16,8 @@ import (
 )
 
 var (
-	sizeRe          = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT])?B?$`)
-	repoNameRe      = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
-	fsUnsafeRe      = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F\s]+`)
-	reservedFsNames = map[string]struct{}{
-		"con": {}, "prn": {}, "aux": {}, "nul": {},
-		"com1": {}, "com2": {}, "com3": {}, "com4": {}, "com5": {}, "com6": {}, "com7": {}, "com8": {}, "com9": {},
-		"lpt1": {}, "lpt2": {}, "lpt3": {}, "lpt4": {}, "lpt5": {}, "lpt6": {}, "lpt7": {}, "lpt8": {}, "lpt9": {},
-	}
+	sizeRe     = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT])?B?$`)
+	repoNameRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 )
 
 var headerProxyWhitelist = map[string]struct{}{
@@ -115,49 +109,24 @@ func IsRepoNameSafe(n string) bool {
 	return repoNameRe.MatchString(n)
 }
 
-func SanitizeFSComponent(name string) string {
-	s := fsUnsafeRe.ReplaceAllString(name, "_")
-	s = strings.Trim(s, "_")
-	if _, reserved := reservedFsNames[strings.ToLower(s)]; reserved {
-		s = "_" + s
-	}
-	if s == "" {
-		return "_"
-	}
-	const maxLen = 100
-	if len(s) > maxLen {
-		s = s[:maxLen]
-	}
-	return s
-}
-
+// GenerateCacheKey теперь просто объединяет repo и path
 func GenerateCacheKey(repo, relPath string) (string, error) {
 	if !IsRepoNameSafe(repo) {
 		return "", fmt.Errorf("invalid repo name for cache key: %q", repo)
 	}
 
-	cleanRelPath := filepath.ToSlash(filepath.Clean(relPath))
-	cleanRelPath = strings.TrimPrefix(cleanRelPath, "/")
-	if cleanRelPath == "." {
-		cleanRelPath = ""
+	// Просто объединяем repo и путь - хеширование будет в disk_store
+	if relPath == "" {
+		return repo, nil
 	}
 
-	if cleanRelPath == "" {
-		return SanitizeFSComponent(repo), nil
+	// Нормализуем путь
+	cleanPath := strings.TrimPrefix(relPath, "/")
+	if cleanPath == "" || cleanPath == "." {
+		return repo, nil
 	}
 
-	parts := []string{SanitizeFSComponent(repo)}
-	for _, p := range strings.Split(cleanRelPath, "/") {
-		if p == "" || p == "." || p == ".." {
-			continue
-		}
-		sanitizedPart := SanitizeFSComponent(p)
-		if sanitizedPart == "" || sanitizedPart == "_" && p != "_" {
-			continue
-		}
-		parts = append(parts, sanitizedPart)
-	}
-	return strings.Join(parts, "/"), nil
+	return repo + "/" + cleanPath, nil
 }
 
 func CopyHeader(h http.Header) http.Header {
