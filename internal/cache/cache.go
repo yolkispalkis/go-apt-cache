@@ -70,9 +70,14 @@ func (m *ItemMeta) IsStale(now time.Time) bool {
 }
 
 type GetResult struct {
-	Meta    *ItemMeta
-	Content io.ReadCloser
-	Hit     bool
+	Meta     *ItemMeta
+	Content  io.ReadCloser
+	Hit      bool
+	KeepOpen bool // Флаг что контент уже открыт
+}
+
+type GetOptions struct {
+	WithContent bool // Нужен ли контент сразу
 }
 
 type PutOptions struct {
@@ -86,6 +91,7 @@ type PutOptions struct {
 type Manager interface {
 	Init(ctx context.Context) error
 	Get(ctx context.Context, key string) (*GetResult, error)
+	GetWithOptions(ctx context.Context, key string, opts GetOptions) (*GetResult, error)
 	Put(ctx context.Context, key string, r io.Reader, opts PutOptions) (*ItemMeta, error)
 	Delete(ctx context.Context, key string) error
 	MarkUsed(ctx context.Context, key string) error

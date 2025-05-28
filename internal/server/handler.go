@@ -80,7 +80,8 @@ func (h *RepoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheRes, err := h.cm.Get(r.Context(), cacheKey)
+	// Используем новый метод без контента для первоначальной проверки
+	cacheRes, err := h.cm.GetWithOptions(r.Context(), cacheKey, cache.GetOptions{WithContent: false})
 	if err != nil && !errors.Is(err, cache.ErrNotFound) {
 		h.log.Error().Err(err).Str("key", cacheKey).Msg("Cache get error")
 		http.Error(w, "Cache error", http.StatusInternalServerError)
@@ -88,12 +89,16 @@ func (h *RepoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if cacheRes != nil && cacheRes.Hit {
-		h.log.Debug().Str("key", cacheKey).Str("status", "HIT").Msg("Cache hit")
+		if h.log.GetLevel() <= zerolog.DebugLevel {
+			h.log.Debug().Str("key", cacheKey).Str("status", "HIT").Msg("Cache hit")
+		}
 		h.handleCacheHit(w, r, cacheKey, upstreamURL, relPath, cacheRes)
 		return
 	}
 
-	h.log.Info().Str("key", cacheKey).Str("status", "MISS").Msg("Cache miss")
+	if h.log.GetLevel() <= zerolog.InfoLevel {
+		h.log.Info().Str("key", cacheKey).Str("status", "MISS").Msg("Cache miss")
+	}
 	h.handleCacheMiss(w, r, cacheKey, upstreamURL)
 }
 
@@ -302,10 +307,14 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 	key, fetchedUpstreamURL string, fetchRes *fetch.Result) {
 
+	// Используем пул для заголовков
+	headers := util.CopyHeader(fetchRes.Header)
+	defer util.ReturnHeader(headers)
+
 	popts := cache.PutOptions{
 		UpstreamURL: fetchedUpstreamURL,
 		StatusCode:  fetchRes.Status,
-		Headers:     fetchRes.Header,
+		Headers:     headers,
 		Size:        fetchRes.Size,
 		FetchedAt:   time.Now(),
 	}
@@ -412,7 +421,8 @@ func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	cacheReadRes, err := h.cm.Get(r.Context(), key)
+	// Теперь получаем с контентом
+	cacheReadRes, err := h.cm.GetWithOptions(r.Context(), key, cache.GetOptions{WithContent: true})
 	if err != nil || !cacheReadRes.Hit || cacheReadRes.Content == nil {
 		if errors.Is(err, cache.ErrNotFound) {
 			h.log.Warn().Err(err).Str("key", key).Msg("Cache item vanished before serving. Treating as miss.")
@@ -425,7 +435,11 @@ func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 	}
 	defer cacheReadRes.Content.Close()
 
-	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
+	// Используем пул заголовков
+	headers := util.CopyHeader(meta.Headers)
+	defer util.ReturnHeader(headers)
+
+	util.CopyWhitelistedHeaders(w.Header(), headers)
 	if !modTimeForCheck.IsZero() {
 		w.Header().Set("Last-Modified", modTimeForCheck.UTC().Format(http.TimeFormat))
 	}

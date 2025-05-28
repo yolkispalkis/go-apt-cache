@@ -103,11 +103,14 @@ type ServerConfig struct {
 }
 
 type CacheConfig struct {
-	Dir          string   `json:"directory"`
-	MaxSize      string   `json:"maxSize"`
-	Enabled      bool     `json:"enabled"`
-	CleanOnStart bool     `json:"cleanOnStart"`
-	NegativeTTL  Duration `json:"negativeCacheTTL"`
+	Dir                   string   `json:"directory"`
+	MaxSize               string   `json:"maxSize"`
+	Enabled               bool     `json:"enabled"`
+	CleanOnStart          bool     `json:"cleanOnStart"`
+	NegativeTTL           Duration `json:"negativeCacheTTL"`
+	ShardCount            int      `json:"shardCount"`
+	MetadataBatchInterval Duration `json:"metadataBatchInterval"`
+	BufferSize            string   `json:"bufferSize"`
 }
 
 type Config struct {
@@ -131,11 +134,14 @@ func Default() *Config {
 			UserAgent:         appinfo.UserAgent(),
 		},
 		Cache: CacheConfig{
-			Dir:          "/var/cache/go-apt-cache",
-			MaxSize:      "10GB",
-			Enabled:      true,
-			CleanOnStart: false,
-			NegativeTTL:  Duration(5 * time.Minute),
+			Dir:                   "/var/cache/go-apt-cache",
+			MaxSize:               "10GB",
+			Enabled:               true,
+			CleanOnStart:          false,
+			NegativeTTL:           Duration(5 * time.Minute),
+			ShardCount:            16,
+			MetadataBatchInterval: Duration(30 * time.Second),
+			BufferSize:            "64KB",
 		},
 		Logging: logging.Config{
 			Level:      "info",
@@ -235,6 +241,15 @@ func Validate(cfg *Config) error {
 		}
 		if _, err := util.ParseSize(c.MaxSize); err != nil {
 			return fmt.Errorf("invalid cache.maxSize %q: %w", c.MaxSize, err)
+		}
+		if c.ShardCount <= 0 || (c.ShardCount&(c.ShardCount-1)) != 0 {
+			return errors.New("cache.shardCount must be a power of 2 and > 0")
+		}
+		if c.MetadataBatchInterval.StdDuration() <= 0 {
+			return errors.New("cache.metadataBatchInterval must be > 0")
+		}
+		if _, err := util.ParseSize(c.BufferSize); err != nil {
+			return fmt.Errorf("invalid cache.bufferSize %q: %w", c.BufferSize, err)
 		}
 	}
 

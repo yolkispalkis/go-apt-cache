@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"container/heap"
 	"container/list"
 	"context"
 	"errors"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +26,95 @@ type lruEntry struct {
 	meta *ItemMeta
 }
 
+type MetadataUpdate struct {
+	Key  string
+	Meta *ItemMeta
+}
+
+type MetadataBatcher struct {
+	updates chan MetadataUpdate
+	ticker  *time.Ticker
+	store   *diskStore
+	log     zerolog.Logger
+	done    chan struct{}
+}
+
+func newMetadataBatcher(store *diskStore, logger zerolog.Logger, interval time.Duration) *MetadataBatcher {
+	mb := &MetadataBatcher{
+		updates: make(chan MetadataUpdate, 1000),
+		ticker:  time.NewTicker(interval),
+		store:   store,
+		log:     logger,
+		done:    make(chan struct{}),
+	}
+	go mb.batchUpdates()
+	return mb
+}
+
+func (mb *MetadataBatcher) batchUpdates() {
+	updates := make(map[string]*ItemMeta, 100)
+
+	for {
+		select {
+		case update := <-mb.updates:
+			updates[update.Key] = update.Meta
+
+		case <-mb.ticker.C:
+			if len(updates) > 0 {
+				mb.flushUpdates(updates)
+				updates = make(map[string]*ItemMeta, 100)
+			}
+
+		case <-mb.done:
+			// Финальная очистка
+			mb.flushUpdates(updates)
+			return
+		}
+	}
+}
+
+func (mb *MetadataBatcher) flushUpdates(updates map[string]*ItemMeta) {
+	for _, meta := range updates {
+		if err := mb.store.writeMetadata(meta.MetaPath, meta); err != nil {
+			mb.log.Warn().Err(err).Str("key", meta.Key).Msg("Failed to batch update metadata")
+		}
+	}
+	mb.log.Debug().Int("count", len(updates)).Msg("Batch updated metadata files")
+}
+
+func (mb *MetadataBatcher) scheduleUpdate(key string, meta *ItemMeta) {
+	select {
+	case mb.updates <- MetadataUpdate{Key: key, Meta: meta}:
+	default:
+		mb.log.Warn().Str("key", key).Msg("Metadata update queue full, dropping update")
+	}
+}
+
+func (mb *MetadataBatcher) close() {
+	close(mb.done)
+	mb.ticker.Stop()
+}
+
+type ItemHeap []*ItemMeta
+
+func (h ItemHeap) Len() int { return len(h) }
+func (h ItemHeap) Less(i, j int) bool {
+	return h[i].LastUsedAt.Time().Before(h[j].LastUsedAt.Time())
+}
+func (h ItemHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *ItemHeap) Push(x interface{}) {
+	*h = append(*h, x.(*ItemMeta))
+}
+
+func (h *ItemHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[0 : n-1]
+	return item
+}
+
 type DiskLRU struct {
 	cfg      config.CacheConfig
 	log      zerolog.Logger
@@ -39,9 +128,10 @@ type DiskLRU struct {
 	lruList      *list.List
 	currentBytes atomic.Int64
 
-	initOnce sync.Once
-	initErr  error
-	ready    bool
+	initOnce    sync.Once
+	initErr     error
+	ready       bool
+	metaBatcher *MetadataBatcher
 }
 
 func NewDiskLRU(cfg config.CacheConfig, logger zerolog.Logger) (*DiskLRU, error) {
@@ -71,16 +161,24 @@ func NewDiskLRU(cfg config.CacheConfig, logger zerolog.Logger) (*DiskLRU, error)
 		return nil, fmt.Errorf("init disk store at %s: %w", effectiveCfg.Dir, err)
 	}
 
-	return &DiskLRU{
+	batchInterval := cfg.MetadataBatchInterval.StdDuration()
+	if batchInterval <= 0 {
+		batchInterval = 30 * time.Second
+	}
+
+	cache := &DiskLRU{
 		cfg:      effectiveCfg,
 		log:      logger.With().Str("component", "DiskLRU").Logger(),
 		store:    store,
 		maxBytes: maxBytes,
 
-		negTTL:  cfg.NegativeTTL.StdDuration(),
-		items:   make(map[string]*list.Element),
-		lruList: list.New(),
-	}, nil
+		negTTL:      cfg.NegativeTTL.StdDuration(),
+		items:       make(map[string]*list.Element),
+		lruList:     list.New(),
+		metaBatcher: newMetadataBatcher(store, logger, batchInterval),
+	}
+
+	return cache, nil
 }
 
 func (c *DiskLRU) calculateExpiresAt(cacheKey string, headers http.Header, dateValueTime time.Time) time.Time {
@@ -186,11 +284,8 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 			return
 		}
 
-		type itemToSort struct {
-			key  string
-			meta *ItemMeta
-		}
-		var itemsToLoad []itemToSort
+		// Используем heap для эффективной сортировки больших объемов
+		itemHeap := make(ItemHeap, 0, len(metaFiles))
 		var currentSizeOnDisk int64
 		loadedCount := 0
 
@@ -225,21 +320,20 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 					continue
 				}
 			}
-			itemsToLoad = append(itemsToLoad, itemToSort{key: meta.Key, meta: meta})
+
+			heap.Push(&itemHeap, meta)
 			if meta.StatusCode != http.StatusNotFound {
 				currentSizeOnDisk += meta.Size
 			}
 			loadedCount++
 		}
 
-		sort.Slice(itemsToLoad, func(i, j int) bool {
-			return itemsToLoad[i].meta.LastUsedAt.Time().Before(itemsToLoad[j].meta.LastUsedAt.Time())
-		})
-
-		for _, item := range itemsToLoad {
-			entry := &lruEntry{key: item.key, meta: item.meta}
+		// Извлекаем элементы из heap в правильном порядке (от старых к новым)
+		for itemHeap.Len() > 0 {
+			meta := heap.Pop(&itemHeap).(*ItemMeta)
+			entry := &lruEntry{key: meta.Key, meta: meta}
 			listElement := c.lruList.PushFront(entry)
-			c.items[item.key] = listElement
+			c.items[meta.Key] = listElement
 		}
 		c.currentBytes.Store(currentSizeOnDisk)
 
@@ -270,6 +364,10 @@ func (c *DiskLRU) checkReady() error {
 }
 
 func (c *DiskLRU) Get(ctx context.Context, key string) (*GetResult, error) {
+	return c.GetWithOptions(ctx, key, GetOptions{WithContent: false})
+}
+
+func (c *DiskLRU) GetWithOptions(ctx context.Context, key string, opts GetOptions) (*GetResult, error) {
 	if !c.cfg.Enabled {
 		return nil, ErrNotFound
 	}
@@ -295,18 +393,23 @@ func (c *DiskLRU) Get(ctx context.Context, key string) (*GetResult, error) {
 			return nil, ErrNotFound
 		}
 		_ = c.MarkUsed(ctx, key)
-		return &GetResult{Meta: meta, Hit: true}, nil
+		return &GetResult{Meta: meta, Hit: true, KeepOpen: false}, nil
 	}
 
-	contentFile, err := c.store.openContentFile(meta.Path)
-	if err != nil {
-		c.log.Error().Err(err).Str("key", key).Str("path", meta.Path).Msg("Failed to open content file for cached item.")
-		go c.Delete(context.Background(), key)
-		return nil, ErrNotFound
+	var contentFile *os.File
+	var err error
+
+	if opts.WithContent {
+		contentFile, err = c.store.openContentFile(meta.Path)
+		if err != nil {
+			c.log.Error().Err(err).Str("key", key).Str("path", meta.Path).Msg("Failed to open content file for cached item.")
+			go c.Delete(context.Background(), key)
+			return nil, ErrNotFound
+		}
 	}
 
 	_ = c.MarkUsed(ctx, key)
-	return &GetResult{Meta: meta, Content: contentFile, Hit: true}, nil
+	return &GetResult{Meta: meta, Content: contentFile, Hit: true, KeepOpen: opts.WithContent}, nil
 }
 
 func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOptions) (*ItemMeta, error) {
@@ -528,12 +631,8 @@ func (c *DiskLRU) MarkUsed(ctx context.Context, key string) error {
 	metaSnapshot := *entry.meta
 	c.mu.Unlock()
 
-	go func(mSnap ItemMeta) {
-		if err := c.store.writeMetadata(mSnap.MetaPath, &mSnap); err != nil {
-			c.log.Warn().Err(err).Str("key", mSnap.Key).Msg("Failed to update metadata file on MarkUsed (async)")
-		}
-	}(metaSnapshot)
-
+	// Используем батчер вместо горутины
+	c.metaBatcher.scheduleUpdate(key, &metaSnapshot)
 	return nil
 }
 
@@ -602,13 +701,9 @@ func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validat
 	metaSnapshot := *metaToUpdate
 	c.mu.Unlock()
 
-	go func(mSnap ItemMeta) {
-		if err := c.store.writeMetadata(mSnap.MetaPath, &mSnap); err != nil {
-			c.log.Warn().Err(err).Str("key", mSnap.Key).Msg("Failed to update metadata file on UpdateAfterValidation (async)")
-		} else {
-			c.log.Debug().Str("key", mSnap.Key).Time("new_expires_at", mSnap.ExpiresAt.Time()).Msg("Cache metadata updated and written after validation.")
-		}
-	}(metaSnapshot)
+	// Используем батчер для обновления метаданных
+	c.metaBatcher.scheduleUpdate(key, &metaSnapshot)
+	c.log.Debug().Str("key", key).Time("new_expires_at", metaSnapshot.ExpiresAt.Time()).Msg("Cache metadata updated after validation.")
 
 	return &metaSnapshot, nil
 }
@@ -624,8 +719,16 @@ func (c *DiskLRU) evictItemsLocked(requiredSpaceToFree int64, deleteFiles bool) 
 		Str("max_size", util.FormatSize(c.maxBytes)).
 		Msg("Starting eviction process.")
 
+	// Собираем список для удаления под блокировкой
+	type evictionItem struct {
+		key      string
+		size     int64
+		metaPath string
+		dataPath string
+	}
+
+	var itemsToEvict []evictionItem
 	freedSpace := int64(0)
-	itemsEvicted := 0
 
 	for c.lruList.Len() > 0 && (freedSpace < requiredSpaceToFree || c.currentBytes.Load() > c.maxBytes) {
 		tailElement := c.lruList.Back()
@@ -640,16 +743,40 @@ func (c *DiskLRU) evictItemsLocked(requiredSpaceToFree int64, deleteFiles bool) 
 			continue
 		}
 
+		// Собираем информацию для удаления
+		item := evictionItem{
+			key:      entryToEvict.key,
+			size:     entryToEvict.meta.Size,
+			metaPath: entryToEvict.meta.MetaPath,
+			dataPath: entryToEvict.meta.Path,
+		}
+		itemsToEvict = append(itemsToEvict, item)
+
 		c.log.Debug().Str("key", entryToEvict.key).Str("size", util.FormatSize(entryToEvict.meta.Size)).Time("last_used", entryToEvict.meta.LastUsedAt.Time()).Msg("Evicting item.")
-		c.removeItemLocked(entryToEvict.key, deleteFiles)
+
+		// Удаляем из памяти
+		c.lruList.Remove(tailElement)
+		delete(c.items, entryToEvict.key)
 
 		if entryToEvict.meta.StatusCode != http.StatusNotFound {
+			c.currentBytes.Add(-entryToEvict.meta.Size)
 			freedSpace += entryToEvict.meta.Size
 		}
-		itemsEvicted++
 	}
+
+	// Удаляем файлы без блокировки (если нужно)
+	if deleteFiles && len(itemsToEvict) > 0 {
+		go func(items []evictionItem) {
+			for _, item := range items {
+				if err := c.store.deleteFiles(item.dataPath, item.metaPath); err != nil {
+					c.log.Error().Err(err).Str("key", item.key).Msg("Failed to delete cache files from disk during eviction.")
+				}
+			}
+		}(itemsToEvict)
+	}
+
 	c.log.Info().
-		Int("items_evicted", itemsEvicted).
+		Int("items_evicted", len(itemsToEvict)).
 		Str("space_freed", util.FormatSize(freedSpace)).
 		Str("new_cache_size", util.FormatSize(c.currentBytes.Load())).
 		Msg("Eviction process finished.")
@@ -690,6 +817,9 @@ func (c *DiskLRU) Purge(ctx context.Context) error {
 func (c *DiskLRU) Close() error {
 	if !c.cfg.Enabled {
 		return nil
+	}
+	if c.metaBatcher != nil {
+		c.metaBatcher.close()
 	}
 	c.log.Info().Msg("Closing cache manager.")
 	return nil

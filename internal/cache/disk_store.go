@@ -2,7 +2,6 @@ package cache
 
 import (
 	"bufio"
-	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,7 +12,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/rs/zerolog"
+	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
 const (
@@ -37,10 +38,10 @@ func newDiskStore(baseDir string, logger zerolog.Logger) (*diskStore, error) {
 	}, nil
 }
 
-// hashPath создает MD5 хеш от ключа и возвращает путь вида /aa/bb/hash
+// hashPath создает xxhash от ключа и возвращает путь вида /aa/bb/hash
 func (ds *diskStore) hashPath(key string) string {
-	hash := md5.Sum([]byte(key))
-	hashStr := hex.EncodeToString(hash[:])
+	hash := xxhash.Sum64String(key)
+	hashStr := hex.EncodeToString([]byte(fmt.Sprintf("%016x", hash)))
 
 	// Создаем структуру /aa/bb/hash
 	return filepath.Join(
@@ -95,8 +96,11 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 		}
 		tmpCPath = tmpCFileHandle.Name()
 
-		bufW := bufio.NewWriter(tmpCFileHandle)
-		writtenSize, err = io.Copy(bufW, r)
+		// Используем пул буферов для более эффективного копирования
+		buf := util.GetBuffer()
+		defer util.ReturnBuffer(buf)
+
+		writtenSize, err = io.CopyBuffer(tmpCFileHandle, r, buf)
 		if err != nil {
 			_ = tmpCFileHandle.Close()
 			return 0, "", "", fmt.Errorf("write content to temp: %w", err)
@@ -125,10 +129,6 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 			}
 		}
 
-		if err = bufW.Flush(); err != nil {
-			_ = tmpCFileHandle.Close()
-			return 0, "", "", fmt.Errorf("flush content buffer: %w", err)
-		}
 		if syncErr := tmpCFileHandle.Sync(); syncErr != nil {
 			ds.log.Warn().Err(syncErr).Str("path", tmpCPath).Msg("Sync temp content file failed")
 		}

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,6 +33,19 @@ var headerProxyWhitelist = map[string]struct{}{
 	"Expires":             {},
 	"Vary":                {},
 	"Age":                 {},
+}
+
+// Пулы для переиспользования объектов
+var headerPool = sync.Pool{
+	New: func() interface{} {
+		return make(http.Header, 16)
+	},
+}
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 64*1024)
+	},
 }
 
 func RepoNameRegexString() string {
@@ -133,13 +147,39 @@ func CopyHeader(h http.Header) http.Header {
 	if h == nil {
 		return nil
 	}
-	h2 := make(http.Header, len(h))
+	h2 := headerPool.Get().(http.Header)
+
+	// Очищаем заголовки
+	for k := range h2 {
+		delete(h2, k)
+	}
+
+	// Копируем с переиспользованием слайсов
 	for k, vv := range h {
-		vv2 := make([]string, len(vv))
-		copy(vv2, vv)
-		h2[k] = vv2
+		if cap(h2[k]) >= len(vv) {
+			h2[k] = h2[k][:len(vv)]
+		} else {
+			h2[k] = make([]string, len(vv))
+		}
+		copy(h2[k], vv)
 	}
 	return h2
+}
+
+func ReturnHeader(h http.Header) {
+	if h != nil {
+		headerPool.Put(h)
+	}
+}
+
+func GetBuffer() []byte {
+	return bufferPool.Get().([]byte)
+}
+
+func ReturnBuffer(buf []byte) {
+	if cap(buf) == 64*1024 {
+		bufferPool.Put(buf[:cap(buf)])
+	}
 }
 
 func CopyWhitelistedHeaders(dst, src http.Header) {

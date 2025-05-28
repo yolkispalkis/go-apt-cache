@@ -56,12 +56,15 @@ func NewCoordinator(cfg config.ServerConfig, logger zerolog.Logger) *Coordinator
 		}).DialContext,
 		MaxIdleConns:          cfg.MaxConcurrent * 2,
 		MaxIdleConnsPerHost:   cfg.MaxConcurrent,
+		MaxConnsPerHost:       cfg.MaxConcurrent * 3,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 		ResponseHeaderTimeout: cfg.ReqTimeout.StdDuration(),
 		DisableCompression:    true,
+		WriteBufferSize:       64 * 1024,
+		ReadBufferSize:        64 * 1024,
 	}
 
 	client := &http.Client{

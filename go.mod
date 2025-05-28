@@ -3,6 +3,7 @@ module github.com/yolkispalkis/go-apt-cache
 go 1.24.3
 
 require (
+	github.com/cespare/xxhash/v2 v2.3.0
 	golang.org/x/sync v0.12.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
