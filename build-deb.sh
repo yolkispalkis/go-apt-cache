@@ -152,9 +152,6 @@ case "\$1" in
         if [ "\$(stat -c %d:%i /)" != "\$(stat -c %d:%i /proc/1/root/.)" ]; then
             echo "Обнаружен режим chroot, сервис не будет запущен/перезапущен автоматически."
         else
-            # ИЗМЕНЕНО: Заменена логика if/else на единый вызов 'restart'.
-            # 'restart' является более надежным: он запускает сервис, если тот остановлен,
-            # и перезапускает, если он уже работает (включая состояние 'failed').
             echo "Запуск/перезапуск сервиса \${SERVICE_NAME}..."
             systemctl restart "\${SERVICE_NAME}" || \
               echo "Предупреждение: не удалось запустить/перезапустить сервис \${SERVICE_NAME}. Проверьте журнал: journalctl -u \${SERVICE_NAME}"
@@ -173,6 +170,7 @@ EOF
 chmod 755 "${DEBIAN_DIR}/postinst"
 
 echo "Создание prerm скрипта..."
+# ИСПРАВЛЕНО: Логика prerm разделена, чтобы не отключать сервис при обновлении
 cat >"${DEBIAN_DIR}/prerm" <<EOF
 #!/bin/bash
 set -e
@@ -185,9 +183,6 @@ case "\$1" in
             if systemctl is-active --quiet "\${SERVICE_NAME}"; then
                 systemctl stop "\${SERVICE_NAME}"
             fi
-            if systemctl is-enabled --quiet "\${SERVICE_NAME}"; then
-                systemctl disable "\${SERVICE_NAME}"
-            fi
         fi
     ;;
     failed-upgrade)
@@ -197,6 +192,17 @@ case "\$1" in
         exit 1
     ;;
 esac
+
+case "\$1" in
+    remove)
+        if systemctl list-units --full --all | grep -q "^\${SERVICE_NAME}"; then
+            if systemctl is-enabled --quiet "\${SERVICE_NAME}"; then
+                systemctl disable "\${SERVICE_NAME}"
+            fi
+        fi
+    ;;
+esac
+
 
 exit 0
 EOF

@@ -264,8 +264,6 @@ func (h *RepoHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request,
 	h.storeAndServe(w, r, key, upstreamURL, fetchRes)
 }
 
-// ИЗМЕНЕНО: Логика обработки ошибок загрузки переписана для более корректного
-// возврата статусов (504 для таймаутов/сети) и лучшего логирования.
 func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL string, err error, fetchResOnError *fetch.Result) {
 	if errors.Is(err, fetch.ErrUpstreamNotModified) {
 		w.WriteHeader(http.StatusNotModified)
@@ -274,14 +272,17 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 	if errors.Is(err, fetch.ErrUpstreamNotFound) {
 		if h.cacheCfg.NegativeTTL.StdDuration() > 0 {
 			go func() {
-				negativeHeaders := make(http.Header)
+				// ИСПРАВЛЕНО: Теперь передаем владение заголовком кешу, а не просто копируем
+				var negativeHeaders http.Header
 				if fetchResOnError != nil && fetchResOnError.Header != nil {
 					negativeHeaders = fetchResOnError.Header
+				} else {
+					negativeHeaders = make(http.Header)
 				}
 				popts := cache.PutOptions{
 					UpstreamURL: upstreamURL,
 					StatusCode:  http.StatusNotFound,
-					Headers:     negativeHeaders,
+					Headers:     negativeHeaders, // Передаем владение
 					FetchedAt:   time.Now(),
 					Size:        0,
 				}
@@ -302,8 +303,6 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 	if errors.Is(err, fetch.ErrNetwork) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		status = http.StatusGatewayTimeout
 	} else if fetchResOnError != nil && fetchResOnError.Status > 0 {
-		// Если от апстрима пришла ошибка (4xx/5xx), логируем ее реальный код,
-		// но клиенту все равно отдаем 502, т.к. проблема на стороне апстрима.
 		logCtx.Int("upstream_status", fetchResOnError.Status)
 	}
 
@@ -314,14 +313,14 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 	key, fetchedUpstreamURL string, fetchRes *fetch.Result) {
 
-	// Используем пул для заголовков
+	// ИСПРАВЛЕНО: Заголовок берется из пула, но не возвращается здесь.
+	// Владение передается в cm.Put, который отвечает за его жизненный цикл.
 	headers := util.CopyHeader(fetchRes.Header)
-	defer util.ReturnHeader(headers)
 
 	popts := cache.PutOptions{
 		UpstreamURL: fetchedUpstreamURL,
 		StatusCode:  fetchRes.Status,
-		Headers:     headers,
+		Headers:     headers, // Передаем владение
 		Size:        fetchRes.Size,
 		FetchedAt:   time.Now(),
 	}

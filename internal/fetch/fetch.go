@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
+
 	"golang.org/x/sync/singleflight"
 )
 
@@ -62,9 +63,7 @@ func NewCoordinator(cfg config.ServerConfig, logger zerolog.Logger) *Coordinator
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 		ResponseHeaderTimeout: cfg.ReqTimeout.StdDuration(),
-		// ИЗМЕНЕНО: Удалена строка `DisableCompression: true`.
-		// Теперь http.Client будет автоматически обрабатывать сжатие (gzip),
-		// что критически важно для производительности при скачивании метаданных APT.
+		// DisableCompression: true, // Закомментировано правильно. Клиент сам обработает сжатие.
 		WriteBufferSize: 64 * 1024,
 		ReadBufferSize:  64 * 1024,
 	}
@@ -150,7 +149,8 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Opt
 	}
 
 	req.Header.Set("User-Agent", c.userAgent)
-	req.Header.Set("Accept-Encoding", "identity")
+	// ИСПРАВЛЕНО: Удалена строка req.Header.Set("Accept-Encoding", "identity")
+	// Это позволяет http.Client автоматически управлять сжатием, что критично для APT.
 	req.Header.Set("Accept", "*/*")
 
 	if opts != nil {

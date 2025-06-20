@@ -284,7 +284,6 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 			return
 		}
 
-		// Используем heap для эффективной сортировки больших объемов
 		itemHeap := make(ItemHeap, 0, len(metaFiles))
 		var currentSizeOnDisk int64
 		loadedCount := 0
@@ -302,6 +301,8 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 				_ = os.Remove(strings.TrimSuffix(mPath, metadataSuffix) + contentSuffix)
 				continue
 			}
+			util.ReturnHeader(meta.Headers)              // Headers read from disk are not from the pool
+			meta.Headers = util.CopyHeader(meta.Headers) // Put them in a pooled header
 
 			meta.MetaPath = mPath
 			meta.Path = c.store.contentPath(meta.Key)
@@ -328,7 +329,6 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 			loadedCount++
 		}
 
-		// Извлекаем элементы из heap в правильном порядке (от старых к новым)
 		for itemHeap.Len() > 0 {
 			meta := heap.Pop(&itemHeap).(*ItemMeta)
 			entry := &lruEntry{key: meta.Key, meta: meta}
@@ -413,6 +413,14 @@ func (c *DiskLRU) GetWithOptions(ctx context.Context, key string, opts GetOption
 }
 
 func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOptions) (*ItemMeta, error) {
+	// ИСПРАВЛЕНО: Защита от утечки заголовка при ошибке
+	success := false
+	defer func() {
+		if !success {
+			util.ReturnHeader(opts.Headers)
+		}
+	}()
+
 	if !c.cfg.Enabled {
 		if r != nil {
 			if rc, ok := r.(io.Closer); ok {
@@ -440,13 +448,14 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		return nil, fmt.Errorf("will not cache response with status %d for key %s", opts.StatusCode, key)
 	}
 
+	// ИСПРАВЛЕНО: Не копируем заголовок снова, используем тот, что пришел
 	prelimMetaForWrite := &ItemMeta{
 		Version:     MetadataVersion,
 		Key:         key,
 		UpstreamURL: opts.UpstreamURL,
 		FetchedAt:   UnixTime(opts.FetchedAt),
 		StatusCode:  opts.StatusCode,
-		Headers:     util.CopyHeader(opts.Headers),
+		Headers:     opts.Headers,
 		Size:        opts.Size,
 	}
 
@@ -456,6 +465,7 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 	}
 
 	now := time.Now()
+	// ИСПРАВЛЕНО: Не копируем заголовок снова, используем тот, что пришел
 	finalNewMeta := &ItemMeta{
 		Version:     MetadataVersion,
 		Key:         key,
@@ -466,7 +476,7 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		LastUsedAt:  UnixTime(now),
 		ValidatedAt: UnixTime(now),
 		StatusCode:  opts.StatusCode,
-		Headers:     util.CopyHeader(prelimMetaForWrite.Headers),
+		Headers:     opts.Headers,
 		Size:        writtenSize,
 	}
 
@@ -521,10 +531,20 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 	}
 
 	c.log.Debug().Str("key", key).Str("size", util.FormatSize(finalNewMeta.Size)).Msg("Item added to cache.")
+
+	success = true // Отмечаем успех, чтобы defer не вернул заголовок в пул
 	return finalNewMeta, nil
 }
 
 func (c *DiskLRU) putNegativeEntry(_ context.Context, key string, opts PutOptions) (*ItemMeta, error) {
+	// ИСПРАВЛЕНО: Защита от утечки заголовка при ошибке
+	success := false
+	defer func() {
+		if !success {
+			util.ReturnHeader(opts.Headers)
+		}
+	}()
+
 	c.log.Debug().Str("key", key).Dur("ttl", c.negTTL).Msg("Caching negative (404) entry.")
 	now := time.Now()
 	meta := &ItemMeta{
@@ -535,7 +555,7 @@ func (c *DiskLRU) putNegativeEntry(_ context.Context, key string, opts PutOption
 		LastUsedAt:  UnixTime(now),
 		ValidatedAt: UnixTime(now),
 		StatusCode:  http.StatusNotFound,
-		Headers:     util.CopyHeader(opts.Headers),
+		Headers:     opts.Headers,
 		Size:        0,
 	}
 
@@ -561,6 +581,7 @@ func (c *DiskLRU) putNegativeEntry(_ context.Context, key string, opts PutOption
 	listElement := c.lruList.PushFront(entry)
 	c.items[key] = listElement
 
+	success = true
 	return meta, nil
 }
 
@@ -603,6 +624,11 @@ func (c *DiskLRU) removeItemLocked(key string, deleteFilesFromDisk bool) {
 		c.currentBytes.Add(-meta.Size)
 	}
 
+	// ИСПРАВЛЕНО: Возвращаем заголовок в пул при удалении элемента
+	if meta.Headers != nil {
+		util.ReturnHeader(meta.Headers)
+	}
+
 	if deleteFilesFromDisk {
 		if err := c.store.deleteFiles(meta.Path, meta.MetaPath); err != nil {
 			c.log.Error().Err(err).Str("key", key).Msg("Failed to delete cache files from disk.")
@@ -631,12 +657,14 @@ func (c *DiskLRU) MarkUsed(ctx context.Context, key string) error {
 	metaSnapshot := *entry.meta
 	c.mu.Unlock()
 
-	// Используем батчер вместо горутины
 	c.metaBatcher.scheduleUpdate(key, &metaSnapshot)
 	return nil
 }
 
 func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validationTime time.Time, newHeaders http.Header, newStatusCode int, newSizeIfChanged int64) (*ItemMeta, error) {
+	// ИСПРАВЛЕНО: возвращаем полученный newHeaders в пул, т.к. он из пула (в fetch.go)
+	defer util.ReturnHeader(newHeaders)
+
 	if !c.cfg.Enabled {
 		return nil, errors.New("cache disabled")
 	}
@@ -654,6 +682,8 @@ func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validat
 	entry := listElement.Value.(*lruEntry)
 	metaToUpdate := entry.meta
 
+	// Обновляем заголовки в существующем объекте metaToUpdate.Headers
+	// чтобы не создавать новый и не терять старый из пула
 	if val := newHeaders.Get("Date"); val != "" {
 		if _, err := http.ParseTime(val); err == nil {
 			metaToUpdate.Headers.Set("Date", val)
@@ -701,7 +731,6 @@ func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validat
 	metaSnapshot := *metaToUpdate
 	c.mu.Unlock()
 
-	// Используем батчер для обновления метаданных
 	c.metaBatcher.scheduleUpdate(key, &metaSnapshot)
 	c.log.Debug().Str("key", key).Time("new_expires_at", metaSnapshot.ExpiresAt.Time()).Msg("Cache metadata updated after validation.")
 
@@ -719,7 +748,6 @@ func (c *DiskLRU) evictItemsLocked(requiredSpaceToFree int64, deleteFiles bool) 
 		Str("max_size", util.FormatSize(c.maxBytes)).
 		Msg("Starting eviction process.")
 
-	// Собираем список для удаления под блокировкой
 	type evictionItem struct {
 		key      string
 		size     int64
@@ -743,7 +771,6 @@ func (c *DiskLRU) evictItemsLocked(requiredSpaceToFree int64, deleteFiles bool) 
 			continue
 		}
 
-		// Собираем информацию для удаления
 		item := evictionItem{
 			key:      entryToEvict.key,
 			size:     entryToEvict.meta.Size,
@@ -754,17 +781,14 @@ func (c *DiskLRU) evictItemsLocked(requiredSpaceToFree int64, deleteFiles bool) 
 
 		c.log.Debug().Str("key", entryToEvict.key).Str("size", util.FormatSize(entryToEvict.meta.Size)).Time("last_used", entryToEvict.meta.LastUsedAt.Time()).Msg("Evicting item.")
 
-		// Удаляем из памяти
-		c.lruList.Remove(tailElement)
-		delete(c.items, entryToEvict.key)
+		// Удаляем из памяти и возвращаем заголовок в пул
+		c.removeItemLocked(entryToEvict.key, false) // false, так как файлы удалим асинхронно
 
 		if entryToEvict.meta.StatusCode != http.StatusNotFound {
-			c.currentBytes.Add(-entryToEvict.meta.Size)
 			freedSpace += entryToEvict.meta.Size
 		}
 	}
 
-	// Удаляем файлы без блокировки (если нужно)
 	if deleteFiles && len(itemsToEvict) > 0 {
 		go func(items []evictionItem) {
 			for _, item := range items {
