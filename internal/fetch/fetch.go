@@ -9,12 +9,12 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
-
 	"golang.org/x/sync/singleflight"
 )
 
@@ -27,6 +27,19 @@ var (
 	ErrNetwork             = errors.New("fetch: network error")
 	ErrInternal            = errors.New("fetch: internal error")
 )
+
+// ИСПРАВЛЕНО: Список hop-by-hop заголовков, которые не должны храниться или пересылаться.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Proxy-Connection", // non-standard but still seen
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",      // canonicalized version of "TE"
+	"Trailer", // not Trailers
+	"Transfer-Encoding",
+	"Upgrade",
+}
 
 type Result struct {
 	Status  int
@@ -63,11 +76,9 @@ func NewCoordinator(cfg config.ServerConfig, logger zerolog.Logger) *Coordinator
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 		ResponseHeaderTimeout: cfg.ReqTimeout.StdDuration(),
-		// ИСПРАВЛЕНО: Раскомментировано для предотвращения автоматической распаковки.
-		// Это критично для APT, который ожидает получить сжатые файлы "как есть".
-		DisableCompression: true,
-		WriteBufferSize:    64 * 1024,
-		ReadBufferSize:     64 * 1024,
+		DisableCompression:    true,
+		WriteBufferSize:       64 * 1024,
+		ReadBufferSize:        64 * 1024,
 	}
 
 	client := &http.Client{
@@ -151,8 +162,6 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Opt
 	}
 
 	req.Header.Set("User-Agent", c.userAgent)
-	// Заголовок Accept-Encoding не устанавливаем, так как DisableCompression=true
-	// заставляет клиента не добавлять его, и мы передаем тело "как есть".
 	req.Header.Set("Accept", "*/*")
 
 	if opts != nil {
@@ -181,6 +190,24 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Opt
 	c.log.Debug().Str("url", upstreamURL).Int("status_code", resp.StatusCode).Msg("Received upstream response")
 
 	responseHeaders := util.CopyHeader(resp.Header)
+
+	// ИСПРАВЛЕНО: Удаляем hop-by-hop заголовки перед возвратом и кешированием.
+	for _, h := range hopByHopHeaders {
+		responseHeaders.Del(h)
+	}
+	// Также удаляем заголовки, перечисленные в самом заголовке Connection
+	if c := responseHeaders.Get("Connection"); c != "" {
+		for _, f := range strings.Split(c, ",") {
+			responseHeaders.Del(strings.TrimSpace(f))
+		}
+	}
+
+	// ИСПРАВЛЕНО: Предупреждаем, если пришел заголовок Vary, который мы не обрабатываем.
+	if vary := responseHeaders.Get("Vary"); vary != "" {
+		// APT обычно не использует Vary, но это важно для общего случая.
+		// Полная поддержка Vary требует изменения ключа кеша.
+		c.log.Warn().Str("url", upstreamURL).Str("vary_header", vary).Msg("Upstream responded with Vary header. Cache does not support Vary and may return incorrect responses for different clients.")
+	}
 
 	switch {
 	case resp.StatusCode == http.StatusNotModified:

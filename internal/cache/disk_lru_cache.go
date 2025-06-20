@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort" // ИЗМЕНЕНО: Добавлен импорт
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +37,7 @@ type MetadataBatcher struct {
 	store   *diskStore
 	log     zerolog.Logger
 	done    chan struct{}
+	wg      sync.WaitGroup // ИСПРАВЛЕНО: WaitGroup для ожидания завершения горутины
 }
 
 func newMetadataBatcher(store *diskStore, logger zerolog.Logger, interval time.Duration) *MetadataBatcher {
@@ -47,18 +48,19 @@ func newMetadataBatcher(store *diskStore, logger zerolog.Logger, interval time.D
 		log:     logger,
 		done:    make(chan struct{}),
 	}
+	mb.wg.Add(1) // ИСПРАВЛЕНО: Увеличиваем счетчик WaitGroup перед запуском горутины
 	go mb.batchUpdates()
 	return mb
 }
 
 func (mb *MetadataBatcher) batchUpdates() {
+	defer mb.wg.Done() // ИСПРАВЛЕНО: Уменьшаем счетчик при выходе из горутины
+
 	updates := make(map[string]*ItemMeta, 100)
 
 	for {
 		select {
 		case update := <-mb.updates:
-			// ИСПРАВЛЕНО: Если для этого ключа уже есть обновление в очереди,
-			// нужно вернуть заголовок старого обновления в пул, чтобы избежать утечки.
 			if oldMeta, exists := updates[update.Key]; exists {
 				util.ReturnHeader(oldMeta.Headers)
 			}
@@ -71,7 +73,7 @@ func (mb *MetadataBatcher) batchUpdates() {
 			}
 
 		case <-mb.done:
-			// Финальная очистка
+			// Финальная очистка перед выходом
 			if len(updates) > 0 {
 				mb.flushUpdates(updates)
 			}
@@ -81,12 +83,10 @@ func (mb *MetadataBatcher) batchUpdates() {
 }
 
 func (mb *MetadataBatcher) flushUpdates(updates map[string]*ItemMeta) {
-	// ИСПРАВЛЕНО: Возвращаем заголовки в пул после записи на диск.
 	for _, meta := range updates {
 		if err := mb.store.writeMetadata(meta.MetaPath, meta); err != nil {
 			mb.log.Warn().Err(err).Str("key", meta.Key).Msg("Failed to batch update metadata")
 		}
-		// Этот заголовок был специально скопирован для батчера, поэтому мы обязаны вернуть его в пул.
 		util.ReturnHeader(meta.Headers)
 	}
 	mb.log.Debug().Int("count", len(updates)).Msg("Batch updated metadata files")
@@ -97,7 +97,6 @@ func (mb *MetadataBatcher) scheduleUpdate(key string, meta *ItemMeta) {
 	case mb.updates <- MetadataUpdate{Key: key, Meta: meta}:
 	default:
 		mb.log.Warn().Str("key", key).Msg("Metadata update queue full, dropping update")
-		// Если очередь переполнена, нужно вернуть заголовок, чтобы он не потерялся.
 		util.ReturnHeader(meta.Headers)
 	}
 }
@@ -105,11 +104,8 @@ func (mb *MetadataBatcher) scheduleUpdate(key string, meta *ItemMeta) {
 func (mb *MetadataBatcher) close() {
 	close(mb.done)
 	mb.ticker.Stop()
+	mb.wg.Wait() // ИСПРАВЛЕНО: Ждем завершения горутины batchUpdates для сохранения всех данных
 }
-
-// ИЗМЕНЕНО: ItemHeap и его методы больше не нужны для инициализации
-// type ItemHeap []*ItemMeta
-// ...
 
 type DiskLRU struct {
 	cfg      config.CacheConfig
@@ -163,11 +159,10 @@ func NewDiskLRU(cfg config.CacheConfig, logger zerolog.Logger) (*DiskLRU, error)
 	}
 
 	cache := &DiskLRU{
-		cfg:      effectiveCfg,
-		log:      logger.With().Str("component", "DiskLRU").Logger(),
-		store:    store,
-		maxBytes: maxBytes,
-
+		cfg:         effectiveCfg,
+		log:         logger.With().Str("component", "DiskLRU").Logger(),
+		store:       store,
+		maxBytes:    maxBytes,
 		negTTL:      cfg.NegativeTTL.StdDuration(),
 		items:       make(map[string]*list.Element),
 		lruList:     list.New(),
@@ -280,11 +275,11 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 			return
 		}
 
-		// ИЗМЕНЕНО: Используем обычный слайс вместо кучи для простоты и ясности.
 		itemsToSort := make([]*ItemMeta, 0, len(metaFiles))
 		var currentSizeOnDisk int64
-		loadedCount := 0
+		var loadedCount, removedStaleCount int64
 
+		now := time.Now()
 		for _, mPath := range metaFiles {
 			if ctx.Err() != nil {
 				c.initErr = ctx.Err()
@@ -298,9 +293,17 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 				_ = os.Remove(strings.TrimSuffix(mPath, metadataSuffix) + contentSuffix)
 				continue
 			}
-			util.ReturnHeader(meta.Headers)              // Headers read from disk are not from the pool
-			meta.Headers = util.CopyHeader(meta.Headers) // Put them in a pooled header
 
+			// ИСПРАВЛЕНО: Удаляем протухшие элементы при инициализации
+			if meta.IsStale(now) {
+				c.log.Debug().Str("key", meta.Key).Msg("Removing stale item during cache initialization.")
+				_ = c.store.deleteFiles(c.store.contentPath(meta.Key), mPath)
+				removedStaleCount++
+				continue
+			}
+
+			util.ReturnHeader(meta.Headers)
+			meta.Headers = util.CopyHeader(meta.Headers)
 			meta.MetaPath = mPath
 			meta.Path = c.store.contentPath(meta.Key)
 
@@ -319,22 +322,17 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 				}
 			}
 
-			// ИЗМЕНЕНО: Просто добавляем в слайс
 			itemsToSort = append(itemsToSort, meta)
-
 			if meta.StatusCode != http.StatusNotFound {
 				currentSizeOnDisk += meta.Size
 			}
 			loadedCount++
 		}
 
-		// ИЗМЕНЕНО: Сортируем слайс по времени последнего использования (от старых к новым).
 		sort.Slice(itemsToSort, func(i, j int) bool {
 			return itemsToSort[i].LastUsedAt.Time().Before(itemsToSort[j].LastUsedAt.Time())
 		})
 
-		// ИЗМЕНЕНО: Заполняем LRU список из отсортированного слайса.
-		// Так как мы добавляем в начало, самые новые окажутся в начале списка.
 		for _, meta := range itemsToSort {
 			entry := &lruEntry{key: meta.Key, meta: meta}
 			listElement := c.lruList.PushFront(entry)
@@ -342,18 +340,21 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 		}
 		c.currentBytes.Store(currentSizeOnDisk)
 
-		c.log.Info().
-			Int("loaded_items", loadedCount).
+		logEvent := c.log.Info().
+			Int64("loaded_items", loadedCount).
 			Str("total_size", util.FormatSize(c.currentBytes.Load())).
-			Dur("duration", time.Since(startTime)).
-			Msg("Cache initialization complete.")
+			Dur("duration", time.Since(startTime))
+
+		if removedStaleCount > 0 {
+			logEvent = logEvent.Int64("stale_removed", removedStaleCount)
+		}
+		logEvent.Msg("Cache initialization complete.")
 
 		if c.currentBytes.Load() > c.maxBytes && c.maxBytes > 0 {
 			c.log.Info().
 				Str("current_size", util.FormatSize(c.currentBytes.Load())).
 				Str("max_size", util.FormatSize(c.maxBytes)).
 				Msg("Cache size exceeds maximum after init, performing eviction.")
-
 			c.evictItems(c.currentBytes.Load()-c.maxBytes, true)
 		}
 		c.ready = true
@@ -418,7 +419,6 @@ func (c *DiskLRU) GetWithOptions(ctx context.Context, key string, opts GetOption
 }
 
 func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOptions) (*ItemMeta, error) {
-	// Защита от утечки заголовка при ошибке
 	success := false
 	defer func() {
 		if !success {
@@ -453,7 +453,6 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		return nil, fmt.Errorf("will not cache response with status %d for key %s", opts.StatusCode, key)
 	}
 
-	// Не копируем заголовок снова, используем тот, что пришел
 	prelimMetaForWrite := &ItemMeta{
 		Version:     MetadataVersion,
 		Key:         key,
@@ -470,7 +469,6 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 	}
 
 	now := time.Now()
-	// Не копируем заголовок снова, используем тот, что пришел
 	finalNewMeta := &ItemMeta{
 		Version:     MetadataVersion,
 		Key:         key,
@@ -537,12 +535,11 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 
 	c.log.Debug().Str("key", key).Str("size", util.FormatSize(finalNewMeta.Size)).Msg("Item added to cache.")
 
-	success = true // Отмечаем успех, чтобы defer не вернул заголовок в пул
+	success = true
 	return finalNewMeta, nil
 }
 
 func (c *DiskLRU) putNegativeEntry(_ context.Context, key string, opts PutOptions) (*ItemMeta, error) {
-	// Защита от утечки заголовка при ошибке
 	success := false
 	defer func() {
 		if !success {
@@ -629,7 +626,6 @@ func (c *DiskLRU) removeItemLocked(key string, deleteFilesFromDisk bool) {
 		c.currentBytes.Add(-meta.Size)
 	}
 
-	// Возвращаем заголовок в пул при удалении элемента
 	if meta.Headers != nil {
 		util.ReturnHeader(meta.Headers)
 	}
@@ -660,8 +656,6 @@ func (c *DiskLRU) MarkUsed(ctx context.Context, key string) error {
 	entry.meta.LastUsedAt = UnixTime(time.Now())
 	c.lruList.MoveToFront(listElement)
 
-	// ИСПРАВЛЕНО (Race Condition): Создаем глубокую копию метаданных, включая заголовки,
-	// чтобы избежать гонки состояний, если элемент будет вытеснен из кэша до записи на диск.
 	metaSnapshot := *entry.meta
 	metaSnapshot.Headers = util.CopyHeader(entry.meta.Headers)
 	c.mu.Unlock()
@@ -671,7 +665,6 @@ func (c *DiskLRU) MarkUsed(ctx context.Context, key string) error {
 }
 
 func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validationTime time.Time, newHeaders http.Header, newStatusCode int, newSizeIfChanged int64) (*ItemMeta, error) {
-	// ИСПРАВЛЕНО: возвращаем полученный newHeaders в пул, т.к. он из пула (в fetch.go)
 	defer util.ReturnHeader(newHeaders)
 
 	if !c.cfg.Enabled {
@@ -691,8 +684,6 @@ func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validat
 	entry := listElement.Value.(*lruEntry)
 	metaToUpdate := entry.meta
 
-	// Обновляем заголовки в существующем объекте metaToUpdate.Headers
-	// чтобы не создавать новый и не терять старый из пула
 	if val := newHeaders.Get("Date"); val != "" {
 		if _, err := http.ParseTime(val); err == nil {
 			metaToUpdate.Headers.Set("Date", val)
@@ -737,8 +728,6 @@ func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validat
 
 	c.lruList.MoveToFront(listElement)
 
-	// ИСПРАВЛЕНО (Race Condition): Создаем глубокую копию метаданных, включая заголовки,
-	// чтобы избежать гонки состояний, если элемент будет вытеснен из кэша до записи на диск.
 	metaSnapshot := *metaToUpdate
 	metaSnapshot.Headers = util.CopyHeader(metaToUpdate.Headers)
 	c.mu.Unlock()
@@ -793,8 +782,7 @@ func (c *DiskLRU) evictItemsLocked(requiredSpaceToFree int64, deleteFiles bool) 
 
 		c.log.Debug().Str("key", entryToEvict.key).Str("size", util.FormatSize(entryToEvict.meta.Size)).Time("last_used", entryToEvict.meta.LastUsedAt.Time()).Msg("Evicting item.")
 
-		// Удаляем из памяти и возвращаем заголовок в пул
-		c.removeItemLocked(entryToEvict.key, false) // false, так как файлы удалим асинхронно
+		c.removeItemLocked(entryToEvict.key, false)
 
 		if entryToEvict.meta.StatusCode != http.StatusNotFound {
 			freedSpace += entryToEvict.meta.Size

@@ -76,6 +76,15 @@ type GetResult struct {
 	KeepOpen bool // Флаг что контент уже открыт
 }
 
+// ИСПРАВЛЕНО: Добавлен безопасный метод Close для предотвращения утечек файловых дескрипторов.
+// Этот метод можно безопасно вызывать даже для nil-результата.
+func (gr *GetResult) Close() error {
+	if gr != nil && gr.Content != nil {
+		return gr.Content.Close()
+	}
+	return nil
+}
+
 type GetOptions struct {
 	WithContent bool // Нужен ли контент сразу
 }

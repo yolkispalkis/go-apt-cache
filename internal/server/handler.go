@@ -80,7 +80,6 @@ func (h *RepoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Используем новый метод без контента для первоначальной проверки
 	cacheRes, err := h.cm.GetWithOptions(r.Context(), cacheKey, cache.GetOptions{WithContent: false})
 	if err != nil && !errors.Is(err, cache.ErrNotFound) {
 		h.log.Error().Err(err).Str("key", cacheKey).Msg("Cache get error")
@@ -105,10 +104,10 @@ func (h *RepoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *RepoHandler) handleCacheHit(w http.ResponseWriter, r *http.Request,
 	key, upstreamURL, relPath string, cacheRes *cache.GetResult) {
 
+	// ИСПРАВЛЕНО: Используем новый безопасный метод Close()
+	defer cacheRes.Close()
+
 	meta := cacheRes.Meta
-	if cacheRes.Content != nil {
-		defer cacheRes.Content.Close()
-	}
 
 	if meta.StatusCode == http.StatusNotFound {
 		if h.cacheCfg.NegativeTTL.StdDuration() > 0 && time.Since(meta.FetchedAt.Time()) > h.cacheCfg.NegativeTTL.StdDuration() {
@@ -219,20 +218,17 @@ func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	// Обрабатываем 404 Not Found отдельно и в первую очередь.
 	if errors.Is(fetchErr, fetch.ErrUpstreamNotFound) {
 		h.log.Warn().Str("key", key).Msg("Item not found on upstream during revalidation. Deleting from cache and returning 404.")
-		go h.cm.Delete(context.Background(), key) // Удаляем асинхронно, чтобы не блокировать ответ.
+		go h.cm.Delete(context.Background(), key)
 		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
 
-	// Для других ошибок (5xx, сетевые проблемы) мы можем отдать устаревший контент, если это разрешено.
 	if errors.Is(fetchErr, fetch.ErrUpstreamClientErr) || errors.Is(fetchErr, fetch.ErrUpstreamServerErr) {
 		h.log.Info().Str("key", key).Msg("Serving stale content as revalidation failed with upstream error (or no must-revalidate).")
 		h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
 	} else {
-		// Для непредвиденных ошибок (не 404, не 5xx, не сетевые)
 		h.log.Error().Err(fetchErr).Str("key", key).Msg("Unhandled revalidation fetch error. Returning 500.")
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 	}
@@ -272,7 +268,6 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 	if errors.Is(err, fetch.ErrUpstreamNotFound) {
 		if h.cacheCfg.NegativeTTL.StdDuration() > 0 {
 			go func() {
-				// Теперь передаем владение заголовком кешу, а не просто копируем
 				var negativeHeaders http.Header
 				if fetchResOnError != nil && fetchResOnError.Header != nil {
 					negativeHeaders = fetchResOnError.Header
@@ -282,7 +277,7 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 				popts := cache.PutOptions{
 					UpstreamURL: upstreamURL,
 					StatusCode:  http.StatusNotFound,
-					Headers:     negativeHeaders, // Передаем владение
+					Headers:     negativeHeaders,
 					FetchedAt:   time.Now(),
 					Size:        0,
 				}
@@ -298,7 +293,7 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 	}
 
 	logCtx := h.log.Error().Err(err).Str("key", key).Str("upstreamURL", upstreamURL)
-	status := http.StatusBadGateway // Статус по умолчанию
+	status := http.StatusBadGateway
 
 	if errors.Is(err, fetch.ErrNetwork) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		status = http.StatusGatewayTimeout
@@ -313,14 +308,12 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 	key, fetchedUpstreamURL string, fetchRes *fetch.Result) {
 
-	// Заголовок берется из пула, но не возвращается здесь.
-	// Владение передается в cm.Put, который отвечает за его жизненный цикл.
 	headers := util.CopyHeader(fetchRes.Header)
 
 	popts := cache.PutOptions{
 		UpstreamURL: fetchedUpstreamURL,
 		StatusCode:  fetchRes.Status,
-		Headers:     headers, // Передаем владение
+		Headers:     headers,
 		Size:        fetchRes.Size,
 		FetchedAt:   time.Now(),
 	}
@@ -336,6 +329,7 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
+	// ИСПРАВЛЕНО: Улучшена логика работы с io.Pipe для предотвращения deadlock.
 	pr, pw := io.Pipe()
 	var storeWg sync.WaitGroup
 	var putErrGlobal error
@@ -343,31 +337,16 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 
 	go func() {
 		defer storeWg.Done()
-		_, putErr := h.cm.Put(context.Background(), key, pr, popts)
-		if putErr != nil {
-			putErrGlobal = putErr
-			if !errors.Is(putErr, io.ErrClosedPipe) &&
-				!strings.Contains(putErr.Error(), "broken pipe") &&
-				!strings.Contains(putErr.Error(), "read tcp") {
-				h.log.Error().Err(putErr).Str("key", key).Msg("Error storing item to cache during Tee.")
-			} else {
-				h.log.Debug().Err(putErr).Str("key", key).Msg("Cache Put failed due to pipe closure, likely client disconnect.")
-			}
-		} else {
-			h.log.Debug().Str("key", key).Msg("Item successfully stored in cache via Tee.")
-		}
+		_, putErrGlobal = h.cm.Put(context.Background(), key, pr, popts)
 	}()
 
 	teeBody := io.TeeReader(fetchRes.Body, pw)
 
 	if h.checkClientConditional(w, r, fetchRes.ModTime, fetchRes.Header.Get("ETag")) {
 		h.log.Debug().Str("key", key).Msg("Client conditional GET matched newly fetched resource (304). Discarding body, closing pipe to cache.")
-		_, copyErr := io.Copy(io.Discard, teeBody)
-		if copyErr != nil {
-			_ = pw.CloseWithError(copyErr)
-		} else {
-			_ = pw.Close()
-		}
+		_, _ = io.Copy(io.Discard, teeBody)
+		// Закрываем pw, чтобы cm.Put завершился с io.EOF
+		_ = pw.Close()
 		storeWg.Wait()
 		return
 	}
@@ -394,6 +373,8 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 		_, clientCopyError = io.Copy(w, teeBody)
 	}
 
+	// Гарантированно закрываем PipeWriter после завершения копирования клиенту.
+	// Это разблокирует PipeReader в горутине кеширования.
 	if clientCopyError != nil {
 		if !util.IsClientDisconnectedError(clientCopyError) {
 			h.log.Error().Err(clientCopyError).Str("key", key).Msg("Error streaming response to client.")
@@ -402,11 +383,16 @@ func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 	} else {
 		_ = pw.Close()
 	}
+
+	// Ждем, пока горутина с cm.Put точно завершится.
 	storeWg.Wait()
 
-	if putErrGlobal != nil && util.IsClientDisconnectedError(clientCopyError) {
-		if errors.Is(putErrGlobal, io.ErrClosedPipe) || strings.Contains(putErrGlobal.Error(), "broken pipe") || strings.Contains(putErrGlobal.Error(), "read tcp") {
-			h.log.Debug().Err(putErrGlobal).Str("key", key).Msg("Cache store failed due to client disconnect (pipe closed), as expected after clientCopyError.")
+	// Логируем ошибку из кеша, если она была.
+	if putErrGlobal != nil {
+		if !util.IsClientDisconnectedError(putErrGlobal) {
+			h.log.Error().Err(putErrGlobal).Str("key", key).Msg("Error storing item to cache.")
+		} else {
+			h.log.Debug().Err(putErrGlobal).Str("key", key).Msg("Cache Put failed due to client disconnect (pipe closed), as expected.")
 		}
 	}
 }
@@ -427,7 +413,6 @@ func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Теперь получаем с контентом
 	cacheReadRes, err := h.cm.GetWithOptions(r.Context(), key, cache.GetOptions{WithContent: true})
 	if err != nil || !cacheReadRes.Hit || cacheReadRes.Content == nil {
 		if errors.Is(err, cache.ErrNotFound) {
@@ -439,10 +424,9 @@ func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 		h.handleCacheMiss(w, r, key, meta.UpstreamURL)
 		return
 	}
-	defer cacheReadRes.Content.Close()
+	// ИСПРАВЛЕНО: Используем новый безопасный метод Close()
+	defer cacheReadRes.Close()
 
-	// ИСПРАВЛЕНО: Убрано лишнее копирование заголовка. Заголовки из meta
-	// управляются жизненным циклом элемента кэша, мы можем безопасно читать из них.
 	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
 	if !modTimeForCheck.IsZero() {
 		w.Header().Set("Last-Modified", modTimeForCheck.UTC().Format(http.TimeFormat))

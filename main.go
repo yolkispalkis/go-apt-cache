@@ -23,6 +23,7 @@ func main() {
 	defer stop()
 
 	if err := run(ctx); err != nil {
+		// Логгер может быть еще не инициализирован, поэтому пишем в Stderr
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -48,7 +49,7 @@ func run(ctx context.Context) error {
 
 	if err := logging.Setup(cfg.Logging); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to setup logging: %v\n", err)
-		// Continue with default console logging
+		// Продолжаем с логгером по умолчанию, который пишет в stderr
 	}
 
 	log := logging.L()
@@ -59,16 +60,20 @@ func run(ctx context.Context) error {
 
 	log.Info().Str("file", cfgPath).Msg("Config loaded and validated")
 
-	// ИСПРАВЛЕНО: Инициализируем пул буферов с размером из конфига
 	util.InitBufferPool(cfg.Cache.BufferSize, log)
 
 	cm, err := cache.NewDiskLRU(cfg.Cache, log)
 	if err != nil {
 		return fmt.Errorf("init cache: %w", err)
 	}
+	defer cm.Close()
 
 	if err := cm.Init(ctx); err != nil {
-		log.Error().Err(err).Msg("Cache init failed, continuing with empty cache")
+		// ИСПРАВЛЕНО: Сделать ошибку инициализации кеша фатальной, если он включен.
+		if cfg.Cache.Enabled {
+			return fmt.Errorf("cache init failed: %w", err)
+		}
+		log.Error().Err(err).Msg("Cache init failed, but cache is disabled. Continuing.")
 	} else {
 		log.Info().
 			Str("dir", cfg.Cache.Dir).
@@ -77,7 +82,6 @@ func run(ctx context.Context) error {
 			Str("used", util.FormatSize(cm.CurrentSize())).
 			Msg("Cache initialized")
 	}
-	defer cm.Close()
 
 	fc := fetch.NewCoordinator(cfg.Server, log)
 	log.Info().
@@ -99,10 +103,11 @@ func run(ctx context.Context) error {
 	case err := <-errChan:
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, http.ErrServerClosed) {
 			log.Error().Err(err).Msg("Server error")
-			srv.Shutdown()
+			// Попытка штатного завершения работы, даже если один из листенеров упал.
+			_ = srv.Shutdown()
 			return err
 		}
-		log.Info().Msg("Server stopped gracefully")
+		log.Info().Msg("Server stopped")
 	case <-ctx.Done():
 		log.Info().Msg("Shutdown signal received")
 		if err := srv.Shutdown(); err != nil {
@@ -134,8 +139,7 @@ func parseFlags() (cfgPath string, createCfg bool, logLevel, listenAddr string) 
 	fs.StringVar(&listenAddr, "listen", "", "Override server listen address (e.g., :8080)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
-		os.Exit(2)
+		// flag.ExitOnError сам обработает ошибку и завершит программу
 	}
 	return
 }

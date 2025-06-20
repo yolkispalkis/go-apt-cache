@@ -73,8 +73,10 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 	var tmpCPath string
 	var tmpMPath string
 
+	// ИСПРАВЛЕНО: Улучшена логика defer для надежной очистки временных файлов только при сбое.
+	isSuccess := false
 	defer func() {
-		if err != nil {
+		if !isSuccess {
 			if tmpCPath != "" {
 				if rmErr := os.Remove(tmpCPath); rmErr != nil && !os.IsNotExist(rmErr) {
 					ds.log.Warn().Err(rmErr).Str("path", tmpCPath).Msg("Failed to remove temp content file on error")
@@ -96,27 +98,38 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 		}
 		tmpCPath = tmpCFileHandle.Name()
 
-		// Используем пул буферов для более эффективного копирования
 		buf := util.GetBuffer()
 		defer util.ReturnBuffer(buf)
 
 		writtenSize, err = io.CopyBuffer(tmpCFileHandle, r, buf)
+
+		// ИСПРАВЛЕНО: Сохраняем частично скачанные файлы, если ошибка вызвана разрывом соединения.
 		if err != nil {
-			_ = tmpCFileHandle.Close()
-			return 0, "", "", fmt.Errorf("write content to temp: %w", err)
+			if util.IsClientDisconnectedError(err) {
+				ds.log.Debug().Err(err).Str("key", key).Int64("bytes_written", writtenSize).Msg("Client disconnected during download. Committing partial file to cache.")
+				// Сбрасываем ошибку, так как для кеша это не сбой, а штатное завершение.
+				err = nil
+			} else {
+				// Это реальная ошибка записи (например, нет места на диске), выходим.
+				_ = tmpCFileHandle.Close()
+				return 0, "", "", fmt.Errorf("write content to temp: %w", err)
+			}
+		}
+		// Закрываем файл после всех операций, включая обработку ошибок.
+		if closeErr := tmpCFileHandle.Close(); closeErr != nil && err == nil {
+			return 0, "", "", fmt.Errorf("close temp content file: %w", closeErr)
 		}
 
 		originalContentLengthStr := meta.Headers.Get("Content-Length")
 		if originalContentLengthStr != "" {
 			originalContentLength, parseErr := strconv.ParseInt(originalContentLengthStr, 10, 64)
 			if parseErr == nil && originalContentLength >= 0 {
-				if writtenSize != originalContentLength {
+				if writtenSize != originalContentLength && err == nil { // Проверяем только если не было ошибки обрыва
 					ds.log.Error().
 						Str("key", meta.Key).
 						Int64("expected_size_upstream", originalContentLength).
 						Int64("actual_written_size", writtenSize).
 						Msg("Upstream Content-Length mismatch with bytes read")
-					_ = tmpCFileHandle.Close()
 					err = fmt.Errorf("upstream Content-Length %d did not match received bytes %d for key %s", originalContentLength, writtenSize, meta.Key)
 					return 0, "", "", err
 				}
@@ -131,9 +144,6 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 
 		if syncErr := tmpCFileHandle.Sync(); syncErr != nil {
 			ds.log.Warn().Err(syncErr).Str("path", tmpCPath).Msg("Sync temp content file failed")
-		}
-		if err = tmpCFileHandle.Close(); err != nil {
-			return 0, "", "", fmt.Errorf("close temp content file: %w", err)
 		}
 	} else {
 		writtenSize = 0
@@ -175,6 +185,8 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 		}
 		tmpCPath = ""
 	}
+
+	isSuccess = true // Отмечаем успех, чтобы defer не удалил файлы.
 	return writtenSize, finalCPath, finalMPath, nil
 }
 
@@ -243,6 +255,12 @@ func (ds *diskStore) readMeta(mPath string) (*ItemMeta, error) {
 	if meta.Key == "" {
 		ds.log.Warn().Str("path", mPath).Msg("Metadata file missing 'key' field")
 		return nil, fmt.Errorf("missing 'key' in metadata for %s", mPath)
+	}
+
+	expectedMPath := ds.metadataPath(meta.Key)
+	if mPath != expectedMPath {
+		ds.log.Warn().Str("path", mPath).Str("key_in_file", meta.Key).Str("expected_path", expectedMPath).Msg("Metadata file path does not match its internal key. File may be corrupted or misplaced.")
+		return nil, fmt.Errorf("key %q in %s does not match file path", meta.Key, mPath)
 	}
 
 	return &meta, nil
