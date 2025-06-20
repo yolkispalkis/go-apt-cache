@@ -108,9 +108,9 @@ type CacheConfig struct {
 	Enabled               bool     `json:"enabled"`
 	CleanOnStart          bool     `json:"cleanOnStart"`
 	NegativeTTL           Duration `json:"negativeCacheTTL"`
-	ShardCount            int      `json:"shardCount"`
 	MetadataBatchInterval Duration `json:"metadataBatchInterval"`
 	BufferSize            string   `json:"bufferSize"`
+	// ИЗМЕНЕНО: Удалено поле ShardCount, так как оно не использовалось в реализации.
 }
 
 type Config struct {
@@ -134,12 +134,12 @@ func Default() *Config {
 			UserAgent:         appinfo.UserAgent(),
 		},
 		Cache: CacheConfig{
-			Dir:                   "/var/cache/go-apt-cache",
-			MaxSize:               "10GB",
-			Enabled:               true,
-			CleanOnStart:          false,
-			NegativeTTL:           Duration(5 * time.Minute),
-			ShardCount:            16,
+			Dir:          "/var/cache/go-apt-cache",
+			MaxSize:      "10GB",
+			Enabled:      true,
+			CleanOnStart: false,
+			NegativeTTL:  Duration(5 * time.Minute),
+			// ИЗМЕНЕНО: Удалено поле ShardCount.
 			MetadataBatchInterval: Duration(30 * time.Second),
 			BufferSize:            "64KB",
 		},
@@ -242,9 +242,7 @@ func Validate(cfg *Config) error {
 		if _, err := util.ParseSize(c.MaxSize); err != nil {
 			return fmt.Errorf("invalid cache.maxSize %q: %w", c.MaxSize, err)
 		}
-		if c.ShardCount <= 0 || (c.ShardCount&(c.ShardCount-1)) != 0 {
-			return errors.New("cache.shardCount must be a power of 2 and > 0")
-		}
+		// ИЗМЕНЕНО: Удалена валидация для ShardCount
 		if c.MetadataBatchInterval.StdDuration() <= 0 {
 			return errors.New("cache.metadataBatchInterval must be > 0")
 		}

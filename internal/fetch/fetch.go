@@ -62,9 +62,11 @@ func NewCoordinator(cfg config.ServerConfig, logger zerolog.Logger) *Coordinator
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 		ResponseHeaderTimeout: cfg.ReqTimeout.StdDuration(),
-		DisableCompression:    true,
-		WriteBufferSize:       64 * 1024,
-		ReadBufferSize:        64 * 1024,
+		// ИЗМЕНЕНО: Удалена строка `DisableCompression: true`.
+		// Теперь http.Client будет автоматически обрабатывать сжатие (gzip),
+		// что критически важно для производительности при скачивании метаданных APT.
+		WriteBufferSize: 64 * 1024,
+		ReadBufferSize:  64 * 1024,
 	}
 
 	client := &http.Client{

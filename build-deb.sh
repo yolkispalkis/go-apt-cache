@@ -152,15 +152,12 @@ case "\$1" in
         if [ "\$(stat -c %d:%i /)" != "\$(stat -c %d:%i /proc/1/root/.)" ]; then
             echo "Обнаружен режим chroot, сервис не будет запущен/перезапущен автоматически."
         else
-            if systemctl is-active --quiet "\${SERVICE_NAME}"; then
-                echo "Сервис \${SERVICE_NAME} активен, попытка перезапуска..."
-                systemctl try-restart "\${SERVICE_NAME}" || \
-                  echo "Предупреждение: не удалось перезапустить сервис \${SERVICE_NAME}. Проверьте журнал: journalctl -u \${SERVICE_NAME}"
-            else
-                echo "Попытка запуска сервиса \${SERVICE_NAME}..."
-                systemctl start "\${SERVICE_NAME}" || \
-                  echo "Предупреждение: не удалось запустить сервис \${SERVICE_NAME}. Проверьте журнал: journalctl -u \${SERVICE_NAME}"
-            fi
+            # ИЗМЕНЕНО: Заменена логика if/else на единый вызов 'restart'.
+            # 'restart' является более надежным: он запускает сервис, если тот остановлен,
+            # и перезапускает, если он уже работает (включая состояние 'failed').
+            echo "Запуск/перезапуск сервиса \${SERVICE_NAME}..."
+            systemctl restart "\${SERVICE_NAME}" || \
+              echo "Предупреждение: не удалось запустить/перезапустить сервис \${SERVICE_NAME}. Проверьте журнал: journalctl -u \${SERVICE_NAME}"
         fi
     ;;
     abort-upgrade|abort-remove|abort-deconfigure)

@@ -219,7 +219,6 @@ func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	// --- ИСПРАВЛЕННЫЙ БЛОК ---
 	// Обрабатываем 404 Not Found отдельно и в первую очередь.
 	if errors.Is(fetchErr, fetch.ErrUpstreamNotFound) {
 		h.log.Warn().Str("key", key).Msg("Item not found on upstream during revalidation. Deleting from cache and returning 404.")
@@ -265,6 +264,8 @@ func (h *RepoHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request,
 	h.storeAndServe(w, r, key, upstreamURL, fetchRes)
 }
 
+// ИЗМЕНЕНО: Логика обработки ошибок загрузки переписана для более корректного
+// возврата статусов (504 для таймаутов/сети) и лучшего логирования.
 func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL string, err error, fetchResOnError *fetch.Result) {
 	if errors.Is(err, fetch.ErrUpstreamNotModified) {
 		w.WriteHeader(http.StatusNotModified)
@@ -295,23 +296,18 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 		return
 	}
 
-	h.log.Error().Err(err).Str("key", key).Str("upstreamURL", upstreamURL).Msg("Failed to fetch item from upstream on MISS.")
-	status := http.StatusBadGateway
-	if errors.Is(err, fetch.ErrUpstreamClientErr) {
-		if fetchResOnError != nil && fetchResOnError.Status != 0 {
-			status = http.StatusBadGateway
-		} else {
-			status = http.StatusBadGateway
-		}
-	} else if errors.Is(err, fetch.ErrUpstreamServerErr) {
-		if fetchResOnError != nil && fetchResOnError.Status != 0 {
-			status = http.StatusBadGateway
-		} else {
-			status = http.StatusBadGateway
-		}
-	} else if errors.Is(err, fetch.ErrNetwork) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	logCtx := h.log.Error().Err(err).Str("key", key).Str("upstreamURL", upstreamURL)
+	status := http.StatusBadGateway // Статус по умолчанию
+
+	if errors.Is(err, fetch.ErrNetwork) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		status = http.StatusGatewayTimeout
+	} else if fetchResOnError != nil && fetchResOnError.Status > 0 {
+		// Если от апстрима пришла ошибка (4xx/5xx), логируем ее реальный код,
+		// но клиенту все равно отдаем 502, т.к. проблема на стороне апстрима.
+		logCtx.Int("upstream_status", fetchResOnError.Status)
 	}
+
+	logCtx.Msg("Failed to fetch item from upstream on MISS.")
 	http.Error(w, http.StatusText(status), status)
 }
 
