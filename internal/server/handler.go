@@ -219,10 +219,21 @@ func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	if errors.Is(fetchErr, fetch.ErrUpstreamNotFound) || errors.Is(fetchErr, fetch.ErrUpstreamClientErr) || errors.Is(fetchErr, fetch.ErrUpstreamServerErr) {
+	// --- ИСПРАВЛЕННЫЙ БЛОК ---
+	// Обрабатываем 404 Not Found отдельно и в первую очередь.
+	if errors.Is(fetchErr, fetch.ErrUpstreamNotFound) {
+		h.log.Warn().Str("key", key).Msg("Item not found on upstream during revalidation. Deleting from cache and returning 404.")
+		go h.cm.Delete(context.Background(), key) // Удаляем асинхронно, чтобы не блокировать ответ.
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		return
+	}
+
+	// Для других ошибок (5xx, сетевые проблемы) мы можем отдать устаревший контент, если это разрешено.
+	if errors.Is(fetchErr, fetch.ErrUpstreamClientErr) || errors.Is(fetchErr, fetch.ErrUpstreamServerErr) {
 		h.log.Info().Str("key", key).Msg("Serving stale content as revalidation failed with upstream error (or no must-revalidate).")
 		h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
 	} else {
+		// Для непредвиденных ошибок (не 404, не 5xx, не сетевые)
 		h.log.Error().Err(fetchErr).Str("key", key).Msg("Unhandled revalidation fetch error. Returning 500.")
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 	}
