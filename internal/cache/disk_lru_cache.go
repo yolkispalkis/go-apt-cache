@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"container/heap"
 	"container/list"
 	"context"
 	"errors"
@@ -10,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort" // ИЗМЕНЕНО: Добавлен импорт
 	"strconv"
 	"strings"
 	"sync"
@@ -107,25 +107,9 @@ func (mb *MetadataBatcher) close() {
 	mb.ticker.Stop()
 }
 
-type ItemHeap []*ItemMeta
-
-func (h ItemHeap) Len() int { return len(h) }
-func (h ItemHeap) Less(i, j int) bool {
-	return h[i].LastUsedAt.Time().Before(h[j].LastUsedAt.Time())
-}
-func (h ItemHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-
-func (h *ItemHeap) Push(x interface{}) {
-	*h = append(*h, x.(*ItemMeta))
-}
-
-func (h *ItemHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	*h = old[0 : n-1]
-	return item
-}
+// ИЗМЕНЕНО: ItemHeap и его методы больше не нужны для инициализации
+// type ItemHeap []*ItemMeta
+// ...
 
 type DiskLRU struct {
 	cfg      config.CacheConfig
@@ -296,7 +280,8 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 			return
 		}
 
-		itemHeap := make(ItemHeap, 0, len(metaFiles))
+		// ИЗМЕНЕНО: Используем обычный слайс вместо кучи для простоты и ясности.
+		itemsToSort := make([]*ItemMeta, 0, len(metaFiles))
 		var currentSizeOnDisk int64
 		loadedCount := 0
 
@@ -334,15 +319,23 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 				}
 			}
 
-			heap.Push(&itemHeap, meta)
+			// ИЗМЕНЕНО: Просто добавляем в слайс
+			itemsToSort = append(itemsToSort, meta)
+
 			if meta.StatusCode != http.StatusNotFound {
 				currentSizeOnDisk += meta.Size
 			}
 			loadedCount++
 		}
 
-		for itemHeap.Len() > 0 {
-			meta := heap.Pop(&itemHeap).(*ItemMeta)
+		// ИЗМЕНЕНО: Сортируем слайс по времени последнего использования (от старых к новым).
+		sort.Slice(itemsToSort, func(i, j int) bool {
+			return itemsToSort[i].LastUsedAt.Time().Before(itemsToSort[j].LastUsedAt.Time())
+		})
+
+		// ИЗМЕНЕНО: Заполняем LRU список из отсортированного слайса.
+		// Так как мы добавляем в начало, самые новые окажутся в начале списка.
+		for _, meta := range itemsToSort {
 			entry := &lruEntry{key: meta.Key, meta: meta}
 			listElement := c.lruList.PushFront(entry)
 			c.items[meta.Key] = listElement

@@ -63,9 +63,11 @@ func NewCoordinator(cfg config.ServerConfig, logger zerolog.Logger) *Coordinator
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 		ResponseHeaderTimeout: cfg.ReqTimeout.StdDuration(),
-		// DisableCompression: true, // Закомментировано правильно. Клиент сам обработает сжатие.
-		WriteBufferSize: 64 * 1024,
-		ReadBufferSize:  64 * 1024,
+		// ИСПРАВЛЕНО: Раскомментировано для предотвращения автоматической распаковки.
+		// Это критично для APT, который ожидает получить сжатые файлы "как есть".
+		DisableCompression: true,
+		WriteBufferSize:    64 * 1024,
+		ReadBufferSize:     64 * 1024,
 	}
 
 	client := &http.Client{
@@ -149,8 +151,8 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Opt
 	}
 
 	req.Header.Set("User-Agent", c.userAgent)
-	// ИСПРАВЛЕНО: Удалена строка req.Header.Set("Accept-Encoding", "identity")
-	// Это позволяет http.Client автоматически управлять сжатием, что критично для APT.
+	// Заголовок Accept-Encoding не устанавливаем, так как DisableCompression=true
+	// заставляет клиента не добавлять его, и мы передаем тело "как есть".
 	req.Header.Set("Accept", "*/*")
 
 	if opts != nil {

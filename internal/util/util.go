@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 var (
@@ -42,10 +44,31 @@ var headerPool = sync.Pool{
 	},
 }
 
+// ИСПРАВЛЕНО: bufferPoolSize теперь переменная, инициализируемая из конфига.
+var bufferPoolSize int64 = 64 * 1024 // Размер по умолчанию
+
 var bufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 64*1024)
+		return make([]byte, bufferPoolSize)
 	},
+}
+
+// InitBufferPool инициализирует пул буферов с размером из конфигурации.
+// Должна вызываться один раз при старте приложения.
+func InitBufferPool(sizeStr string, log zerolog.Logger) {
+	size, err := ParseSize(sizeStr)
+	if err != nil || size <= 0 {
+		log.Warn().Err(err).Str("configured_size", sizeStr).Int64("default_size", bufferPoolSize).Msg("Invalid bufferSize, using default.")
+		return
+	}
+	bufferPoolSize = size
+	// Сбрасываем пул, чтобы он начал создавать буферы нового размера.
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, bufferPoolSize)
+		},
+	}
+	log.Info().Str("size", FormatSize(bufferPoolSize)).Msg("Buffer pool re-initialized with configured size")
 }
 
 func RepoNameRegexString() string {
@@ -177,7 +200,8 @@ func GetBuffer() []byte {
 }
 
 func ReturnBuffer(buf []byte) {
-	if cap(buf) == 64*1024 {
+	// ИСПРАВЛЕНО: Проверяем размер относительно сконфигурированного.
+	if int64(cap(buf)) == bufferPoolSize {
 		bufferPool.Put(buf[:cap(buf)])
 	}
 }

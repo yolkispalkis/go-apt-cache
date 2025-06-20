@@ -59,6 +59,9 @@ func run(ctx context.Context) error {
 
 	log.Info().Str("file", cfgPath).Msg("Config loaded and validated")
 
+	// ИСПРАВЛЕНО: Инициализируем пул буферов с размером из конфига
+	util.InitBufferPool(cfg.Cache.BufferSize, log)
+
 	cm, err := cache.NewDiskLRU(cfg.Cache, log)
 	if err != nil {
 		return fmt.Errorf("init cache: %w", err)
