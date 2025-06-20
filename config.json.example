@@ -14,7 +14,9 @@
     "maxSize": "20GB",
     "enabled": true,
     "cleanOnStart": false,
-    "negativeCacheTTL": "5m" 
+    "negativeCacheTTL": "5m",
+    "metadataBatchInterval": "30s",
+    "bufferSize": "64KB"
   },
   "logging": {
     "level": "info",

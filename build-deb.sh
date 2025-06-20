@@ -32,6 +32,7 @@ LD_FLAGS="-s -w -X '${APP_MAIN_PACKAGE}/internal/appinfo.AppVersion=${PKG_VERSIO
 go build -ldflags="${LD_FLAGS}" -o "${BIN_DIR}/${PKG_NAME}" main.go
 
 echo "Создание конфигурационного файла..."
+# ИСПРАВЛЕНО: Добавлены все опции конфигурации
 cat >"${CONFIG_DIR}/config.json" <<EOF
 {
   "server": {
@@ -49,7 +50,9 @@ cat >"${CONFIG_DIR}/config.json" <<EOF
     "maxSize": "20GB",
     "enabled": true,
     "cleanOnStart": false,
-    "negativeCacheTTL": "5m"
+    "negativeCacheTTL": "5m",
+    "metadataBatchInterval": "30s",
+    "bufferSize": "64KB"
   },
   "logging": {
     "level": "info",
@@ -178,12 +181,20 @@ set -e
 SERVICE_NAME="${PKG_NAME}.service"
 
 case "\$1" in
-    remove|upgrade|deconfigure)
+    remove)
+        # Это полное удаление, не обновление. Останавливаем и отключаем сервис.
         if systemctl list-units --full --all | grep -q "^\${SERVICE_NAME}"; then
             if systemctl is-active --quiet "\${SERVICE_NAME}"; then
                 systemctl stop "\${SERVICE_NAME}"
             fi
+            if systemctl is-enabled --quiet "\${SERVICE_NAME}"; then
+                systemctl disable "\${SERVICE_NAME}"
+            fi
         fi
+    ;;
+    upgrade|deconfigure)
+        # При обновлении (upgrade) ничего не делаем в prerm, чтобы избежать простоя сервиса.
+        # Сервис будет перезапущен в postinst нового пакета.
     ;;
     failed-upgrade)
     ;;
@@ -192,17 +203,6 @@ case "\$1" in
         exit 1
     ;;
 esac
-
-case "\$1" in
-    remove)
-        if systemctl list-units --full --all | grep -q "^\${SERVICE_NAME}"; then
-            if systemctl is-enabled --quiet "\${SERVICE_NAME}"; then
-                systemctl disable "\${SERVICE_NAME}"
-            fi
-        fi
-    ;;
-esac
-
 
 exit 0
 EOF

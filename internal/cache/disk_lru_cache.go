@@ -57,6 +57,11 @@ func (mb *MetadataBatcher) batchUpdates() {
 	for {
 		select {
 		case update := <-mb.updates:
+			// ИСПРАВЛЕНО: Если для этого ключа уже есть обновление в очереди,
+			// нужно вернуть заголовок старого обновления в пул, чтобы избежать утечки.
+			if oldMeta, exists := updates[update.Key]; exists {
+				util.ReturnHeader(oldMeta.Headers)
+			}
 			updates[update.Key] = update.Meta
 
 		case <-mb.ticker.C:
@@ -67,17 +72,22 @@ func (mb *MetadataBatcher) batchUpdates() {
 
 		case <-mb.done:
 			// Финальная очистка
-			mb.flushUpdates(updates)
+			if len(updates) > 0 {
+				mb.flushUpdates(updates)
+			}
 			return
 		}
 	}
 }
 
 func (mb *MetadataBatcher) flushUpdates(updates map[string]*ItemMeta) {
+	// ИСПРАВЛЕНО: Возвращаем заголовки в пул после записи на диск.
 	for _, meta := range updates {
 		if err := mb.store.writeMetadata(meta.MetaPath, meta); err != nil {
 			mb.log.Warn().Err(err).Str("key", meta.Key).Msg("Failed to batch update metadata")
 		}
+		// Этот заголовок был специально скопирован для батчера, поэтому мы обязаны вернуть его в пул.
+		util.ReturnHeader(meta.Headers)
 	}
 	mb.log.Debug().Int("count", len(updates)).Msg("Batch updated metadata files")
 }
@@ -87,6 +97,8 @@ func (mb *MetadataBatcher) scheduleUpdate(key string, meta *ItemMeta) {
 	case mb.updates <- MetadataUpdate{Key: key, Meta: meta}:
 	default:
 		mb.log.Warn().Str("key", key).Msg("Metadata update queue full, dropping update")
+		// Если очередь переполнена, нужно вернуть заголовок, чтобы он не потерялся.
+		util.ReturnHeader(meta.Headers)
 	}
 }
 
@@ -413,7 +425,7 @@ func (c *DiskLRU) GetWithOptions(ctx context.Context, key string, opts GetOption
 }
 
 func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOptions) (*ItemMeta, error) {
-	// ИСПРАВЛЕНО: Защита от утечки заголовка при ошибке
+	// Защита от утечки заголовка при ошибке
 	success := false
 	defer func() {
 		if !success {
@@ -448,7 +460,7 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		return nil, fmt.Errorf("will not cache response with status %d for key %s", opts.StatusCode, key)
 	}
 
-	// ИСПРАВЛЕНО: Не копируем заголовок снова, используем тот, что пришел
+	// Не копируем заголовок снова, используем тот, что пришел
 	prelimMetaForWrite := &ItemMeta{
 		Version:     MetadataVersion,
 		Key:         key,
@@ -465,7 +477,7 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 	}
 
 	now := time.Now()
-	// ИСПРАВЛЕНО: Не копируем заголовок снова, используем тот, что пришел
+	// Не копируем заголовок снова, используем тот, что пришел
 	finalNewMeta := &ItemMeta{
 		Version:     MetadataVersion,
 		Key:         key,
@@ -537,7 +549,7 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 }
 
 func (c *DiskLRU) putNegativeEntry(_ context.Context, key string, opts PutOptions) (*ItemMeta, error) {
-	// ИСПРАВЛЕНО: Защита от утечки заголовка при ошибке
+	// Защита от утечки заголовка при ошибке
 	success := false
 	defer func() {
 		if !success {
@@ -624,7 +636,7 @@ func (c *DiskLRU) removeItemLocked(key string, deleteFilesFromDisk bool) {
 		c.currentBytes.Add(-meta.Size)
 	}
 
-	// ИСПРАВЛЕНО: Возвращаем заголовок в пул при удалении элемента
+	// Возвращаем заголовок в пул при удалении элемента
 	if meta.Headers != nil {
 		util.ReturnHeader(meta.Headers)
 	}
@@ -654,7 +666,11 @@ func (c *DiskLRU) MarkUsed(ctx context.Context, key string) error {
 	entry := listElement.Value.(*lruEntry)
 	entry.meta.LastUsedAt = UnixTime(time.Now())
 	c.lruList.MoveToFront(listElement)
+
+	// ИСПРАВЛЕНО (Race Condition): Создаем глубокую копию метаданных, включая заголовки,
+	// чтобы избежать гонки состояний, если элемент будет вытеснен из кэша до записи на диск.
 	metaSnapshot := *entry.meta
+	metaSnapshot.Headers = util.CopyHeader(entry.meta.Headers)
 	c.mu.Unlock()
 
 	c.metaBatcher.scheduleUpdate(key, &metaSnapshot)
@@ -728,7 +744,10 @@ func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validat
 
 	c.lruList.MoveToFront(listElement)
 
+	// ИСПРАВЛЕНО (Race Condition): Создаем глубокую копию метаданных, включая заголовки,
+	// чтобы избежать гонки состояний, если элемент будет вытеснен из кэша до записи на диск.
 	metaSnapshot := *metaToUpdate
+	metaSnapshot.Headers = util.CopyHeader(metaToUpdate.Headers)
 	c.mu.Unlock()
 
 	c.metaBatcher.scheduleUpdate(key, &metaSnapshot)

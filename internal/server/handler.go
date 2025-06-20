@@ -272,7 +272,7 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 	if errors.Is(err, fetch.ErrUpstreamNotFound) {
 		if h.cacheCfg.NegativeTTL.StdDuration() > 0 {
 			go func() {
-				// ИСПРАВЛЕНО: Теперь передаем владение заголовком кешу, а не просто копируем
+				// Теперь передаем владение заголовком кешу, а не просто копируем
 				var negativeHeaders http.Header
 				if fetchResOnError != nil && fetchResOnError.Header != nil {
 					negativeHeaders = fetchResOnError.Header
@@ -313,7 +313,7 @@ func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL s
 func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
 	key, fetchedUpstreamURL string, fetchRes *fetch.Result) {
 
-	// ИСПРАВЛЕНО: Заголовок берется из пула, но не возвращается здесь.
+	// Заголовок берется из пула, но не возвращается здесь.
 	// Владение передается в cm.Put, который отвечает за его жизненный цикл.
 	headers := util.CopyHeader(fetchRes.Header)
 
@@ -441,11 +441,9 @@ func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
 	}
 	defer cacheReadRes.Content.Close()
 
-	// Используем пул заголовков
-	headers := util.CopyHeader(meta.Headers)
-	defer util.ReturnHeader(headers)
-
-	util.CopyWhitelistedHeaders(w.Header(), headers)
+	// ИСПРАВЛЕНО: Убрано лишнее копирование заголовка. Заголовки из meta
+	// управляются жизненным циклом элемента кэша, мы можем безопасно читать из них.
+	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
 	if !modTimeForCheck.IsZero() {
 		w.Header().Set("Last-Modified", modTimeForCheck.UTC().Format(http.TimeFormat))
 	}
