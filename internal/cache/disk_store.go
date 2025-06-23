@@ -73,7 +73,6 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 	var tmpCPath string
 	var tmpMPath string
 
-	// ИСПРАВЛЕНО: Улучшена логика defer для надежной очистки временных файлов только при сбое.
 	isSuccess := false
 	defer func() {
 		if !isSuccess {
@@ -103,19 +102,19 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 
 		writtenSize, err = io.CopyBuffer(tmpCFileHandle, r, buf)
 
-		// ИСПРАВЛЕНО: Сохраняем частично скачанные файлы, если ошибка вызвана разрывом соединения.
 		if err != nil {
 			if util.IsClientDisconnectedError(err) {
 				ds.log.Debug().Err(err).Str("key", key).Int64("bytes_written", writtenSize).Msg("Client disconnected during download. Committing partial file to cache.")
-				// Сбрасываем ошибку, так как для кеша это не сбой, а штатное завершение.
 				err = nil
 			} else {
-				// Это реальная ошибка записи (например, нет места на диске), выходим.
 				_ = tmpCFileHandle.Close()
 				return 0, "", "", fmt.Errorf("write content to temp: %w", err)
 			}
 		}
-		// Закрываем файл после всех операций, включая обработку ошибок.
+
+		if syncErr := tmpCFileHandle.Sync(); syncErr != nil {
+			ds.log.Warn().Err(syncErr).Str("path", tmpCPath).Msg("Sync temp content file failed")
+		}
 		if closeErr := tmpCFileHandle.Close(); closeErr != nil && err == nil {
 			return 0, "", "", fmt.Errorf("close temp content file: %w", closeErr)
 		}
@@ -124,7 +123,7 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 		if originalContentLengthStr != "" {
 			originalContentLength, parseErr := strconv.ParseInt(originalContentLengthStr, 10, 64)
 			if parseErr == nil && originalContentLength >= 0 {
-				if writtenSize != originalContentLength && err == nil { // Проверяем только если не было ошибки обрыва
+				if writtenSize != originalContentLength && err == nil {
 					ds.log.Error().
 						Str("key", meta.Key).
 						Int64("expected_size_upstream", originalContentLength).
@@ -140,10 +139,6 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 					Err(parseErr).
 					Msg("Invalid Content-Length header, proceeding with actual written size")
 			}
-		}
-
-		if syncErr := tmpCFileHandle.Sync(); syncErr != nil {
-			ds.log.Warn().Err(syncErr).Str("path", tmpCPath).Msg("Sync temp content file failed")
 		}
 	} else {
 		writtenSize = 0
@@ -186,7 +181,7 @@ func (ds *diskStore) write(key string, r io.Reader, meta *ItemMeta) (
 		tmpCPath = ""
 	}
 
-	isSuccess = true // Отмечаем успех, чтобы defer не удалил файлы.
+	isSuccess = true
 	return writtenSize, finalCPath, finalMPath, nil
 }
 
