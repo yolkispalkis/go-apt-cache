@@ -453,38 +453,22 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		return nil, fmt.Errorf("will not cache response with status %d for key %s", opts.StatusCode, key)
 	}
 
-	prelimMetaForWrite := &ItemMeta{
-		Version:     MetadataVersion,
-		Key:         key,
-		UpstreamURL: opts.UpstreamURL,
-		FetchedAt:   UnixTime(opts.FetchedAt),
-		StatusCode:  opts.StatusCode,
-		Headers:     opts.Headers,
-		Size:        opts.Size,
-	}
-
-	writtenSize, cPath, mPath, err := c.store.write(key, r, prelimMetaForWrite)
-	if err != nil {
-		return nil, fmt.Errorf("disk store write for key %s: %w", key, err)
-	}
-
+	// ИСПРАВЛЕНО: Создаем полную мета-структуру *перед* записью на диск.
 	now := time.Now()
-	finalNewMeta := &ItemMeta{
+	newMeta := &ItemMeta{
 		Version:     MetadataVersion,
 		Key:         key,
-		Path:        cPath,
-		MetaPath:    mPath,
 		UpstreamURL: opts.UpstreamURL,
 		FetchedAt:   UnixTime(opts.FetchedAt),
 		LastUsedAt:  UnixTime(now),
 		ValidatedAt: UnixTime(now),
 		StatusCode:  opts.StatusCode,
 		Headers:     opts.Headers,
-		Size:        writtenSize,
+		Size:        opts.Size, // Предварительный размер, будет обновлен store.write
 	}
 
 	var dateValueTime time.Time
-	if dateStr := finalNewMeta.Headers.Get("Date"); dateStr != "" {
+	if dateStr := newMeta.Headers.Get("Date"); dateStr != "" {
 		if t, errDate := http.ParseTime(dateStr); errDate == nil {
 			dateValueTime = t
 		}
@@ -492,7 +476,19 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 	if dateValueTime.IsZero() {
 		dateValueTime = opts.FetchedAt
 	}
-	finalNewMeta.ExpiresAt = UnixTime(c.calculateExpiresAt(finalNewMeta.Key, finalNewMeta.Headers, dateValueTime))
+	newMeta.ExpiresAt = UnixTime(c.calculateExpiresAt(newMeta.Key, newMeta.Headers, dateValueTime))
+
+	// Передаем полную мета-структуру в store.write.
+	// store.write обновит поле Size на фактический записанный размер.
+	writtenSize, cPath, mPath, err := c.store.write(key, r, newMeta)
+	if err != nil {
+		return nil, fmt.Errorf("disk store write for key %s: %w", key, err)
+	}
+
+	// Обновляем мета-структуру финальными путями и размером
+	newMeta.Path = cPath
+	newMeta.MetaPath = mPath
+	newMeta.Size = writtenSize
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -502,41 +498,41 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		c.removeItemLocked(oldElement.Value.(*lruEntry).key, true)
 	}
 
-	if c.maxBytes > 0 && finalNewMeta.Size > c.maxBytes {
+	if c.maxBytes > 0 && newMeta.Size > c.maxBytes {
 		c.log.Warn().Str("key", key).
-			Str("item_size", util.FormatSize(finalNewMeta.Size)).
+			Str("item_size", util.FormatSize(newMeta.Size)).
 			Str("max_cache_size", util.FormatSize(c.maxBytes)).
 			Msg("Item size exceeds max cache size, not caching. Cleaning up written files.")
-		_ = c.store.deleteFiles(finalNewMeta.Path, finalNewMeta.MetaPath)
+		_ = c.store.deleteFiles(newMeta.Path, newMeta.MetaPath)
 		return nil, errors.New("item size exceeds maximum cache size")
 	}
 
-	if c.currentBytes.Load()+finalNewMeta.Size > c.maxBytes && c.maxBytes > 0 {
-		spaceToFree := (c.currentBytes.Load() + finalNewMeta.Size) - c.maxBytes
+	if c.currentBytes.Load()+newMeta.Size > c.maxBytes && c.maxBytes > 0 {
+		spaceToFree := (c.currentBytes.Load() + newMeta.Size) - c.maxBytes
 		c.evictItemsLocked(spaceToFree, true)
 	}
 
-	if c.currentBytes.Load()+finalNewMeta.Size > c.maxBytes && c.maxBytes > 0 {
+	if c.currentBytes.Load()+newMeta.Size > c.maxBytes && c.maxBytes > 0 {
 		c.log.Warn().Str("key", key).
-			Str("item_size", util.FormatSize(finalNewMeta.Size)).
+			Str("item_size", util.FormatSize(newMeta.Size)).
 			Str("current_cache_size_after_evict", util.FormatSize(c.currentBytes.Load())).
 			Str("max_cache_size", util.FormatSize(c.maxBytes)).
 			Msg("Not enough space for item even after eviction attempt, not caching. Cleaning up written files.")
-		_ = c.store.deleteFiles(finalNewMeta.Path, finalNewMeta.MetaPath)
+		_ = c.store.deleteFiles(newMeta.Path, newMeta.MetaPath)
 		return nil, errors.New("item size exceeds maximum cache size after eviction attempt")
 	}
 
-	entry := &lruEntry{key: key, meta: finalNewMeta}
+	entry := &lruEntry{key: key, meta: newMeta}
 	listElement := c.lruList.PushFront(entry)
 	c.items[key] = listElement
-	if finalNewMeta.StatusCode != http.StatusNotFound {
-		c.currentBytes.Add(finalNewMeta.Size)
+	if newMeta.StatusCode != http.StatusNotFound {
+		c.currentBytes.Add(newMeta.Size)
 	}
 
-	c.log.Debug().Str("key", key).Str("size", util.FormatSize(finalNewMeta.Size)).Msg("Item added to cache.")
+	c.log.Debug().Str("key", key).Str("size", util.FormatSize(newMeta.Size)).Msg("Item added to cache.")
 
 	success = true
-	return finalNewMeta, nil
+	return newMeta, nil
 }
 
 func (c *DiskLRU) putNegativeEntry(_ context.Context, key string, opts PutOptions) (*ItemMeta, error) {

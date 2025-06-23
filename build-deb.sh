@@ -4,7 +4,7 @@ set -e
 export PATH=$PATH:/usr/local/go/bin
 
 PKG_NAME="go-apt-cache"
-PKG_VERSION="2.3.0"
+PKG_VERSION="2.3.5"
 PKG_ARCH="amd64"
 PKG_MAINTAINER="yolkispalkis <me@w3h.su>"
 PKG_DESCRIPTION="Высокопроизводительный прокси-сервер для APT, написанный на Go"
