@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/rs/zerolog"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
@@ -113,7 +114,7 @@ type DiskLRU struct {
 	maxBytes int64
 
 	negTTL    time.Duration
-	overrides []config.CacheOverride // Правила переопределения TTL
+	overrides []config.CacheOverride
 
 	mu           sync.RWMutex
 	items        map[string]*list.Element
@@ -173,13 +174,10 @@ func NewDiskLRU(cfg config.CacheConfig, logger zerolog.Logger) (*DiskLRU, error)
 	return cache, nil
 }
 
-// findOverrideTTL ищет совпадение относительного пути с правилами переопределения TTL.
+// ИСПРАВЛЕНО: Заменена filepath.Match на doublestar.Match для надежного сопоставления с '**'.
 func (c *DiskLRU) findOverrideTTL(relPath string) (time.Duration, bool) {
 	for _, rule := range c.overrides {
-		// filepath.Match использует ** для рекурсивного соответствия в Go 1.22+
-		// Для более старых версий можно использовать стороннюю библиотеку, но здесь
-		// мы полагаемся на стандартное поведение.
-		matched, err := filepath.Match(rule.PathPattern, relPath)
+		matched, err := doublestar.Match(rule.PathPattern, relPath)
 		if err == nil && matched {
 			c.log.Debug().
 				Str("relPath", relPath).
@@ -193,12 +191,10 @@ func (c *DiskLRU) findOverrideTTL(relPath string) (time.Duration, bool) {
 }
 
 func (c *DiskLRU) calculateExpiresAt(relPath string, headers http.Header, dateValueTime time.Time) time.Time {
-	// 1. Проверяем правила переопределения из конфига
 	if overrideTTL, ok := c.findOverrideTTL(relPath); ok {
 		return dateValueTime.Add(overrideTTL)
 	}
 
-	// 2. Стандартная логика на основе заголовков
 	ageSec := int64(0)
 	if ageHeader := headers.Get("Age"); ageHeader != "" {
 		if ageVal, err := strconv.ParseInt(ageHeader, 10, 64); err == nil && ageVal >= 0 {
@@ -501,7 +497,6 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		dateValueTime = opts.FetchedAt
 	}
 
-	// Извлекаем относительный путь из ключа для проверки правил
 	relPath := ""
 	if parts := strings.SplitN(key, "/", 2); len(parts) == 2 {
 		relPath = parts[1]
@@ -746,7 +741,6 @@ func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validat
 		baseTimeForExpiryCalc = validationTime
 	}
 
-	// Извлекаем относительный путь из ключа для проверки правил
 	relPath := ""
 	if parts := strings.SplitN(key, "/", 2); len(parts) == 2 {
 		relPath = parts[1]
