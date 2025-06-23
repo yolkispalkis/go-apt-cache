@@ -37,7 +37,7 @@ type MetadataBatcher struct {
 	store   *diskStore
 	log     zerolog.Logger
 	done    chan struct{}
-	wg      sync.WaitGroup // ИСПРАВЛЕНО: WaitGroup для ожидания завершения горутины
+	wg      sync.WaitGroup
 }
 
 func newMetadataBatcher(store *diskStore, logger zerolog.Logger, interval time.Duration) *MetadataBatcher {
@@ -48,13 +48,13 @@ func newMetadataBatcher(store *diskStore, logger zerolog.Logger, interval time.D
 		log:     logger,
 		done:    make(chan struct{}),
 	}
-	mb.wg.Add(1) // ИСПРАВЛЕНО: Увеличиваем счетчик WaitGroup перед запуском горутины
+	mb.wg.Add(1)
 	go mb.batchUpdates()
 	return mb
 }
 
 func (mb *MetadataBatcher) batchUpdates() {
-	defer mb.wg.Done() // ИСПРАВЛЕНО: Уменьшаем счетчик при выходе из горутины
+	defer mb.wg.Done()
 
 	updates := make(map[string]*ItemMeta, 100)
 
@@ -73,7 +73,6 @@ func (mb *MetadataBatcher) batchUpdates() {
 			}
 
 		case <-mb.done:
-			// Финальная очистка перед выходом
 			if len(updates) > 0 {
 				mb.flushUpdates(updates)
 			}
@@ -104,7 +103,7 @@ func (mb *MetadataBatcher) scheduleUpdate(key string, meta *ItemMeta) {
 func (mb *MetadataBatcher) close() {
 	close(mb.done)
 	mb.ticker.Stop()
-	mb.wg.Wait() // ИСПРАВЛЕНО: Ждем завершения горутины batchUpdates для сохранения всех данных
+	mb.wg.Wait()
 }
 
 type DiskLRU struct {
@@ -113,7 +112,8 @@ type DiskLRU struct {
 	store    *diskStore
 	maxBytes int64
 
-	negTTL time.Duration
+	negTTL    time.Duration
+	overrides []config.CacheOverride // Правила переопределения TTL
 
 	mu           sync.RWMutex
 	items        map[string]*list.Element
@@ -164,6 +164,7 @@ func NewDiskLRU(cfg config.CacheConfig, logger zerolog.Logger) (*DiskLRU, error)
 		store:       store,
 		maxBytes:    maxBytes,
 		negTTL:      cfg.NegativeTTL.StdDuration(),
+		overrides:   cfg.Overrides,
 		items:       make(map[string]*list.Element),
 		lruList:     list.New(),
 		metaBatcher: newMetadataBatcher(store, logger, batchInterval),
@@ -172,13 +173,38 @@ func NewDiskLRU(cfg config.CacheConfig, logger zerolog.Logger) (*DiskLRU, error)
 	return cache, nil
 }
 
-func (c *DiskLRU) calculateExpiresAt(cacheKey string, headers http.Header, dateValueTime time.Time) time.Time {
+// findOverrideTTL ищет совпадение относительного пути с правилами переопределения TTL.
+func (c *DiskLRU) findOverrideTTL(relPath string) (time.Duration, bool) {
+	for _, rule := range c.overrides {
+		// filepath.Match использует ** для рекурсивного соответствия в Go 1.22+
+		// Для более старых версий можно использовать стороннюю библиотеку, но здесь
+		// мы полагаемся на стандартное поведение.
+		matched, err := filepath.Match(rule.PathPattern, relPath)
+		if err == nil && matched {
+			c.log.Debug().
+				Str("relPath", relPath).
+				Str("pattern", rule.PathPattern).
+				Dur("ttl", rule.TTL.StdDuration()).
+				Msg("Applying configured cache TTL override.")
+			return rule.TTL.StdDuration(), true
+		}
+	}
+	return 0, false
+}
+
+func (c *DiskLRU) calculateExpiresAt(relPath string, headers http.Header, dateValueTime time.Time) time.Time {
+	// 1. Проверяем правила переопределения из конфига
+	if overrideTTL, ok := c.findOverrideTTL(relPath); ok {
+		return dateValueTime.Add(overrideTTL)
+	}
+
+	// 2. Стандартная логика на основе заголовков
 	ageSec := int64(0)
 	if ageHeader := headers.Get("Age"); ageHeader != "" {
 		if ageVal, err := strconv.ParseInt(ageHeader, 10, 64); err == nil && ageVal >= 0 {
 			ageSec = ageVal
 		} else {
-			c.log.Warn().Str("key", cacheKey).Str("age_header", ageHeader).Err(err).Msg("Invalid Age header, ignoring.")
+			c.log.Warn().Str("path", relPath).Str("age_header", ageHeader).Err(err).Msg("Invalid Age header, ignoring.")
 		}
 	}
 
@@ -238,7 +264,7 @@ func (c *DiskLRU) calculateExpiresAt(cacheKey string, headers http.Header, dateV
 				if heuristicLifetimeSec < 0 {
 					heuristicLifetimeSec = 0
 				}
-				c.log.Debug().Str("key", cacheKey).Dur("heuristic_ttl", time.Duration(heuristicLifetimeSec)*time.Second).Msg("Applying heuristic caching TTL")
+				c.log.Debug().Str("path", relPath).Dur("heuristic_ttl", time.Duration(heuristicLifetimeSec)*time.Second).Msg("Applying heuristic caching TTL")
 				return dateValueTime.Add(time.Duration(heuristicLifetimeSec) * time.Second)
 			}
 		}
@@ -294,7 +320,6 @@ func (c *DiskLRU) Init(ctx context.Context) error {
 				continue
 			}
 
-			// ИСПРАВЛЕНО: Удаляем протухшие элементы при инициализации
 			if meta.IsStale(now) {
 				c.log.Debug().Str("key", meta.Key).Msg("Removing stale item during cache initialization.")
 				_ = c.store.deleteFiles(c.store.contentPath(meta.Key), mPath)
@@ -453,7 +478,6 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		return nil, fmt.Errorf("will not cache response with status %d for key %s", opts.StatusCode, key)
 	}
 
-	// ИСПРАВЛЕНО: Создаем полную мета-структуру *перед* записью на диск.
 	now := time.Now()
 	newMeta := &ItemMeta{
 		Version:     MetadataVersion,
@@ -464,7 +488,7 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 		ValidatedAt: UnixTime(now),
 		StatusCode:  opts.StatusCode,
 		Headers:     opts.Headers,
-		Size:        opts.Size, // Предварительный размер, будет обновлен store.write
+		Size:        opts.Size,
 	}
 
 	var dateValueTime time.Time
@@ -476,16 +500,20 @@ func (c *DiskLRU) Put(ctx context.Context, key string, r io.Reader, opts PutOpti
 	if dateValueTime.IsZero() {
 		dateValueTime = opts.FetchedAt
 	}
-	newMeta.ExpiresAt = UnixTime(c.calculateExpiresAt(newMeta.Key, newMeta.Headers, dateValueTime))
 
-	// Передаем полную мета-структуру в store.write.
-	// store.write обновит поле Size на фактический записанный размер.
+	// Извлекаем относительный путь из ключа для проверки правил
+	relPath := ""
+	if parts := strings.SplitN(key, "/", 2); len(parts) == 2 {
+		relPath = parts[1]
+	}
+
+	newMeta.ExpiresAt = UnixTime(c.calculateExpiresAt(relPath, newMeta.Headers, dateValueTime))
+
 	writtenSize, cPath, mPath, err := c.store.write(key, r, newMeta)
 	if err != nil {
 		return nil, fmt.Errorf("disk store write for key %s: %w", key, err)
 	}
 
-	// Обновляем мета-структуру финальными путями и размером
 	newMeta.Path = cPath
 	newMeta.MetaPath = mPath
 	newMeta.Size = writtenSize
@@ -717,7 +745,14 @@ func (c *DiskLRU) UpdateAfterValidation(ctx context.Context, key string, validat
 	if baseTimeForExpiryCalc.IsZero() {
 		baseTimeForExpiryCalc = validationTime
 	}
-	metaToUpdate.ExpiresAt = UnixTime(c.calculateExpiresAt(key, metaToUpdate.Headers, baseTimeForExpiryCalc))
+
+	// Извлекаем относительный путь из ключа для проверки правил
+	relPath := ""
+	if parts := strings.SplitN(key, "/", 2); len(parts) == 2 {
+		relPath = parts[1]
+	}
+
+	metaToUpdate.ExpiresAt = UnixTime(c.calculateExpiresAt(relPath, metaToUpdate.Headers, baseTimeForExpiryCalc))
 
 	metaToUpdate.ValidatedAt = UnixTime(validationTime)
 	metaToUpdate.LastUsedAt = UnixTime(validationTime)

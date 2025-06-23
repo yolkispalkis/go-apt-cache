@@ -102,15 +102,21 @@ type ServerConfig struct {
 	UserAgent         string   `json:"userAgent,omitempty"`
 }
 
+// CacheOverride определяет правило для переопределения TTL кеша для определённых путей.
+type CacheOverride struct {
+	PathPattern string   `json:"pathPattern"` // Шаблон пути в формате glob, например "dists/*/InRelease"
+	TTL         Duration `json:"ttl"`         // Время жизни кеша для этого пути
+}
+
 type CacheConfig struct {
-	Dir                   string   `json:"directory"`
-	MaxSize               string   `json:"maxSize"`
-	Enabled               bool     `json:"enabled"`
-	CleanOnStart          bool     `json:"cleanOnStart"`
-	NegativeTTL           Duration `json:"negativeCacheTTL"`
-	MetadataBatchInterval Duration `json:"metadataBatchInterval"`
-	BufferSize            string   `json:"bufferSize"`
-	// ИЗМЕНЕНО: Удалено поле ShardCount, так как оно не использовалось в реализации.
+	Dir                   string          `json:"directory"`
+	MaxSize               string          `json:"maxSize"`
+	Enabled               bool            `json:"enabled"`
+	CleanOnStart          bool            `json:"cleanOnStart"`
+	NegativeTTL           Duration        `json:"negativeCacheTTL"`
+	MetadataBatchInterval Duration        `json:"metadataBatchInterval"`
+	BufferSize            string          `json:"bufferSize"`
+	Overrides             []CacheOverride `json:"overrides,omitempty"` // Правила для переопределения TTL
 }
 
 type Config struct {
@@ -134,14 +140,17 @@ func Default() *Config {
 			UserAgent:         appinfo.UserAgent(),
 		},
 		Cache: CacheConfig{
-			Dir:          "/var/cache/go-apt-cache",
-			MaxSize:      "10GB",
-			Enabled:      true,
-			CleanOnStart: false,
-			NegativeTTL:  Duration(5 * time.Minute),
-			// ИЗМЕНЕНО: Удалено поле ShardCount.
+			Dir:                   "/var/cache/go-apt-cache",
+			MaxSize:               "10GB",
+			Enabled:               true,
+			CleanOnStart:          false,
+			NegativeTTL:           Duration(5 * time.Minute),
 			MetadataBatchInterval: Duration(30 * time.Second),
 			BufferSize:            "64KB",
+			Overrides: []CacheOverride{
+				{PathPattern: "dists/*/InRelease", TTL: Duration(5 * time.Minute)},
+				{PathPattern: "**/*.deb", TTL: Duration(30 * 24 * time.Hour)},
+			},
 		},
 		Logging: logging.Config{
 			Level:      "info",
@@ -242,12 +251,22 @@ func Validate(cfg *Config) error {
 		if _, err := util.ParseSize(c.MaxSize); err != nil {
 			return fmt.Errorf("invalid cache.maxSize %q: %w", c.MaxSize, err)
 		}
-		// ИЗМЕНЕНО: Удалена валидация для ShardCount
 		if c.MetadataBatchInterval.StdDuration() <= 0 {
 			return errors.New("cache.metadataBatchInterval must be > 0")
 		}
 		if _, err := util.ParseSize(c.BufferSize); err != nil {
 			return fmt.Errorf("invalid cache.bufferSize %q: %w", c.BufferSize, err)
+		}
+		for i, o := range c.Overrides {
+			if o.PathPattern == "" {
+				return fmt.Errorf("cache.overrides[%d]: pathPattern cannot be empty", i)
+			}
+			if _, err := filepath.Match(o.PathPattern, "a"); err != nil {
+				return fmt.Errorf("cache.overrides[%d]: invalid pathPattern glob %q: %w", i, o.PathPattern, err)
+			}
+			if o.TTL.StdDuration() <= 0 {
+				return fmt.Errorf("cache.overrides[%d]: ttl for pattern %q must be > 0", i, o.PathPattern)
+			}
 		}
 	}
 

@@ -16,7 +16,17 @@
     "cleanOnStart": false,
     "negativeCacheTTL": "5m",
     "metadataBatchInterval": "30s",
-    "bufferSize": "64KB"
+    "bufferSize": "64KB",
+    "overrides": [
+      {
+        "pathPattern": "dists/*/InRelease",
+        "ttl": "5m"
+      },
+      {
+        "pathPattern": "**/*.deb",
+        "ttl": "720h"
+      }
+    ]
   },
   "logging": {
     "level": "info",
