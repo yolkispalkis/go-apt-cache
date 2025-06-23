@@ -54,7 +54,7 @@ cat >"${CONFIG_DIR}/config.json" <<EOF
     "bufferSize": "64KB",
     "overrides": [
       {
-        "pathPattern": "dists/*/InRelease",
+        "pathPattern": "dists/**",
         "ttl": "5m"
       },
       {
