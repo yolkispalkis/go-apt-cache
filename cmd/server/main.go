@@ -18,14 +18,6 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
-// Application является центральной структурой приложения, содержащей все зависимости.
-type Application struct {
-	Config  *config.Config
-	Logger  *logging.Logger
-	Cache   cache.Manager
-	Fetcher *fetch.Coordinator
-}
-
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -56,7 +48,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to setup logging: %w", err)
 	}
-	logger.Info("Configuration loaded", "path", *cfgPath)
+	logger.Info().Str("path", *cfgPath).Msg("Configuration loaded")
 
 	// 3. Инициализация зависимостей.
 	util.InitBufferPool(cfg.Cache.BufferSize, logger)
@@ -69,19 +61,18 @@ func run(ctx context.Context) error {
 
 	fetchCoordinator := fetch.NewCoordinator(cfg.Server, logger)
 
-	app := &Application{
-		Config:  cfg,
-		Logger:  logger,
-		Cache:   cacheManager,
-		Fetcher: fetchCoordinator,
-	}
+	// Создаем экземпляр Application из пакета server
+	app := server.NewApplication(cfg, logger, cacheManager, fetchCoordinator)
 
 	// 4. Создание и запуск HTTP-сервера.
 	srv := server.New(cfg.Server, logger, app.Routes())
 
 	errChan := make(chan error, 1)
 	go func() {
-		logger.Info("Starting server...", "tcp_addr", cfg.Server.ListenAddr, "unix_socket", cfg.Server.UnixPath)
+		logger.Info().
+			Str("tcp_addr", cfg.Server.ListenAddr).
+			Str("unix_socket", cfg.Server.UnixPath).
+			Msg("Starting server...")
 		errChan <- srv.Start()
 	}()
 
@@ -89,18 +80,18 @@ func run(ctx context.Context) error {
 	select {
 	case err := <-errChan:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("Server failed", "error", err)
+			logger.Error().Err(err).Msg("Server failed")
 			return err
 		}
 	case <-ctx.Done():
-		logger.Info("Shutdown signal received. Shutting down...")
+		logger.Info().Msg("Shutdown signal received. Shutting down...")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			logger.Error("Graceful server shutdown failed", "error", err)
+			logger.Error().Err(err).Msg("Graceful server shutdown failed")
 			return err
 		}
-		logger.Info("Server shut down gracefully")
+		logger.Info().Msg("Server shut down gracefully")
 	}
 
 	return nil

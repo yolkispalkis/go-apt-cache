@@ -9,10 +9,31 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
+	"github.com/yolkispalkis/go-apt-cache/internal/fetch"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
+
+// Application является центральной структурой приложения, содержащей все зависимости.
+// Она определена здесь, чтобы быть доступной для всех компонентов сервера.
+type Application struct {
+	Config  *config.Config
+	Logger  *logging.Logger
+	Cache   cache.Manager
+	Fetcher *fetch.Coordinator
+}
+
+// NewApplication создает новый экземпляр Application.
+func NewApplication(cfg *config.Config, logger *logging.Logger, cache cache.Manager, fetcher *fetch.Coordinator) *Application {
+	return &Application{
+		Config:  cfg,
+		Logger:  logger,
+		Cache:   cache,
+		Fetcher: fetcher,
+	}
+}
 
 // Server представляет HTTP-сервер приложения.
 type Server struct {
@@ -47,10 +68,10 @@ func (s *Server) Start() error {
 	errChan := make(chan error, 1)
 	for _, l := range s.listeners {
 		lis := l // Захватываем переменную для горутины
-		s.log.Info("Server listening", "network", lis.Addr().Network(), "address", lis.Addr().String())
+		s.log.Info().Str("network", lis.Addr().Network()).Str("address", lis.Addr().String()).Msg("Server listening")
 		go func() {
 			if err := s.httpSrv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				s.log.Error("HTTP server error", "address", lis.Addr().String(), "error", err)
+				s.log.Error().Err(err).Str("address", lis.Addr().String()).Msg("HTTP server error")
 				select {
 				case errChan <- err:
 				default:
@@ -64,7 +85,7 @@ func (s *Server) Start() error {
 
 // Shutdown корректно останавливает сервер.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.log.Info("Attempting graceful server shutdown...")
+	s.log.Info().Msg("Attempting graceful server shutdown...")
 	err := s.httpSrv.Shutdown(ctx)
 	s.cleanupSocket()
 	return err
@@ -122,9 +143,9 @@ func (s *Server) cleanupSocket() {
 	if s.cfg.UnixPath != "" {
 		cleanSockPath := util.CleanPath(s.cfg.UnixPath)
 		if err := os.Remove(cleanSockPath); err != nil && !os.IsNotExist(err) {
-			s.log.Warn("Failed to remove unix socket file during shutdown.", "path", cleanSockPath, "error", err)
+			s.log.Warn().Err(err).Str("path", cleanSockPath).Msg("Failed to remove unix socket file during shutdown.")
 		} else {
-			s.log.Info("Unix socket file removed.", "path", cleanSockPath)
+			s.log.Info().Str("path", cleanSockPath).Msg("Unix socket file removed.")
 		}
 	}
 }
