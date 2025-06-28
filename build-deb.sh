@@ -171,7 +171,7 @@ EOF
 
 create_conffiles() {
     echo "--- Creating conffiles ---"
-    echo "${CONFIG_DIR}/config.json" >"${DEBIAN_DIR}/conffiles"
+    echo "/etc/${PKG_NAME}/config.json" >"${DEBIAN_DIR}/conffiles"
 }
 
 build_package() {
