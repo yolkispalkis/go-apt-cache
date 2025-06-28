@@ -5,41 +5,44 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+// Config хранит настройки логгирования.
 type Config struct {
-	Level      string `json:"level"`
-	File       string `json:"file,omitempty"`
-	MaxSizeMB  int    `json:"maxSizeMB,omitempty"`
-	MaxBackups int    `json:"maxBackups,omitempty"`
-	MaxAgeDays int    `json:"maxAgeDays,omitempty"`
-	NoConsole  bool   `json:"noConsole,omitempty"`
+	Level      string `koanf:"level"`
+	File       string `koanf:"file"`
+	MaxSizeMB  int    `koanf:"maxSizeMB"`
+	MaxBackups int    `koanf:"maxBackups"`
+	MaxAgeDays int    `koanf:"maxAgeDays"`
+	NoConsole  bool   `koanf:"noConsole"`
 }
 
-func Setup(cfg Config) error {
-	level := parseLevel(cfg.Level)
+// Logger - это обертка над zerolog.Logger для добавления контекста.
+type Logger struct {
+	zerolog.Logger
+}
 
+// New создает и настраивает новый логгер.
+func New(cfg Config) (*Logger, error) {
+	level := parseLevel(cfg.Level)
 	var writers []io.Writer
 
-	// Console writer
 	if !cfg.NoConsole {
 		console := zerolog.ConsoleWriter{
 			Out:        os.Stderr,
-			TimeFormat: "15:04:05",
+			TimeFormat: time.RFC3339,
 		}
 		writers = append(writers, console)
 	}
 
-	// File writer
 	if cfg.File != "" {
 		if err := os.MkdirAll(filepath.Dir(cfg.File), 0755); err != nil {
-			return err
+			return nil, err
 		}
-
 		file := &lumberjack.Logger{
 			Filename:   cfg.File,
 			MaxSize:    cfg.MaxSizeMB,
@@ -54,9 +57,15 @@ func Setup(cfg Config) error {
 	}
 
 	multi := zerolog.MultiLevelWriter(writers...)
-	log.Logger = zerolog.New(multi).With().Timestamp().Logger().Level(level)
+	zl := zerolog.New(multi).With().Timestamp().Logger().Level(level)
 
-	return nil
+	return &Logger{zl}, nil
+}
+
+// WithComponent добавляет имя компонента в контекст логгера.
+func (l *Logger) WithComponent(name string) *Logger {
+	zl := l.With().Str("component", name).Logger()
+	return &Logger{zl}
 }
 
 func parseLevel(s string) zerolog.Level {
@@ -72,8 +81,4 @@ func parseLevel(s string) zerolog.Level {
 	default:
 		return zerolog.InfoLevel
 	}
-}
-
-func L() zerolog.Logger {
-	return log.Logger
 }

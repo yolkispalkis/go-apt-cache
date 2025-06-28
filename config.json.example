@@ -3,23 +3,26 @@
     "listenAddress": ":8080",
     "unixSocketPath": "/run/go-apt-cache/go-apt-cache.sock",
     "unixSocketPermissions": "0660",
-    "requestTimeout": "30s",
+    "requestTimeout": "1m",
     "shutdownTimeout": "15s",
-    "idleTimeout": "120s",
+    "idleTimeout": "2m",
     "readHeaderTimeout": "10s",
-    "maxConcurrentFetches": 20
+    "maxConcurrentFetches": 20,
+    "userAgent": "go-apt-cache/dev"
   },
   "cache": {
     "directory": "/var/cache/go-apt-cache",
     "maxSize": "20GB",
     "enabled": true,
     "cleanOnStart": false,
-    "negativeCacheTTL": "5m",
-    "metadataBatchInterval": "30s",
-    "bufferSize": "64KB",
+    "bufferSize": "128KB",
     "overrides": [
       {
-        "pathPattern": "dists/**",
+        "pathPattern": "dists/**/InRelease",
+        "ttl": "5m"
+      },
+      {
+        "pathPattern": "dists/**/Release",
         "ttl": "5m"
       },
       {
@@ -33,7 +36,8 @@
     "file": "/var/log/go-apt-cache/go-apt-cache.log",
     "maxSizeMB": 100,
     "maxBackups": 5,
-    "maxAgeDays": 30
+    "maxAgeDays": 30,
+    "noConsole": false
   },
   "repositories": [
     {

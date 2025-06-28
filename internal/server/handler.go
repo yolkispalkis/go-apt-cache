@@ -3,487 +3,173 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/rs/zerolog"
+	"github.com/go-chi/chi/v5"
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/fetch"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
-type RepoHandler struct {
-	repoCfg  config.Repository
-	srvCfg   config.ServerConfig
-	cacheCfg config.CacheConfig
-	cm       cache.Manager
-	fetcher  *fetch.Coordinator
-	log      zerolog.Logger
-}
+// handleServeRepoContent - основной обработчик запросов к репозиториям.
+func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Request) {
+	repo := r.Context().Value(repoContextKey).(config.Repository)
+	relPath := chi.URLParam(r, "*")
+	key := repo.Name + "/" + relPath
+	upstreamURL := repo.URL + relPath
+	log := app.Logger.With("key", key, "repo", repo.Name)
 
-func newRepoHandler(rcfg config.Repository, scfg config.ServerConfig, ccfg config.CacheConfig,
-	cm cache.Manager, fc *fetch.Coordinator, parentLog zerolog.Logger) *RepoHandler {
-	return &RepoHandler{
-		repoCfg:  rcfg,
-		srvCfg:   scfg,
-		cacheCfg: ccfg,
-		cm:       cm,
-		fetcher:  fc,
-		log:      parentLog.With().Str("repo", rcfg.Name).Logger(),
-	}
-}
-
-func (h *RepoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	relPath := strings.TrimPrefix(r.URL.Path, "/")
-
-	if r.URL.RawQuery != "" || r.URL.Fragment != "" {
-		h.log.Warn().
-			Str("path", r.URL.Path).
-			Str("query", r.URL.RawQuery).
-			Str("fragment", r.URL.Fragment).
-			Msg("Request with query parameters or fragment blocked")
-		http.Error(w, "Query parameters or fragments are not allowed", http.StatusBadRequest)
-		return
-	}
-
-	if strings.Contains(relPath, "..") {
-		cleanedPath := filepath.Clean(relPath)
-		if strings.HasPrefix(cleanedPath, "..") || cleanedPath == ".." ||
-			(relPath != cleanedPath && strings.HasPrefix(cleanedPath, "../")) {
-			h.log.Warn().Str("original_path", r.URL.Path).Str("rel_path", relPath).Str("cleaned_path", cleanedPath).Msg("Path traversal attempt detected and blocked")
-			http.Error(w, "Invalid path (traversal attempt)", http.StatusBadRequest)
-			return
-		}
-		relPath = cleanedPath
-	}
-	if relPath == "." {
-		relPath = ""
-	}
-
-	cacheKey, err := util.GenerateCacheKey(h.repoCfg.Name, relPath)
-	if err != nil {
-		h.log.Error().Err(err).Str("repo", h.repoCfg.Name).Str("relPath", relPath).Msg("Failed to generate cache key")
-		http.Error(w, "Internal server error (cache key generation)", http.StatusInternalServerError)
-		return
-	}
-
-	upstreamURL := h.repoCfg.URL + relPath
-
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
-		return
-	}
-
-	cacheRes, err := h.cm.GetWithOptions(r.Context(), cacheKey, cache.GetOptions{WithContent: false})
-	if err != nil && !errors.Is(err, cache.ErrNotFound) {
-		h.log.Error().Err(err).Str("key", cacheKey).Msg("Cache get error")
-		http.Error(w, "Cache error", http.StatusInternalServerError)
-		return
-	}
-
-	if cacheRes != nil && cacheRes.Hit {
-		if h.log.GetLevel() <= zerolog.DebugLevel {
-			h.log.Debug().Str("key", cacheKey).Str("status", "HIT").Msg("Cache hit")
-		}
-		h.handleCacheHit(w, r, cacheKey, upstreamURL, relPath, cacheRes)
-		return
-	}
-
-	if h.log.GetLevel() <= zerolog.InfoLevel {
-		h.log.Info().Str("key", cacheKey).Str("status", "MISS").Msg("Cache miss")
-	}
-	h.handleCacheMiss(w, r, cacheKey, upstreamURL)
-}
-
-func (h *RepoHandler) handleCacheHit(w http.ResponseWriter, r *http.Request,
-	key, upstreamURL, relPath string, cacheRes *cache.GetResult) {
-
-	// ИСПРАВЛЕНО: Используем новый безопасный метод Close()
-	defer cacheRes.Close()
-
-	meta := cacheRes.Meta
-
-	if meta.StatusCode == http.StatusNotFound {
-		if h.cacheCfg.NegativeTTL.StdDuration() > 0 && time.Since(meta.FetchedAt.Time()) > h.cacheCfg.NegativeTTL.StdDuration() {
-			h.log.Info().Str("key", key).Msg("Expired negative cache entry, re-fetching.")
-			go h.cm.Delete(context.Background(), key)
-			h.handleCacheMiss(w, r, key, upstreamURL)
-			return
-		}
-		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
-		return
-	}
-
-	needsReval := false
-	now := time.Now()
-
-	if clientCC := util.ParseCacheControl(r.Header.Get("Cache-Control")); clientCC["no-cache"] != "" {
-		h.log.Debug().Str("key", key).Msg("Client sent 'Cache-Control: no-cache', forcing revalidation.")
-		needsReval = true
-	}
-
-	if !needsReval && meta.IsStale(now) {
-		h.log.Debug().Str("key", key).Time("expiresAt", meta.ExpiresAt.Time()).Msg("Item is stale based on its expiresAt, needs revalidation.")
-		needsReval = true
-	}
-
-	if needsReval {
-		h.log.Info().Str("key", key).Msg("Revalidation triggered for cached item.")
-		h.revalidateAndServe(w, r, key, upstreamURL, meta)
-	} else {
-		h.serveFromCache(w, r, key, relPath, meta)
-	}
-}
-
-func (h *RepoHandler) revalidateAndServe(w http.ResponseWriter, r *http.Request,
-	key, upstreamURL string, currentMeta *cache.ItemMeta) {
-
-	fetchOpts := &fetch.Options{}
-	if lmStr := currentMeta.Headers.Get("Last-Modified"); lmStr != "" {
-		if t, errLMP := http.ParseTime(lmStr); errLMP == nil {
-			fetchOpts.IfModSince = t
-		}
-	} else if !currentMeta.FetchedAt.Time().IsZero() && currentMeta.StatusCode == http.StatusOK {
-		fetchOpts.IfModSince = currentMeta.FetchedAt.Time()
-	}
-
-	if etag := currentMeta.Headers.Get("ETag"); etag != "" {
-		fetchOpts.IfNoneMatch = etag
-	}
-
-	h.log.Debug().Str("key", key).Str("upstreamURL", upstreamURL).
-		Time("if_mod_since", fetchOpts.IfModSince).Str("if_none_match", fetchOpts.IfNoneMatch).
-		Msg("Revalidating item with conditional fetch")
-
-	derivedRelPath := ""
-	if strings.HasPrefix(currentMeta.UpstreamURL, h.repoCfg.URL) {
-		derivedRelPath = strings.TrimPrefix(currentMeta.UpstreamURL, h.repoCfg.URL)
-	} else {
-		parts := strings.SplitN(key, "/", 2)
-		if len(parts) == 2 {
-			derivedRelPath = parts[1]
-		}
-	}
-
-	fetchRes, fetchErr := h.fetcher.Fetch(r.Context(), key, upstreamURL, fetchOpts)
-	if fetchRes != nil && fetchRes.Body != nil {
-		defer fetchRes.Body.Close()
-	}
-
-	if errors.Is(fetchErr, fetch.ErrUpstreamNotModified) {
-		if fetchRes == nil || fetchRes.Header == nil {
-			h.log.Error().Str("key", key).Msg("Internal error: 304 Not Modified but no headers available from fetcher.")
-			h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
-			return
-		}
-
-		h.log.Info().Str("key", key).Msg("Revalidation returned 304 Not Modified. Updating meta and serving from cache.")
-		validationTime := time.Now()
-		updatedMeta, errUpdate := h.cm.UpdateAfterValidation(r.Context(), key, validationTime, fetchRes.Header, currentMeta.StatusCode, currentMeta.Size)
-		if errUpdate != nil {
-			h.log.Warn().Err(errUpdate).Str("key", key).Msg("Failed to update cache metadata after 304. Serving with old meta.")
-			h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
+	// 1. Проверка кеша метаданных.
+	meta, found := app.Cache.Get(r.Context(), key)
+	if found {
+		log.Debug("Cache hit for metadata")
+		if meta.IsStale(time.Now()) || r.Header.Get("Cache-Control") == "no-cache" {
+			log.Info("Revalidating stale/no-cache item")
+			app.revalidate(w, r, key, upstreamURL, meta)
 		} else {
-			h.serveFromCache(w, r, key, derivedRelPath, updatedMeta)
+			app.serveFromCache(w, r, key, meta)
 		}
 		return
 	}
 
-	if fetchErr == nil {
-		h.log.Info().Str("key", key).Int("status", fetchRes.Status).Msg("Revalidation successful, got new content (2xx).")
-		h.storeAndServe(w, r, key, upstreamURL, fetchRes)
-		return
-	}
-
-	h.log.Warn().Err(fetchErr).Str("key", key).Msg("Revalidation fetch failed (not 304 or 2xx).")
-
-	ccDirectives := util.ParseCacheControl(currentMeta.Headers.Get("Cache-Control"))
-	_, mustRevalidate := ccDirectives["must-revalidate"]
-	_, proxyRevalidate := ccDirectives["proxy-revalidate"]
-
-	if mustRevalidate || proxyRevalidate {
-		isNetErr := errors.Is(fetchErr, fetch.ErrNetwork) || errors.Is(fetchErr, context.DeadlineExceeded) || errors.Is(fetchErr, context.Canceled)
-		isServerErr := errors.Is(fetchErr, fetch.ErrUpstreamServerErr)
-
-		if isNetErr || isServerErr {
-			h.log.Warn().Str("key", key).Msg("Item has must-revalidate/proxy-revalidate and revalidation failed due to upstream/network error. Returning 504.")
-			http.Error(w, http.StatusText(http.StatusGatewayTimeout), http.StatusGatewayTimeout)
-			return
-		}
-	}
-
-	if errors.Is(fetchErr, fetch.ErrUpstreamNotFound) {
-		h.log.Warn().Str("key", key).Msg("Item not found on upstream during revalidation. Deleting from cache and returning 404.")
-		go h.cm.Delete(context.Background(), key)
-		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
-		return
-	}
-
-	if errors.Is(fetchErr, fetch.ErrUpstreamClientErr) || errors.Is(fetchErr, fetch.ErrUpstreamServerErr) {
-		h.log.Info().Str("key", key).Msg("Serving stale content as revalidation failed with upstream error (or no must-revalidate).")
-		h.serveFromCache(w, r, key, derivedRelPath, currentMeta)
-	} else {
-		h.log.Error().Err(fetchErr).Str("key", key).Msg("Unhandled revalidation fetch error. Returning 500.")
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-	}
+	// 2. Кеш промахнулся, загружаем с апстрима.
+	log.Info("Cache miss, fetching from upstream")
+	app.fetchAndServe(w, r, key, upstreamURL, nil)
 }
 
-func (h *RepoHandler) handleCacheMiss(w http.ResponseWriter, r *http.Request,
-	key, upstreamURL string) {
-
-	fetchOpts := &fetch.Options{}
-	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
-		if t, errIMS := http.ParseTime(ims); errIMS == nil {
-			fetchOpts.IfModSince = t
-		}
+// serveFromCache отдает ответ, используя закешированные данные.
+func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key string, meta *cache.ItemMeta) {
+	if util.CheckConditional(w, r, meta.Headers) {
+		return // 304 Not Modified
 	}
-	if inm := r.Header.Get("If-None-Match"); inm != "" {
-		fetchOpts.IfNoneMatch = inm
-	}
-
-	fetchRes, fetchErr := h.fetcher.Fetch(r.Context(), key, upstreamURL, fetchOpts)
-	if fetchRes != nil && fetchRes.Body != nil {
-		defer fetchRes.Body.Close()
-	}
-
-	if fetchErr != nil {
-		h.handleFetchError(w, key, upstreamURL, fetchErr, fetchRes)
-		return
-	}
-
-	h.storeAndServe(w, r, key, upstreamURL, fetchRes)
-}
-
-func (h *RepoHandler) handleFetchError(w http.ResponseWriter, key, upstreamURL string, err error, fetchResOnError *fetch.Result) {
-	if errors.Is(err, fetch.ErrUpstreamNotModified) {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-	if errors.Is(err, fetch.ErrUpstreamNotFound) {
-		if h.cacheCfg.NegativeTTL.StdDuration() > 0 {
-			go func() {
-				var negativeHeaders http.Header
-				if fetchResOnError != nil && fetchResOnError.Header != nil {
-					negativeHeaders = fetchResOnError.Header
-				} else {
-					negativeHeaders = make(http.Header)
-				}
-				popts := cache.PutOptions{
-					UpstreamURL: upstreamURL,
-					StatusCode:  http.StatusNotFound,
-					Headers:     negativeHeaders,
-					FetchedAt:   time.Now(),
-					Size:        0,
-				}
-				if _, putErr := h.cm.Put(context.Background(), key, nil, popts); putErr != nil {
-					h.log.Warn().Err(putErr).Str("key", key).Msg("Failed to store negative cache entry for 404.")
-				} else {
-					h.log.Debug().Str("key", key).Msg("Stored negative cache entry for 404.")
-				}
-			}()
-		}
-		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
-		return
-	}
-
-	logCtx := h.log.Error().Err(err).Str("key", key).Str("upstreamURL", upstreamURL)
-	status := http.StatusBadGateway
-
-	if errors.Is(err, fetch.ErrNetwork) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		status = http.StatusGatewayTimeout
-	} else if fetchResOnError != nil && fetchResOnError.Status > 0 {
-		logCtx.Int("upstream_status", fetchResOnError.Status)
-	}
-
-	logCtx.Msg("Failed to fetch item from upstream on MISS.")
-	http.Error(w, http.StatusText(status), status)
-}
-
-func (h *RepoHandler) storeAndServe(w http.ResponseWriter, r *http.Request,
-	key, fetchedUpstreamURL string, fetchRes *fetch.Result) {
-
-	headers := util.CopyHeader(fetchRes.Header)
-
-	popts := cache.PutOptions{
-		UpstreamURL: fetchedUpstreamURL,
-		StatusCode:  fetchRes.Status,
-		Headers:     headers,
-		Size:        fetchRes.Size,
-		FetchedAt:   time.Now(),
-	}
-
-	if canonicalURL := fetchRes.Header.Get("X-Upstream-Url"); canonicalURL != "" {
-		popts.UpstreamURL = canonicalURL
-	} else if contentLoc := fetchRes.Header.Get("Content-Location"); contentLoc != "" {
-		resolvedContentLoc, err := util.ResolveURL(fetchedUpstreamURL, contentLoc)
-		if err == nil {
-			popts.UpstreamURL = resolvedContentLoc
-		} else {
-			h.log.Warn().Str("key", key).Str("base_url", fetchedUpstreamURL).Str("content_location", contentLoc).Err(err).Msg("Failed to resolve Content-Location, using original fetch URL for cache metadata.")
-		}
-	}
-
-	// ИСПРАВЛЕНО: Улучшена логика работы с io.Pipe для предотвращения deadlock.
-	pr, pw := io.Pipe()
-	var storeWg sync.WaitGroup
-	var putErrGlobal error
-	storeWg.Add(1)
-
-	go func() {
-		defer storeWg.Done()
-		_, putErrGlobal = h.cm.Put(context.Background(), key, pr, popts)
-	}()
-
-	teeBody := io.TeeReader(fetchRes.Body, pw)
-
-	if h.checkClientConditional(w, r, fetchRes.ModTime, fetchRes.Header.Get("ETag")) {
-		h.log.Debug().Str("key", key).Msg("Client conditional GET matched newly fetched resource (304). Discarding body, closing pipe to cache.")
-		_, _ = io.Copy(io.Discard, teeBody)
-		// Закрываем pw, чтобы cm.Put завершился с io.EOF
-		_ = pw.Close()
-		storeWg.Wait()
-		return
-	}
-
-	util.CopyWhitelistedHeaders(w.Header(), fetchRes.Header)
-	if !fetchRes.ModTime.IsZero() {
-		w.Header().Set("Last-Modified", fetchRes.ModTime.UTC().Format(http.TimeFormat))
-	}
-
-	var clientCopyError error
-	if r.Method == http.MethodHead {
-		if fetchRes.Size >= 0 {
-			w.Header().Set("Content-Length", strconv.FormatInt(fetchRes.Size, 10))
-		}
-		w.WriteHeader(fetchRes.Status)
-		_, clientCopyError = io.Copy(io.Discard, teeBody)
-	} else {
-		if fetchRes.Size >= 0 {
-			w.Header().Set("Content-Length", strconv.FormatInt(fetchRes.Size, 10))
-		} else {
-			w.Header().Del("Content-Length")
-		}
-		w.WriteHeader(fetchRes.Status)
-		_, clientCopyError = io.Copy(w, teeBody)
-	}
-
-	// Гарантированно закрываем PipeWriter после завершения копирования клиенту.
-	// Это разблокирует PipeReader в горутине кеширования.
-	if clientCopyError != nil {
-		if !util.IsClientDisconnectedError(clientCopyError) {
-			h.log.Error().Err(clientCopyError).Str("key", key).Msg("Error streaming response to client.")
-		}
-		_ = pw.CloseWithError(clientCopyError)
-	} else {
-		_ = pw.Close()
-	}
-
-	// Ждем, пока горутина с cm.Put точно завершится.
-	storeWg.Wait()
-
-	// Логируем ошибку из кеша, если она была.
-	if putErrGlobal != nil {
-		if !util.IsClientDisconnectedError(putErrGlobal) {
-			h.log.Error().Err(putErrGlobal).Str("key", key).Msg("Error storing item to cache.")
-		} else {
-			h.log.Debug().Err(putErrGlobal).Str("key", key).Msg("Cache Put failed due to client disconnect (pipe closed), as expected.")
-		}
-	}
-}
-
-func (h *RepoHandler) serveFromCache(w http.ResponseWriter, r *http.Request,
-	key, relPath string, meta *cache.ItemMeta) {
-
-	itemModTimeStr := meta.Headers.Get("Last-Modified")
-	var modTimeForCheck time.Time
-	if itemModTimeStr != "" {
-		if t, errLMP := http.ParseTime(itemModTimeStr); errLMP == nil {
-			modTimeForCheck = t
-		}
-	}
-
-	if h.checkClientConditional(w, r, modTimeForCheck, meta.Headers.Get("ETag")) {
-		h.log.Debug().Str("key", key).Msg("Serving 304 Not Modified from cache based on client conditionals.")
-		return
-	}
-
-	cacheReadRes, err := h.cm.GetWithOptions(r.Context(), key, cache.GetOptions{WithContent: true})
-	if err != nil || !cacheReadRes.Hit || cacheReadRes.Content == nil {
-		if errors.Is(err, cache.ErrNotFound) {
-			h.log.Warn().Err(err).Str("key", key).Msg("Cache item vanished before serving. Treating as miss.")
-			h.handleCacheMiss(w, r, key, meta.UpstreamURL)
-			return
-		}
-		h.log.Error().Err(err).Str("key", key).Msg("Failed to re-open cache item for serving. Treating as miss.")
-		h.handleCacheMiss(w, r, key, meta.UpstreamURL)
-		return
-	}
-	// ИСПРАВЛЕНО: Используем новый безопасный метод Close()
-	defer cacheReadRes.Close()
 
 	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
-	if !modTimeForCheck.IsZero() {
-		w.Header().Set("Last-Modified", modTimeForCheck.UTC().Format(http.TimeFormat))
-	}
+	w.Header().Set("X-Cache-Status", "HIT")
 
 	if r.Method == http.MethodHead {
-		if meta.Size >= 0 {
-			w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
-		}
 		w.WriteHeader(meta.StatusCode)
 		return
 	}
 
-	contentSeeker, isSeeker := cacheReadRes.Content.(io.ReadSeeker)
-	if isSeeker {
-		serveName := filepath.Base(relPath)
-		if serveName == "." || serveName == "/" || serveName == "" {
-			if relPath == "" {
-				serveName = "index"
-			} else {
-				serveName = "resource"
-			}
-		}
-		http.ServeContent(w, r, serveName, modTimeForCheck, contentSeeker)
-	} else {
-		if meta.Size >= 0 {
-			w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
-		} else {
-			w.Header().Del("Content-Length")
-		}
-		w.WriteHeader(meta.StatusCode)
-		if _, copyErr := io.Copy(w, cacheReadRes.Content); copyErr != nil {
-			if !util.IsClientDisconnectedError(copyErr) {
-				h.log.Error().Err(copyErr).Str("key", key).Msg("Error streaming non-seekable cache content to client.")
-			}
-		}
+	content, err := app.Cache.GetContent(r.Context(), key)
+	if err != nil {
+		app.Logger.Error("Failed to get content for cached metadata", "key", key, "error", err)
+		http.Error(w, "Cache content unavailable", http.StatusInternalServerError)
+		return
 	}
+	defer content.Close()
+
+	w.WriteHeader(meta.StatusCode)
+	io.Copy(w, content)
 }
 
-func (h *RepoHandler) checkClientConditional(w http.ResponseWriter, r *http.Request, resModTime time.Time, resETag string) bool {
-	if inm := r.Header.Get("If-None-Match"); inm != "" {
-		if util.CompareETags(inm, resETag) {
-			w.WriteHeader(http.StatusNotModified)
-			return true
+// fetchAndServe загружает данные с апстрима, отдает клиенту и кеширует.
+func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, key, upstreamURL string, revalMeta *cache.ItemMeta) {
+	opts := &fetch.Options{}
+	if revalMeta != nil {
+		opts.IfNoneMatch = revalMeta.Headers.Get("ETag")
+		if t, err := http.ParseTime(revalMeta.Headers.Get("Last-Modified")); err == nil {
+			opts.IfModSince = t
 		}
-		return false
 	}
 
-	if imsHdr := r.Header.Get("If-Modified-Since"); imsHdr != "" {
-		if t, errIMS := http.ParseTime(imsHdr); errIMS == nil {
-			if !resModTime.IsZero() {
-				if !resModTime.Truncate(time.Second).After(t.Truncate(time.Second)) {
-					w.WriteHeader(http.StatusNotModified)
-					return true
-				}
-			}
-		}
+	fetchRes, err := app.Fetcher.Fetch(r.Context(), key, upstreamURL, opts)
+	if fetchRes != nil && fetchRes.Body != nil {
+		defer fetchRes.Body.Close()
 	}
-	return false
+
+	if err != nil {
+		if errors.Is(err, fetch.ErrUpstreamNotModified) {
+			app.Logger.Info("Revalidation successful (304)", "key", key)
+			if revalMeta != nil {
+				revalMeta.ExpiresAt = util.CalculateFreshness(fetchRes.Header, time.Now(), app.Config.Cache.Overrides)
+				util.UpdateCacheHeaders(revalMeta.Headers, fetchRes.Header)
+				app.Cache.Put(r.Context(), key, revalMeta)
+				app.serveFromCache(w, r, key, revalMeta)
+			}
+			return
+		}
+		app.Logger.Warn("Failed to fetch from upstream", "key", key, "error", err)
+		http.Error(w, "Upstream fetch failed", http.StatusBadGateway)
+		return
+	}
+
+	if util.CheckConditional(w, r, fetchRes.Header) {
+		return
+	}
+
+	meta := &cache.ItemMeta{
+		Key:         key,
+		UpstreamURL: upstreamURL,
+		FetchedAt:   time.Now(),
+		StatusCode:  fetchRes.Status,
+		Headers:     util.CopyHeader(fetchRes.Header),
+		Size:        fetchRes.Size,
+		ExpiresAt:   util.CalculateFreshness(fetchRes.Header, time.Now(), app.Config.Cache.Overrides),
+	}
+
+	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
+	w.Header().Set("X-Cache-Status", "MISS")
+
+	if r.Method == http.MethodHead {
+		w.WriteHeader(meta.StatusCode)
+		app.Cache.Put(r.Context(), key, meta)
+		return
+	}
+
+	pr, pw := io.Pipe()
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		written, err := app.Cache.PutContent(context.Background(), key, pr)
+		if err != nil {
+			app.Logger.Error("Failed to write content to cache", "key", key, "error", err)
+			app.Cache.DeleteContent(context.Background(), key)
+		} else {
+			meta.Size = written
+			app.Cache.Put(context.Background(), key, meta)
+		}
+	}()
+
+	tee := io.TeeReader(fetchRes.Body, pw)
+	w.WriteHeader(meta.StatusCode)
+	_, copyErr := io.Copy(w, tee)
+
+	if copyErr != nil {
+		pw.CloseWithError(copyErr)
+	} else {
+		pw.Close()
+	}
+
+	wg.Wait()
+}
+
+// revalidate выполняет условный запрос к апстриму.
+func (app *Application) revalidate(w http.ResponseWriter, r *http.Request, key, upstreamURL string, currentMeta *cache.ItemMeta) {
+	app.fetchAndServe(w, r, key, upstreamURL, currentMeta)
+}
+
+func (app *Application) handleStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	var sb strings.Builder
+	sb.WriteString("OK\n")
+
+	if app.Config.Cache.Enabled {
+		stats := app.Cache.Stats()
+		fmt.Fprintf(&sb, "Cache Hits: %d\n", stats.Hits())
+		fmt.Fprintf(&sb, "Cache Misses: %d\n", stats.Misses())
+		fmt.Fprintf(&sb, "Cache Hit Ratio: %.2f\n", stats.Ratio())
+	} else {
+		sb.WriteString("Cache: Disabled\n")
+	}
+
+	w.Write([]byte(sb.String()))
 }
