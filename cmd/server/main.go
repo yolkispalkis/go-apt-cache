@@ -53,7 +53,8 @@ func run(ctx context.Context) error {
 	// 3. Инициализация зависимостей.
 	util.InitBufferPool(cfg.Cache.BufferSize, logger)
 
-	cacheManager, err := cache.NewManager(cfg.Cache, logger)
+	// ИСПРАВЛЕНО: Вызываем правильный конструктор cache.NewDiskLRU
+	cacheManager, err := cache.NewDiskLRU(cfg.Cache, logger)
 	if err != nil {
 		return fmt.Errorf("failed to initialize cache manager: %w", err)
 	}
@@ -61,7 +62,6 @@ func run(ctx context.Context) error {
 
 	fetchCoordinator := fetch.NewCoordinator(cfg.Server, logger)
 
-	// Создаем экземпляр Application из пакета server
 	app := server.NewApplication(cfg, logger, cacheManager, fetchCoordinator)
 
 	// 4. Создание и запуск HTTP-сервера.

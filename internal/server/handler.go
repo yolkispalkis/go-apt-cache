@@ -3,9 +3,9 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +30,7 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 	// 1. Проверка кеша метаданных.
 	meta, found := app.Cache.Get(r.Context(), key)
 	if found {
-		log.Debug().Msg("Cache hit for metadata")
+		log.Debug().Msg("Cache hit")
 		if meta.IsStale(time.Now()) || r.Header.Get("Cache-Control") == "no-cache" {
 			log.Info().Msg("Revalidating stale/no-cache item")
 			app.revalidate(w, r, key, upstreamURL, meta)
@@ -61,6 +61,12 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 
 	content, err := app.Cache.GetContent(r.Context(), key)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			app.Logger.Warn().Str("key", key).Msg("Metadata found, but content is missing. Refetching.")
+			app.Cache.Delete(context.Background(), key) // Удаляем "сломанную" запись
+			app.fetchAndServe(w, r, key, meta.UpstreamURL, nil)
+			return
+		}
 		app.Logger.Error().Err(err).Str("key", key).Msg("Failed to get content for cached metadata")
 		http.Error(w, "Cache content unavailable", http.StatusInternalServerError)
 		return
@@ -87,13 +93,18 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 	}
 
 	if err != nil {
+		// Если ревалидация вернула 304, это не ошибка, а успех.
 		if errors.Is(err, fetch.ErrUpstreamNotModified) {
 			app.Logger.Info().Str("key", key).Msg("Revalidation successful (304)")
 			if revalMeta != nil {
 				relPath := strings.TrimPrefix(key, revalMeta.UpstreamURL)
 				revalMeta.ExpiresAt = calculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides)
+				revalMeta.LastUsedAt = time.Now() // Обновляем время использования
 				util.UpdateCacheHeaders(revalMeta.Headers, fetchRes.Header)
-				app.Cache.Put(r.Context(), key, revalMeta)
+				// Сохраняем обновленные метаданные
+				if err := app.Cache.Put(r.Context(), revalMeta); err != nil {
+					app.Logger.Error().Err(err).Str("key", key).Msg("Failed to update metadata after 304")
+				}
 				app.serveFromCache(w, r, key, revalMeta)
 			}
 			return
@@ -108,25 +119,31 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 	}
 
 	relPath := strings.TrimPrefix(key, chi.URLParam(r, "repoName")+"/")
+	now := time.Now()
 	meta := &cache.ItemMeta{
 		Key:         key,
 		UpstreamURL: upstreamURL,
-		FetchedAt:   time.Now(),
+		FetchedAt:   now,
+		LastUsedAt:  now,
 		StatusCode:  fetchRes.Status,
 		Headers:     util.CopyHeader(fetchRes.Header),
 		Size:        fetchRes.Size,
-		ExpiresAt:   calculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides),
+		ExpiresAt:   calculateFreshness(fetchRes.Header, now, relPath, app.Config.Cache.Overrides),
 	}
 
 	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
 	w.Header().Set("X-Cache-Status", "MISS")
 
+	// Если HEAD, просто сохраняем метаданные и выходим
 	if r.Method == http.MethodHead {
 		w.WriteHeader(meta.StatusCode)
-		app.Cache.Put(r.Context(), key, meta)
+		if err := app.Cache.Put(r.Context(), meta); err != nil {
+			app.Logger.Error().Err(err).Str("key", key).Msg("Failed to save metadata for HEAD request")
+		}
 		return
 	}
 
+	// Используем io.Pipe для одновременной отдачи и записи
 	pr, pw := io.Pipe()
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -136,10 +153,14 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 		written, err := app.Cache.PutContent(context.Background(), key, pr)
 		if err != nil {
 			app.Logger.Error().Err(err).Str("key", key).Msg("Failed to write content to cache")
-			app.Cache.DeleteContent(context.Background(), key)
+			// Удаляем "сломанную" запись, если она была создана
+			app.Cache.Delete(context.Background(), key)
 		} else {
+			// После успешной записи контента, сохраняем метаданные
 			meta.Size = written
-			app.Cache.Put(context.Background(), key, meta)
+			if err := app.Cache.Put(context.Background(), meta); err != nil {
+				app.Logger.Error().Err(err).Str("key", key).Msg("Failed to save metadata after content write")
+			}
 		}
 	}()
 
@@ -166,17 +187,10 @@ func (app *Application) handleStatus(w http.ResponseWriter, r *http.Request) {
 	var sb strings.Builder
 	sb.WriteString("OK\n")
 
-	if app.Config.Cache.Enabled {
-		// ИСПРАВЛЕНО: работаем с указателем на метрики
-		stats := app.Cache.Stats()
-		if stats != nil {
-			fmt.Fprintf(&sb, "Cache Hits: %d\n", stats.Hits())
-			fmt.Fprintf(&sb, "Cache Misses: %d\n", stats.Misses())
-			fmt.Fprintf(&sb, "Cache Hit Ratio: %.2f\n", stats.Ratio())
-		}
-	} else {
-		sb.WriteString("Cache: Disabled\n")
-	}
+	// Статус теперь нужно запрашивать у конкретной реализации кеша,
+	// так как интерфейс Manager больше не имеет метода Stats().
+	// Это можно будет добавить позже, если потребуется.
+	sb.WriteString("Cache status endpoint is active.\n")
 
 	w.Write([]byte(sb.String()))
 }
