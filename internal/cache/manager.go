@@ -11,7 +11,6 @@ import (
 	"github.com/dgraph-io/ristretto"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
-	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
 // ItemMeta хранит метаданные о кешированном объекте.
@@ -39,7 +38,6 @@ type Manager interface {
 	PutContent(ctx context.Context, key string, r io.Reader) (int64, error)
 	DeleteContent(ctx context.Context, key string) error
 	Close()
-	// ИСПРАВЛЕНО: Возвращаем указатель, чтобы не копировать мьютекс.
 	Stats() *ristretto.Metrics
 }
 
@@ -59,27 +57,18 @@ func NewManager(cfg config.CacheConfig, logger *logging.Logger) (Manager, error)
 
 	log := logger.WithComponent("cacheManager")
 
-	maxSizeBytes, err := util.ParseSize(cfg.MaxSize)
-	if err != nil {
-		return nil, fmt.Errorf("invalid cache max size: %w", err)
-	}
-
-	numCounters := maxSizeBytes / 1024
-	if numCounters < 1000 {
-		numCounters = 1000
-	}
-
 	memCache, err := ristretto.NewCache(&ristretto.Config{
-		NumCounters: numCounters * 10,
-		MaxCost:     1 << 30,
+		NumCounters: 1e7,     // 10M
+		MaxCost:     1 << 30, // 1GB
 		BufferItems: 64,
-		Metrics:     true, // Включаем сбор метрик
+		Metrics:     true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create in-memory cache: %w", err)
 	}
 
-	diskStore, err := newDiskStore(cfg.Dir, log)
+	// ИСПРАВЛЕНО: Передаем maxSize в diskStore
+	diskStore, err := newDiskStore(cfg.Dir, cfg.MaxSize, log)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create disk store: %w", err)
 	}
@@ -130,7 +119,7 @@ func (m *cacheManager) GetContent(ctx context.Context, key string) (io.ReadClose
 
 // PutContent сохраняет контент на диск.
 func (m *cacheManager) PutContent(ctx context.Context, key string, r io.Reader) (int64, error) {
-	// TODO: Реализовать логику вытеснения (eviction) на основе LRU или другого критерия, если размер диска превышен.
+	// Логика вытеснения теперь внутри diskStore.Put
 	return m.diskStore.Put(key, r)
 }
 
@@ -144,9 +133,7 @@ func (m *cacheManager) Close() {
 	m.log.Info().Msg("Cache manager closed.")
 }
 
-// Stats возвращает метрики кеша в памяти.
 func (m *cacheManager) Stats() *ristretto.Metrics {
-	// ИСПРАВЛЕНО: Возвращаем указатель.
 	return m.memCache.Metrics
 }
 
