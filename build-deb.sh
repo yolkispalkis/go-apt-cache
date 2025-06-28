@@ -176,8 +176,8 @@ create_conffiles() {
 
 build_package() {
     echo "--- Building .deb package ---"
-    fakeroot dpkg-deb --build "${STAGE_DIR}" "${BUILD_DIR}"
-    mv "${BUILD_DIR}/staging.deb" "${BUILD_DIR}/${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.deb"
+    local output_file="${BUILD_DIR}/${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.deb"
+    fakeroot dpkg-deb --build "${STAGE_DIR}" "${output_file}"
 }
 
 main() {
