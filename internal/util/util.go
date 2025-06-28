@@ -194,12 +194,12 @@ func CompareETags(clientETagsStr, resourceETag string) bool {
 	return false
 }
 
-func CalculateFreshness(headers http.Header, responseTime time.Time, overrides []config.CacheOverride) time.Time {
+// CalculateFreshness вычисляет время жизни кеша на основе HTTP-заголовков и правил.
+func CalculateFreshness(headers http.Header, responseTime time.Time, relPath string, overrides []config.CacheOverride) time.Time {
 	// 1. Проверяем правила переопределения из конфига.
-	// TODO: Передавать сюда relPath для проверки. Для простоты пока опускаем.
-	// if overrideTTL, ok := findOverrideTTL(relPath, overrides); ok {
-	// 	return responseTime.Add(overrideTTL)
-	// }
+	if overrideTTL, ok := findOverrideTTL(relPath, overrides); ok {
+		return responseTime.Add(overrideTTL)
+	}
 
 	// 2. Используем стандартную логику кеширования HTTP (RFC 9111).
 	cc := ParseCacheControl(headers.Get("Cache-Control"))

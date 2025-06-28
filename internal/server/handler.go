@@ -88,7 +88,8 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 		if errors.Is(err, fetch.ErrUpstreamNotModified) {
 			app.Logger.Info("Revalidation successful (304)", "key", key)
 			if revalMeta != nil {
-				revalMeta.ExpiresAt = util.CalculateFreshness(fetchRes.Header, time.Now(), app.Config.Cache.Overrides)
+				relPath := strings.TrimPrefix(key, revalMeta.Key)
+				revalMeta.ExpiresAt = util.CalculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides)
 				util.UpdateCacheHeaders(revalMeta.Headers, fetchRes.Header)
 				app.Cache.Put(r.Context(), key, revalMeta)
 				app.serveFromCache(w, r, key, revalMeta)
@@ -104,6 +105,7 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 		return
 	}
 
+	relPath := strings.TrimPrefix(key, chi.URLParam(r, "repoName")+"/")
 	meta := &cache.ItemMeta{
 		Key:         key,
 		UpstreamURL: upstreamURL,
@@ -111,7 +113,7 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 		StatusCode:  fetchRes.Status,
 		Headers:     util.CopyHeader(fetchRes.Header),
 		Size:        fetchRes.Size,
-		ExpiresAt:   util.CalculateFreshness(fetchRes.Header, time.Now(), app.Config.Cache.Overrides),
+		ExpiresAt:   util.CalculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides),
 	}
 
 	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)

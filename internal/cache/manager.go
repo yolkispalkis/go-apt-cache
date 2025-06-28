@@ -131,7 +131,8 @@ func (m *cacheManager) GetContent(ctx context.Context, key string) (io.ReadClose
 
 // PutContent сохраняет контент на диск.
 func (m *cacheManager) PutContent(ctx context.Context, key string, r io.Reader) (int64, error) {
-	// TODO: Реализовать логику вытеснения (eviction) на основе LRU или другого критерия, если размер диска превышен.
+	// TODO: Реализовать логику вытеснения (eviction) на основе LRU или другого критерия,
+	// если размер диска превышен. Это критически важно для долгосрочной работы.
 	return m.diskStore.Put(key, r)
 }
 
@@ -145,8 +146,10 @@ func (m *cacheManager) Close() {
 	m.log.Info("Cache manager closed.")
 }
 
+// Stats возвращает метрики кеша в памяти.
 func (m *cacheManager) Stats() ristretto.Metrics {
-	return *m.memCache.Metrics
+	// ИСПРАВЛЕНО: Ristretto возвращает метрики по значению, а не по указателю.
+	return m.memCache.Metrics
 }
 
 // noopManager - заглушка для случая, когда кеш отключен.
