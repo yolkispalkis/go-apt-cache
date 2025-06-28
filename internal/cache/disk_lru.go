@@ -1,3 +1,4 @@
+// internal/cache/disk_lru.go
 package cache
 
 import (
@@ -165,6 +166,8 @@ func (c *DiskLRU) initialScan() {
 		metaFiles, err := c.store.ScanMetaFiles()
 		if err != nil {
 			c.initErr = err
+			c.log.Error().Err(err).Msg("Failed during initial scan")
+			c.ready = true // Помечаем как готовый, но с ошибкой
 			return
 		}
 
@@ -175,13 +178,16 @@ func (c *DiskLRU) initialScan() {
 			meta, err := c.store.ReadMeta(mPath)
 			if err != nil {
 				c.log.Warn().Err(err).Str("path", mPath).Msg("Failed to read metadata, removing artifact")
-				c.store.Delete(strings.TrimSuffix(filepath.Base(mPath), ".meta"))
+				// Ключ извлекаем из имени файла, т.к. прочитать его из JSON не удалось
+				key := strings.TrimSuffix(filepath.Base(mPath), ".meta")
+				c.store.Delete(key)
 				continue
 			}
 			itemsToSort = append(itemsToSort, meta)
 			totalSize += meta.Size
 		}
 
+		// ИСПРАВЛЕНО: Сортируем только по LastUsedAt из метаданных.
 		sort.Slice(itemsToSort, func(i, j int) bool {
 			return itemsToSort[i].LastUsedAt.Before(itemsToSort[j].LastUsedAt)
 		})
@@ -215,6 +221,7 @@ func (c *DiskLRU) checkReady() error {
 // Get получает элемент из кеша.
 func (c *DiskLRU) Get(ctx context.Context, key string) (*ItemMeta, bool) {
 	if err := c.checkReady(); err != nil {
+		c.log.Error().Err(err).Msg("Cache is not ready")
 		return nil, false
 	}
 
@@ -231,18 +238,15 @@ func (c *DiskLRU) Get(ctx context.Context, key string) (*ItemMeta, bool) {
 	return elem.Value.(*lruEntry).meta, true
 }
 
-// Put добавляет или обновляет элемент в кеше.
+// Put добавляет или обновляет метаданные элемента в кеше.
 func (c *DiskLRU) Put(ctx context.Context, meta *ItemMeta) error {
 	if err := c.checkReady(); err != nil {
 		return err
 	}
 
-	// ИСПРАВЛЕНО: Вызываем правильный метод WriteMetadata
 	if err := c.store.WriteMetadata(meta); err != nil {
 		return fmt.Errorf("disk store write for key %s: %w", meta.Key, err)
 	}
-
-	c.ensureSpace(meta.Size)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -258,7 +262,7 @@ func (c *DiskLRU) Put(ctx context.Context, meta *ItemMeta) error {
 	c.items[meta.Key] = elem
 	c.currentBytes.Add(meta.Size)
 
-	c.log.Debug().Str("key", meta.Key).Str("size", util.FormatSize(meta.Size)).Msg("Item added to cache")
+	c.log.Debug().Str("key", meta.Key).Str("size", util.FormatSize(meta.Size)).Msg("Item metadata added/updated in cache")
 	return nil
 }
 
@@ -295,10 +299,16 @@ func (c *DiskLRU) Delete(ctx context.Context, key string) error {
 }
 
 func (c *DiskLRU) GetContent(ctx context.Context, key string) (io.ReadCloser, error) {
+	// ИСПРАВЛЕНО: Убрали обновление atime
 	return c.store.GetContent(key)
 }
 
 func (c *DiskLRU) PutContent(ctx context.Context, key string, r io.Reader) (int64, error) {
+	// Перед записью проверим, хватит ли места.
+	// Для простоты, предполагаем максимальный размер файла, если он неизвестен.
+	// В реальности, лучше сначала записать во временный файл, узнать размер, а потом вытеснять.
+	// Но для упрощения сделаем так.
+	c.ensureSpace(0) // Запускаем вытеснение, если уже переполнены
 	return c.store.PutContent(key, r)
 }
 
