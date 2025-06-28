@@ -3,7 +3,7 @@ set -e
 
 # --- Конфигурация сборки ---
 PKG_NAME="go-apt-cache"
-PKG_VERSION="3.0.0"
+PKG_VERSION="3.0.1"
 PKG_ARCH="amd64"
 PKG_MAINTAINER="yolkispalkis <me@w3h.su>"
 PKG_DESCRIPTION="A high-performance caching proxy for APT repositories, written in Go."
@@ -50,14 +50,18 @@ create_config() {
 
 create_systemd_service() {
     echo "--- Creating systemd service file ---"
+    # ИСПРАВЛЕНО: Определяем пути, которые будут в целевой системе
+    local exec_path="/usr/local/bin/${PKG_NAME}"
+    local config_path="/etc/${PKG_NAME}/config.json"
+
     cat >"${SYSTEMD_DIR}/${PKG_NAME}.service" <<EOF
 [Unit]
 Description=Go APT Cache Service
-Documentation=https://github.com/${APP_MAIN_PACKAGE}
+Documentation=https://${APP_MAIN_PACKAGE}
 After=network.target
 
 [Service]
-ExecStart=${BIN_DIR}/${PKG_NAME} -config ${CONFIG_DIR}/config.json
+ExecStart=${exec_path} -config ${config_path}
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 EnvironmentFile=-/etc/environment
@@ -160,7 +164,7 @@ Installed-Size: ${INSTALLED_SIZE}
 Depends: adduser, systemd
 Section: net
 Priority: optional
-Homepage: https://github.com/${APP_MAIN_PACKAGE}
+Homepage: https://${APP_MAIN_PACKAGE}
 Description: ${PKG_DESCRIPTION}
  A modern, high-performance caching proxy for APT repositories, designed
  for speed and efficiency. It helps to significantly speed up package
