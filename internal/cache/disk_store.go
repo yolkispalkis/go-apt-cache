@@ -73,17 +73,33 @@ func (ds *diskStore) PutContent(key string, r io.Reader) (int64, error) {
 	return written, os.Rename(tmpFile.Name(), path)
 }
 
+// WriteMetadata теперь основной метод для записи метаданных.
 func (ds *diskStore) WriteMetadata(meta *ItemMeta) error {
 	path := ds.keyToPath(meta.Key, metaSuffix)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return err
 	}
-	data, err := json.Marshal(meta)
+	// Атомарная запись через временный файл
+	tmpFile, err := os.CreateTemp(dir, "temp-meta-")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	defer os.Remove(tmpFile.Name())
+
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		tmpFile.Close()
+		return err
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpFile.Name(), path)
 }
 
 func (ds *diskStore) ReadMeta(path string) (*ItemMeta, error) {

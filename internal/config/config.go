@@ -50,6 +50,7 @@ type CacheConfig struct {
 	CleanOnStart bool            `koanf:"cleanOnStart"`
 	BufferSize   string          `koanf:"bufferSize"`
 	Overrides    []CacheOverride `koanf:"overrides"`
+	NegativeTTL  time.Duration   `koanf:"negativeCacheTTL"`
 }
 
 type Config struct {
@@ -78,6 +79,7 @@ func Default() *Config {
 			Enabled:      true,
 			CleanOnStart: false,
 			BufferSize:   "64KB",
+			NegativeTTL:  5 * time.Minute,
 			Overrides: []CacheOverride{
 				{PathPattern: "dists/**/InRelease", TTL: 5 * time.Minute},
 				{PathPattern: "dists/**/Release", TTL: 5 * time.Minute},
