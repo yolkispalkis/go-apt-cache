@@ -21,14 +21,14 @@ func (app *Application) logRequest(next http.Handler) http.Handler {
 		ww := util.NewResponseWriterInterceptor(w)
 		next.ServeHTTP(ww, r)
 
-		app.Logger.Info("Request handled",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", ww.Status(),
-			"bytes", ww.BytesWritten(),
-			"duration", time.Since(start),
-			"remote_addr", r.RemoteAddr,
-		)
+		app.Logger.Info().
+			Str("method", r.Method).
+			Str("path", r.URL.Path).
+			Int("status", ww.Status()).
+			Int64("bytes", ww.BytesWritten()).
+			Dur("duration", time.Since(start)).
+			Str("remote_addr", r.RemoteAddr).
+			Msg("Request handled")
 	})
 }
 
@@ -38,7 +38,10 @@ func (app *Application) recoverPanic(next http.Handler) http.Handler {
 		defer func() {
 			if err := recover(); err != nil {
 				w.Header().Set("Connection", "close")
-				app.Logger.Error("Panic recovered", "error", err, "stack", string(debug.Stack()))
+				app.Logger.Error().
+					Interface("panic", err).
+					Bytes("stack", debug.Stack()).
+					Msg("Panic recovered")
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			}
 		}()

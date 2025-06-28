@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/go-chi/chi/v5"
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
@@ -23,14 +25,14 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 	relPath := chi.URLParam(r, "*")
 	key := repo.Name + "/" + relPath
 	upstreamURL := repo.URL + relPath
-	log := app.Logger.With("key", key, "repo", repo.Name)
+	log := app.Logger.With().Str("key", key).Str("repo", repo.Name).Logger()
 
 	// 1. Проверка кеша метаданных.
 	meta, found := app.Cache.Get(r.Context(), key)
 	if found {
-		log.Debug("Cache hit for metadata")
+		log.Debug().Msg("Cache hit for metadata")
 		if meta.IsStale(time.Now()) || r.Header.Get("Cache-Control") == "no-cache" {
-			log.Info("Revalidating stale/no-cache item")
+			log.Info().Msg("Revalidating stale/no-cache item")
 			app.revalidate(w, r, key, upstreamURL, meta)
 		} else {
 			app.serveFromCache(w, r, key, meta)
@@ -39,7 +41,7 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 	}
 
 	// 2. Кеш промахнулся, загружаем с апстрима.
-	log.Info("Cache miss, fetching from upstream")
+	log.Info().Msg("Cache miss, fetching from upstream")
 	app.fetchAndServe(w, r, key, upstreamURL, nil)
 }
 
@@ -59,7 +61,7 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 
 	content, err := app.Cache.GetContent(r.Context(), key)
 	if err != nil {
-		app.Logger.Error("Failed to get content for cached metadata", "key", key, "error", err)
+		app.Logger.Error().Err(err).Str("key", key).Msg("Failed to get content for cached metadata")
 		http.Error(w, "Cache content unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -86,17 +88,17 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 
 	if err != nil {
 		if errors.Is(err, fetch.ErrUpstreamNotModified) {
-			app.Logger.Info("Revalidation successful (304)", "key", key)
+			app.Logger.Info().Str("key", key).Msg("Revalidation successful (304)")
 			if revalMeta != nil {
-				relPath := strings.TrimPrefix(key, revalMeta.Key)
-				revalMeta.ExpiresAt = util.CalculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides)
+				relPath := strings.TrimPrefix(key, revalMeta.UpstreamURL)
+				revalMeta.ExpiresAt = calculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides)
 				util.UpdateCacheHeaders(revalMeta.Headers, fetchRes.Header)
 				app.Cache.Put(r.Context(), key, revalMeta)
 				app.serveFromCache(w, r, key, revalMeta)
 			}
 			return
 		}
-		app.Logger.Warn("Failed to fetch from upstream", "key", key, "error", err)
+		app.Logger.Warn().Err(err).Str("key", key).Msg("Failed to fetch from upstream")
 		http.Error(w, "Upstream fetch failed", http.StatusBadGateway)
 		return
 	}
@@ -113,7 +115,7 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 		StatusCode:  fetchRes.Status,
 		Headers:     util.CopyHeader(fetchRes.Header),
 		Size:        fetchRes.Size,
-		ExpiresAt:   util.CalculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides),
+		ExpiresAt:   calculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides),
 	}
 
 	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
@@ -133,7 +135,7 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 		defer wg.Done()
 		written, err := app.Cache.PutContent(context.Background(), key, pr)
 		if err != nil {
-			app.Logger.Error("Failed to write content to cache", "key", key, "error", err)
+			app.Logger.Error().Err(err).Str("key", key).Msg("Failed to write content to cache")
 			app.Cache.DeleteContent(context.Background(), key)
 		} else {
 			meta.Size = written
@@ -165,13 +167,68 @@ func (app *Application) handleStatus(w http.ResponseWriter, r *http.Request) {
 	sb.WriteString("OK\n")
 
 	if app.Config.Cache.Enabled {
+		// ИСПРАВЛЕНО: работаем с указателем на метрики
 		stats := app.Cache.Stats()
-		fmt.Fprintf(&sb, "Cache Hits: %d\n", stats.Hits())
-		fmt.Fprintf(&sb, "Cache Misses: %d\n", stats.Misses())
-		fmt.Fprintf(&sb, "Cache Hit Ratio: %.2f\n", stats.Ratio())
+		if stats != nil {
+			fmt.Fprintf(&sb, "Cache Hits: %d\n", stats.Hits())
+			fmt.Fprintf(&sb, "Cache Misses: %d\n", stats.Misses())
+			fmt.Fprintf(&sb, "Cache Hit Ratio: %.2f\n", stats.Ratio())
+		}
 	} else {
 		sb.WriteString("Cache: Disabled\n")
 	}
 
 	w.Write([]byte(sb.String()))
+}
+
+// --- Логика вычисления свежести ---
+
+func calculateFreshness(headers http.Header, responseTime time.Time, relPath string, overrides []config.CacheOverride) time.Time {
+	if overrideTTL, ok := findOverrideTTL(relPath, overrides); ok {
+		return responseTime.Add(overrideTTL)
+	}
+
+	cc := util.ParseCacheControl(headers.Get("Cache-Control"))
+
+	if _, ok := cc["no-store"]; ok {
+		return time.Time{}
+	}
+	if _, ok := cc["no-cache"]; ok {
+		return responseTime
+	}
+
+	var lifetime time.Duration
+	if sMaxAge, ok := cc["s-maxage"]; ok {
+		if sec, err := strconv.ParseInt(sMaxAge, 10, 64); err == nil {
+			lifetime = time.Duration(sec) * time.Second
+		}
+	} else if maxAge, ok := cc["max-age"]; ok {
+		if sec, err := strconv.ParseInt(maxAge, 10, 64); err == nil {
+			lifetime = time.Duration(sec) * time.Second
+		}
+	} else if expiresStr := headers.Get("Expires"); expiresStr != "" {
+		if expires, err := http.ParseTime(expiresStr); err == nil {
+			lifetime = expires.Sub(responseTime)
+		}
+	} else if lmStr := headers.Get("Last-Modified"); lmStr != "" {
+		if lm, err := http.ParseTime(lmStr); err == nil {
+			lifetime = responseTime.Sub(lm) / 10
+		}
+	}
+
+	if lifetime < 0 {
+		lifetime = 0
+	}
+
+	return responseTime.Add(lifetime)
+}
+
+func findOverrideTTL(relPath string, overrides []config.CacheOverride) (time.Duration, bool) {
+	for _, rule := range overrides {
+		matched, err := doublestar.Match(rule.PathPattern, relPath)
+		if err == nil && matched {
+			return rule.TTL, true
+		}
+	}
+	return 0, false
 }

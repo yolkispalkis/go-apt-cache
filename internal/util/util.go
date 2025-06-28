@@ -12,10 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/bmatcuk/doublestar/v4"
-	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 )
 
@@ -37,12 +34,18 @@ var bufferPool = sync.Pool{New: func() any { return make([]byte, bufferPoolSize)
 func InitBufferPool(sizeStr string, log *logging.Logger) {
 	size, err := ParseSize(sizeStr)
 	if err != nil || size <= 0 {
-		log.Warn("Invalid bufferSize, using default.", "configured_size", sizeStr, "default_size", bufferPoolSize, "error", err)
+		// Исправлено: вызов логгера
+		log.Warn().
+			Str("configured_size", sizeStr).
+			Int64("default_size", bufferPoolSize).
+			Err(err).
+			Msg("Invalid bufferSize, using default.")
 		return
 	}
 	bufferPoolSize = size
 	bufferPool = sync.Pool{New: func() any { return make([]byte, bufferPoolSize) }}
-	log.Info("Buffer pool initialized with configured size", "size", FormatSize(bufferPoolSize))
+	// Исправлено: вызов логгера
+	log.Info().Str("size", FormatSize(bufferPoolSize)).Msg("Buffer pool initialized with configured size")
 }
 
 func MustParseSize(s string) int64 {
@@ -192,59 +195,6 @@ func CompareETags(clientETagsStr, resourceETag string) bool {
 		}
 	}
 	return false
-}
-
-// CalculateFreshness вычисляет время жизни кеша на основе HTTP-заголовков и правил.
-func CalculateFreshness(headers http.Header, responseTime time.Time, relPath string, overrides []config.CacheOverride) time.Time {
-	// 1. Проверяем правила переопределения из конфига.
-	if overrideTTL, ok := findOverrideTTL(relPath, overrides); ok {
-		return responseTime.Add(overrideTTL)
-	}
-
-	// 2. Используем стандартную логику кеширования HTTP (RFC 9111).
-	cc := ParseCacheControl(headers.Get("Cache-Control"))
-
-	if _, ok := cc["no-store"]; ok {
-		return time.Time{} // Не кешировать
-	}
-	if _, ok := cc["no-cache"]; ok {
-		return responseTime // Требует ревалидации
-	}
-
-	var lifetime time.Duration
-	if sMaxAge, ok := cc["s-maxage"]; ok {
-		if sec, err := strconv.ParseInt(sMaxAge, 10, 64); err == nil {
-			lifetime = time.Duration(sec) * time.Second
-		}
-	} else if maxAge, ok := cc["max-age"]; ok {
-		if sec, err := strconv.ParseInt(maxAge, 10, 64); err == nil {
-			lifetime = time.Duration(sec) * time.Second
-		}
-	} else if expiresStr := headers.Get("Expires"); expiresStr != "" {
-		if expires, err := http.ParseTime(expiresStr); err == nil {
-			lifetime = expires.Sub(responseTime)
-		}
-	} else if lmStr := headers.Get("Last-Modified"); lmStr != "" {
-		if lm, err := http.ParseTime(lmStr); err == nil {
-			lifetime = responseTime.Sub(lm) / 10 // Эвристика: 10%
-		}
-	}
-
-	if lifetime < 0 {
-		lifetime = 0
-	}
-
-	return responseTime.Add(lifetime)
-}
-
-func findOverrideTTL(relPath string, overrides []config.CacheOverride) (time.Duration, bool) {
-	for _, rule := range overrides {
-		matched, err := doublestar.Match(rule.PathPattern, relPath)
-		if err == nil && matched {
-			return rule.TTL, true
-		}
-	}
-	return 0, false
 }
 
 // ResponseWriterInterceptor для перехвата статуса и размера ответа.

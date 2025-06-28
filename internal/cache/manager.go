@@ -39,7 +39,8 @@ type Manager interface {
 	PutContent(ctx context.Context, key string, r io.Reader) (int64, error)
 	DeleteContent(ctx context.Context, key string) error
 	Close()
-	Stats() ristretto.Metrics
+	// ИСПРАВЛЕНО: Возвращаем указатель, чтобы не копировать мьютекс.
+	Stats() *ristretto.Metrics
 }
 
 // cacheManager координирует работу кеша метаданных в памяти и дискового кеша для файлов.
@@ -63,17 +64,16 @@ func NewManager(cfg config.CacheConfig, logger *logging.Logger) (Manager, error)
 		return nil, fmt.Errorf("invalid cache max size: %w", err)
 	}
 
-	// Ristretto требует оценки максимального количества ключей.
-	// Предположим, что средний размер метаданных ~1KB.
 	numCounters := maxSizeBytes / 1024
 	if numCounters < 1000 {
 		numCounters = 1000
 	}
 
 	memCache, err := ristretto.NewCache(&ristretto.Config{
-		NumCounters: numCounters * 10, // Рекомендация Ristretto
-		MaxCost:     1 << 30,          // 1GB - максимальный "вес" кеша, мы не используем его для ограничения.
+		NumCounters: numCounters * 10,
+		MaxCost:     1 << 30,
 		BufferItems: 64,
+		Metrics:     true, // Включаем сбор метрик
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create in-memory cache: %w", err)
@@ -84,7 +84,7 @@ func NewManager(cfg config.CacheConfig, logger *logging.Logger) (Manager, error)
 		return nil, fmt.Errorf("failed to create disk store: %w", err)
 	}
 
-	log.Info("Cache manager initialized", "dir", cfg.Dir, "max_size", cfg.MaxSize)
+	log.Info().Str("dir", cfg.Dir).Str("max_size", cfg.MaxSize).Msg("Cache manager initialized")
 
 	return &cacheManager{
 		cfg:       cfg,
@@ -102,7 +102,7 @@ func (m *cacheManager) Get(ctx context.Context, key string) (*ItemMeta, bool) {
 	}
 	meta, ok := value.(*ItemMeta)
 	if !ok {
-		m.log.Warn("Invalid type in memory cache, deleting", "key", key)
+		m.log.Warn().Str("key", key).Msg("Invalid type in memory cache, deleting")
 		m.memCache.Del(key)
 		return nil, false
 	}
@@ -113,7 +113,6 @@ func (m *cacheManager) Get(ctx context.Context, key string) (*ItemMeta, bool) {
 func (m *cacheManager) Put(ctx context.Context, key string, meta *ItemMeta) {
 	ttl := time.Until(meta.ExpiresAt)
 	if ttl <= 0 {
-		// Не кешируем уже протухшие элементы в памяти
 		return
 	}
 	m.memCache.SetWithTTL(key, meta, 1, ttl)
@@ -131,8 +130,7 @@ func (m *cacheManager) GetContent(ctx context.Context, key string) (io.ReadClose
 
 // PutContent сохраняет контент на диск.
 func (m *cacheManager) PutContent(ctx context.Context, key string, r io.Reader) (int64, error) {
-	// TODO: Реализовать логику вытеснения (eviction) на основе LRU или другого критерия,
-	// если размер диска превышен. Это критически важно для долгосрочной работы.
+	// TODO: Реализовать логику вытеснения (eviction) на основе LRU или другого критерия, если размер диска превышен.
 	return m.diskStore.Put(key, r)
 }
 
@@ -143,12 +141,12 @@ func (m *cacheManager) DeleteContent(ctx context.Context, key string) error {
 
 func (m *cacheManager) Close() {
 	m.memCache.Close()
-	m.log.Info("Cache manager closed.")
+	m.log.Info().Msg("Cache manager closed.")
 }
 
 // Stats возвращает метрики кеша в памяти.
-func (m *cacheManager) Stats() ristretto.Metrics {
-	// ИСПРАВЛЕНО: Ristretto возвращает метрики по значению, а не по указателю.
+func (m *cacheManager) Stats() *ristretto.Metrics {
+	// ИСПРАВЛЕНО: Возвращаем указатель.
 	return m.memCache.Metrics
 }
 
@@ -166,4 +164,4 @@ func (n *noopManager) PutContent(ctx context.Context, key string, r io.Reader) (
 }
 func (n *noopManager) DeleteContent(ctx context.Context, key string) error { return nil }
 func (n *noopManager) Close()                                              {}
-func (n *noopManager) Stats() ristretto.Metrics                            { return ristretto.Metrics{} }
+func (n *noopManager) Stats() *ristretto.Metrics                           { return &ristretto.Metrics{} }

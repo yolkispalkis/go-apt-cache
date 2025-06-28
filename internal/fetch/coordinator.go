@@ -82,12 +82,14 @@ func NewCoordinator(cfg config.ServerConfig, logger *logging.Logger) *Coordinato
 
 func (c *Coordinator) Fetch(ctx context.Context, key, upstreamURL string, opts *Options) (*Result, error) {
 	resInterface, err, shared := c.sfGroup.Do(key, func() (any, error) {
-		c.log.Debug("Executing actual fetch", "key", key)
+		// Исправлено: вызов логгера
+		c.log.Debug().Str("key", key).Msg("Executing actual fetch")
 		return c.doFetch(ctx, upstreamURL, opts)
 	})
 
 	if shared {
-		c.log.Debug("Shared fetch result", "key", key)
+		// Исправлено: вызов логгера
+		c.log.Debug().Str("key", key).Msg("Shared fetch result")
 	}
 
 	if err != nil {
@@ -166,15 +168,18 @@ func logProxyInfo(logger *logging.Logger) {
 		reqURL, _ := url.Parse(fmt.Sprintf("%s://example.com", scheme))
 		proxyURL, err := http.ProxyFromEnvironment(&http.Request{URL: reqURL})
 		if err != nil {
-			logger.Error("Error getting proxy from environment", "scheme", scheme, "error", err)
+			// Исправлено: вызов логгера
+			logger.Error().Err(err).Str("scheme", scheme).Msg("Error getting proxy from environment")
 			continue
 		}
 		if proxyURL != nil {
 			safeProxyURL := *proxyURL
 			safeProxyURL.User = nil
-			logger.Info("System proxy configured for upstream requests", "scheme", scheme, "proxy_url", safeProxyURL.String())
+			// Исправлено: вызов логгера
+			logger.Info().Str("scheme", scheme).Str("proxy_url", safeProxyURL.String()).Msg("System proxy configured for upstream requests")
 		} else {
-			logger.Info("No system proxy configured for upstream requests", "scheme", scheme)
+			// Исправлено: вызов логгера
+			logger.Info().Str("scheme", scheme).Msg("No system proxy configured for upstream requests")
 		}
 	}
 }
