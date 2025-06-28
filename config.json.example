@@ -18,11 +18,7 @@
     "bufferSize": "128KB",
     "overrides": [
       {
-        "pathPattern": "dists/**/InRelease",
-        "ttl": "5m"
-      },
-      {
-        "pathPattern": "dists/**/Release",
+        "pathPattern": "dists/**",
         "ttl": "5m"
       },
       {
