@@ -76,11 +76,10 @@ func Default() *Config {
 			MaxSize:      "10GB",
 			Enabled:      true,
 			CleanOnStart: false,
-			BufferSize:   "64KB",
+			BufferSize:   "256KB",
 			NegativeTTL:  5 * time.Minute,
 			Overrides: []CacheOverride{
-				{PathPattern: "dists/**/InRelease", TTL: 5 * time.Minute},
-				{PathPattern: "dists/**/Release", TTL: 5 * time.Minute},
+				{PathPattern: "dists/**", TTL: 5 * time.Minute},
 				{PathPattern: "**/*.deb", TTL: 30 * 24 * time.Hour},
 			},
 		},
@@ -90,6 +89,7 @@ func Default() *Config {
 			MaxSizeMB:  100,
 			MaxBackups: 3,
 			MaxAgeDays: 7,
+			NoConsole:  true,
 		},
 		Repositories: []Repository{
 			{Name: "ubuntu", URL: "http://archive.ubuntu.com/ubuntu/", Enabled: true},

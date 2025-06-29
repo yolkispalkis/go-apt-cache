@@ -12,10 +12,11 @@
   },
   "cache": {
     "directory": "/var/cache/go-apt-cache",
-    "maxSize": "20GB",
+    "maxSize": "10GB",
     "enabled": true,
     "cleanOnStart": false,
-    "bufferSize": "128KB",
+    "bufferSize": "256KB",
+    "negativeCacheTTL": "5m",
     "overrides": [
       {
         "pathPattern": "dists/**",
@@ -31,9 +32,9 @@
     "level": "info",
     "file": "/var/log/go-apt-cache/go-apt-cache.log",
     "maxSizeMB": 100,
-    "maxBackups": 5,
-    "maxAgeDays": 30,
-    "noConsole": false
+    "maxBackups": 3,
+    "maxAgeDays": 7,
+    "noConsole": true
   },
   "repositories": [
     {
@@ -44,11 +45,6 @@
     {
       "name": "debian",
       "url": "http://deb.debian.org/debian/",
-      "enabled": true
-    },
-    {
-      "name": "raspbian",
-      "url": "http://archive.raspberrypi.org/raspbian/",
       "enabled": false
     }
   ]

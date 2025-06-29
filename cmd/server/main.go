@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
@@ -47,6 +48,15 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("failed to setup logging: %w", err)
 	}
 	logger.Info().Str("path", *cfgPath).Msg("Configuration loaded")
+
+	if cfg.Cache.Enabled && cfg.Cache.CleanOnStart {
+		logger.Info().Str("directory", cfg.Cache.Dir).Msg("Cleaning cache directory on start as configured...")
+		if err := cleanCacheDir(cfg.Cache.Dir); err != nil {
+			logger.Error().Err(err).Str("directory", cfg.Cache.Dir).Msg("Failed to clean cache directory")
+		} else {
+			logger.Info().Msg("Cache directory cleaned successfully.")
+		}
+	}
 
 	util.InitBufferPool(cfg.Cache.BufferSize, logger)
 
@@ -88,5 +98,29 @@ func run(ctx context.Context) error {
 		logger.Info().Msg("Server shut down gracefully")
 	}
 
+	return nil
+}
+
+func cleanCacheDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer d.Close()
+
+	names, err := d.Readdirnames(-1)
+	if err != nil {
+		return err
+	}
+
+	for _, name := range names {
+		err = os.RemoveAll(filepath.Join(dir, name))
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
