@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -9,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	json "github.com/goccy/go-json"
 
 	kjson "github.com/knadh/koanf/parsers/json"
 	"github.com/knadh/koanf/providers/file"
