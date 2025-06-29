@@ -202,6 +202,8 @@ type ResponseWriterInterceptor struct {
 	wroteHeader bool
 }
 
+var _ io.ReaderFrom = (*ResponseWriterInterceptor)(nil)
+
 func NewResponseWriterInterceptor(w http.ResponseWriter) *ResponseWriterInterceptor {
 	return &ResponseWriterInterceptor{ResponseWriter: w}
 }
@@ -222,6 +224,18 @@ func (w *ResponseWriterInterceptor) Write(b []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(b)
 	w.bytes += int64(n)
 	return n, err
+}
+
+func (w *ResponseWriterInterceptor) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		if !w.wroteHeader {
+			w.WriteHeader(http.StatusOK)
+		}
+		n, err := rf.ReadFrom(r)
+		w.bytes += n
+		return n, err
+	}
+	return io.Copy(w, r)
 }
 
 func (w *ResponseWriterInterceptor) Status() int {
