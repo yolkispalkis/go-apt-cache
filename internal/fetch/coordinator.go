@@ -44,6 +44,12 @@ type Options struct {
 	IfNoneMatch string
 }
 
+type SharedFetch struct {
+	Result *Result
+	Err    error
+	Done   chan struct{}
+}
+
 type Coordinator struct {
 	client    *http.Client
 	sfGroup   singleflight.Group
@@ -86,29 +92,23 @@ func NewCoordinator(cfg config.ServerConfig, logger *logging.Logger) *Coordinato
 	}
 }
 
-func (c *Coordinator) Fetch(ctx context.Context, key, upstreamURL string, opts *Options) (*Result, error) {
+func (c *Coordinator) Fetch(ctx context.Context, key, upstreamURL string, opts *Options) (any, error, bool) {
 	resInterface, err, shared := c.sfGroup.Do(key, func() (any, error) {
 		c.log.Debug().Str("key", key).Msg("Executing actual fetch")
-		return c.doFetch(ctx, upstreamURL, opts)
+		result, fetchErr := c.doFetch(ctx, upstreamURL, opts)
+
+		return &SharedFetch{
+			Result: result,
+			Err:    fetchErr,
+			Done:   make(chan struct{}),
+		}, fetchErr
 	})
 
 	if shared {
 		c.log.Debug().Str("key", key).Msg("Shared fetch result")
 	}
 
-	if err != nil {
-		if result, ok := resInterface.(*Result); ok {
-			return result, err
-		}
-		return nil, err
-	}
-
-	result, ok := resInterface.(*Result)
-	if !ok {
-		return nil, fmt.Errorf("%w: unexpected type %T from singleflight", ErrInternal, resInterface)
-	}
-
-	return result, nil
+	return resInterface, err, shared
 }
 
 func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Options) (*Result, error) {

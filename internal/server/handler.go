@@ -46,7 +46,7 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 		if meta.StatusCode == http.StatusNotFound {
 			if meta.IsStale(time.Now()) {
 				log.Info().Msg("Stale negative cache entry, re-fetching")
-				app.Cache.Delete(context.Background(), key)
+				app.Cache.Delete(r.Context(), key)
 				app.fetchAndServe(w, r, key, upstreamURL, nil, cleanRelPath)
 			} else {
 				log.Debug().Msg("Serving 404 from negative cache")
@@ -85,7 +85,7 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			app.Logger.Warn().Str("key", key).Msg("Metadata found, but content is missing. Refetching.")
-			app.Cache.Delete(context.Background(), key)
+			app.Cache.Delete(r.Context(), key)
 			app.fetchAndServe(w, r, key, meta.UpstreamURL, nil, cleanRelPath)
 			return
 		}
@@ -108,10 +108,45 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 		}
 	}
 
-	fetchRes, err := app.Fetcher.Fetch(r.Context(), key, upstreamURL, opts)
+	resInterface, _, shared := app.Fetcher.Fetch(r.Context(), key, upstreamURL, opts)
+
+	sharedFetch, ok := resInterface.(*fetch.SharedFetch)
+	if !ok {
+		if resInterface == nil {
+			app.Logger.Warn().Str("key", key).Msg("Fetch initiation failed, possibly due to client disconnect.")
+			return
+		}
+		app.Logger.Error().Str("key", key).Msgf("Unexpected type from singleflight: %T", resInterface)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if shared {
+		app.Logger.Debug().Str("key", key).Msg("Following a shared fetch, waiting for leader.")
+		select {
+		case <-sharedFetch.Done:
+			app.Logger.Debug().Str("key", key).Msg("Leader finished, proceeding to serve from cache.")
+			meta, found := app.Cache.Get(r.Context(), key)
+			if !found {
+				app.Logger.Error().Str("key", key).Msg("Leader was supposed to cache the item, but it's not found.")
+				http.Error(w, "Failed to retrieve file after fetch", http.StatusInternalServerError)
+				return
+			}
+			app.serveFromCache(w, r, key, meta, relPath)
+		case <-r.Context().Done():
+			app.Logger.Info().Str("key", key).Msg("Client disconnected while waiting for leader.")
+			return
+		}
+		return
+	}
+
+	fetchRes := sharedFetch.Result
+	err := sharedFetch.Err
+
 	if fetchRes != nil && fetchRes.Body != nil {
 		defer fetchRes.Body.Close()
 	}
+	defer close(sharedFetch.Done)
 
 	if err != nil {
 		if errors.Is(err, fetch.ErrUpstreamNotFound) {
@@ -186,11 +221,15 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 	var wg sync.WaitGroup
 	wg.Add(1)
 
+	cacheCtx := r.Context()
+
 	go func() {
 		defer wg.Done()
-		written, err := app.Cache.PutContent(context.Background(), key, pr)
+		written, err := app.Cache.PutContent(cacheCtx, key, pr)
 		if err != nil {
-			app.Logger.Error().Err(err).Str("key", key).Msg("Failed to write content to cache")
+			if !util.IsClientDisconnectedError(err) {
+				app.Logger.Error().Err(err).Str("key", key).Msg("Failed to write content to cache")
+			}
 			app.Cache.Delete(context.Background(), key)
 		} else {
 			meta.Size = written
