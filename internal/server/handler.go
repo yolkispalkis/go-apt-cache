@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,8 +23,21 @@ import (
 func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Request) {
 	repo := r.Context().Value(repoContextKey).(config.Repository)
 	relPath := chi.URLParam(r, "*")
-	key := repo.Name + "/" + relPath
-	upstreamURL := repo.URL + relPath
+
+	cleanRelPath := filepath.Clean(relPath)
+
+	if strings.HasPrefix(cleanRelPath, "..") || cleanRelPath == ".." || cleanRelPath == "." {
+		app.Logger.Warn().
+			Str("repo", repo.Name).
+			Str("remote_addr", r.RemoteAddr).
+			Str("raw_path", relPath).
+			Msg("Path traversal attempt blocked")
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+
+	key := repo.Name + "/" + cleanRelPath
+	upstreamURL := repo.URL + cleanRelPath
 	log := app.Logger.With().Str("key", key).Str("repo", repo.Name).Logger()
 
 	meta, found := app.Cache.Get(r.Context(), key)
@@ -33,7 +47,7 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 			if meta.IsStale(time.Now()) {
 				log.Info().Msg("Stale negative cache entry, re-fetching")
 				app.Cache.Delete(context.Background(), key)
-				app.fetchAndServe(w, r, key, upstreamURL, nil)
+				app.fetchAndServe(w, r, key, upstreamURL, nil, cleanRelPath)
 			} else {
 				log.Debug().Msg("Serving 404 from negative cache")
 				http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
@@ -43,18 +57,18 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 
 		if meta.IsStale(time.Now()) || r.Header.Get("Cache-Control") == "no-cache" {
 			log.Info().Msg("Revalidating stale/no-cache item")
-			app.revalidate(w, r, key, upstreamURL, meta)
+			app.revalidate(w, r, key, upstreamURL, meta, cleanRelPath)
 		} else {
-			app.serveFromCache(w, r, key, meta)
+			app.serveFromCache(w, r, key, meta, cleanRelPath)
 		}
 		return
 	}
 
 	log.Info().Msg("Cache miss, fetching from upstream")
-	app.fetchAndServe(w, r, key, upstreamURL, nil)
+	app.fetchAndServe(w, r, key, upstreamURL, nil, cleanRelPath)
 }
 
-func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key string, meta *cache.ItemMeta) {
+func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key string, meta *cache.ItemMeta, cleanRelPath string) {
 	if util.CheckConditional(w, r, meta.Headers) {
 		return
 	}
@@ -72,7 +86,7 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 		if errors.Is(err, os.ErrNotExist) {
 			app.Logger.Warn().Str("key", key).Msg("Metadata found, but content is missing. Refetching.")
 			app.Cache.Delete(context.Background(), key)
-			app.fetchAndServe(w, r, key, meta.UpstreamURL, nil)
+			app.fetchAndServe(w, r, key, meta.UpstreamURL, nil, cleanRelPath)
 			return
 		}
 		app.Logger.Error().Err(err).Str("key", key).Msg("Failed to get content for cached metadata")
@@ -85,7 +99,7 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 	io.Copy(w, content)
 }
 
-func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, key, upstreamURL string, revalMeta *cache.ItemMeta) {
+func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, key, upstreamURL string, revalMeta *cache.ItemMeta, relPath string) {
 	opts := &fetch.Options{}
 	if revalMeta != nil {
 		opts.IfNoneMatch = revalMeta.Headers.Get("ETag")
@@ -125,14 +139,13 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 		if errors.Is(err, fetch.ErrUpstreamNotModified) {
 			app.Logger.Info().Str("key", key).Msg("Revalidation successful (304)")
 			if revalMeta != nil {
-				relPath := strings.TrimPrefix(key, revalMeta.UpstreamURL)
 				revalMeta.ExpiresAt = calculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides)
 				revalMeta.LastUsedAt = time.Now()
 				util.UpdateCacheHeaders(revalMeta.Headers, fetchRes.Header)
 				if err := app.Cache.Put(r.Context(), revalMeta); err != nil {
 					app.Logger.Error().Err(err).Str("key", key).Msg("Failed to update metadata after 304")
 				}
-				app.serveFromCache(w, r, key, revalMeta)
+				app.serveFromCache(w, r, key, revalMeta, relPath)
 			}
 			return
 		}
@@ -146,7 +159,6 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 		return
 	}
 
-	relPath := strings.TrimPrefix(key, chi.URLParam(r, "repoName")+"/")
 	now := time.Now()
 	meta := &cache.ItemMeta{
 		Key:         key,
@@ -201,8 +213,8 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 	wg.Wait()
 }
 
-func (app *Application) revalidate(w http.ResponseWriter, r *http.Request, key, upstreamURL string, currentMeta *cache.ItemMeta) {
-	app.fetchAndServe(w, r, key, upstreamURL, currentMeta)
+func (app *Application) revalidate(w http.ResponseWriter, r *http.Request, key, upstreamURL string, currentMeta *cache.ItemMeta, relPath string) {
+	app.fetchAndServe(w, r, key, upstreamURL, currentMeta, relPath)
 }
 
 func (app *Application) handleStatus(w http.ResponseWriter, r *http.Request) {
