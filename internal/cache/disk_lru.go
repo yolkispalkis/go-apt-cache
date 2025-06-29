@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"path/filepath"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -23,6 +23,7 @@ const numShards = 64
 
 type ShardedManager struct {
 	shards []*lruShard
+	store  *diskStore
 	log    *logging.Logger
 }
 
@@ -47,30 +48,16 @@ func NewDiskLRU(cfg config.CacheConfig, logger *logging.Logger) (Manager, error)
 
 	manager := &ShardedManager{
 		shards: make([]*lruShard, numShards),
+		store:  store,
 		log:    log,
 	}
 
-	var wg sync.WaitGroup
-	initErrs := make(chan error, numShards)
-
 	for i := 0; i < numShards; i++ {
-		wg.Add(1)
-		go func(shardIndex int) {
-			defer wg.Done()
-			shard, err := newLRUShard(cfg, log, store, maxBytesPerShard)
-			if err != nil {
-				initErrs <- fmt.Errorf("failed to create shard %d: %w", shardIndex, err)
-				return
-			}
-			manager.shards[shardIndex] = shard
-		}(i)
-	}
-
-	wg.Wait()
-	close(initErrs)
-
-	for err := range initErrs {
-		return nil, err
+		shard, err := newLRUShard(i, cfg, log, store, maxBytesPerShard)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create shard %d: %w", i, err)
+		}
+		manager.shards[i] = shard
 	}
 
 	go manager.initialScan()
@@ -78,17 +65,21 @@ func NewDiskLRU(cfg config.CacheConfig, logger *logging.Logger) (Manager, error)
 	return manager, nil
 }
 
-func (sm *ShardedManager) getShard(key string) *lruShard {
+func (sm *ShardedManager) getShardIndex(key string) uint64 {
 	hasher := fnv.New64a()
 	hasher.Write([]byte(key))
-	return sm.shards[hasher.Sum64()&(numShards-1)]
+	return hasher.Sum64() & (numShards - 1)
+}
+
+func (sm *ShardedManager) getShard(key string) *lruShard {
+	return sm.shards[sm.getShardIndex(key)]
 }
 
 func (sm *ShardedManager) initialScan() {
 	sm.log.Info().Msg("Starting initial disk scan for all shards...")
 	startTime := time.Now()
 
-	metaFiles, err := sm.shards[0].store.ScanMetaFiles()
+	metaFiles, err := sm.store.ScanMetaFiles()
 	if err != nil {
 		sm.log.Error().Err(err).Msg("Failed during initial scan file listing")
 		for _, s := range sm.shards {
@@ -104,15 +95,15 @@ func (sm *ShardedManager) initialScan() {
 	}
 
 	for _, mPath := range metaFiles {
-		meta, err := sm.shards[0].store.ReadMeta(mPath)
+		meta, err := sm.store.ReadMeta(mPath)
 		if err != nil {
 			sm.log.Warn().Err(err).Str("path", mPath).Msg("Could not read meta for sharding, deleting artifact")
-			key := strings.TrimSuffix(filepath.Base(mPath), ".meta")
-			sm.shards[0].store.Delete(key)
+			_ = os.Remove(mPath)
+			_ = os.Remove(strings.TrimSuffix(mPath, metaSuffix) + contentSuffix)
 			continue
 		}
-		shardIndex := sm.getShard(meta.Key).shardIndex()
-		shardMetaPaths[shardIndex] = append(shardMetaPaths[shardIndex], mPath)
+		targetShardIndex := sm.getShardIndex(meta.Key)
+		shardMetaPaths[targetShardIndex] = append(shardMetaPaths[targetShardIndex], mPath)
 	}
 
 	var wg sync.WaitGroup
@@ -125,7 +116,7 @@ func (sm *ShardedManager) initialScan() {
 	}
 	wg.Wait()
 
-	sm.log.Info().Dur("duration", time.Since(startTime)).Msg("All shards finished initial scan.")
+	sm.log.Info().Dur("duration", time.Since(startTime)).Int("files", len(metaFiles)).Msg("All shards finished initial scan.")
 }
 
 func (sm *ShardedManager) Get(ctx context.Context, key string) (*ItemMeta, bool) {
@@ -162,43 +153,34 @@ func (sm *ShardedManager) Close() {
 }
 
 type lruShard struct {
-	cfg      config.CacheConfig
-	log      *logging.Logger
-	store    *diskStore
-	maxBytes int64
-
+	index        int
+	cfg          config.CacheConfig
+	log          *logging.Logger
+	store        *diskStore
+	maxBytes     int64
 	mu           sync.RWMutex
 	items        map[string]*list.Element
 	lruList      *list.List
 	currentBytes atomic.Int64
-
-	initErr     error
-	ready       bool
-	metaBatcher *metadataBatcher
+	initErr      error
+	ready        bool
+	metaBatcher  *metadataBatcher
 }
 
-func newLRUShard(cfg config.CacheConfig, logger *logging.Logger, store *diskStore, maxBytes int64) (*lruShard, error) {
+func newLRUShard(index int, cfg config.CacheConfig, logger *logging.Logger, store *diskStore, maxBytes int64) (*lruShard, error) {
 	batchInterval := 30 * time.Second
+	shardLogger := logger.With().Int("shard", index).Logger()
 	shard := &lruShard{
+		index:       index,
 		cfg:         cfg,
-		log:         logger,
+		log:         &logging.Logger{Logger: shardLogger},
 		store:       store,
 		maxBytes:    maxBytes,
 		items:       make(map[string]*list.Element),
 		lruList:     list.New(),
-		metaBatcher: newMetadataBatcher(store, logger, batchInterval),
+		metaBatcher: newMetadataBatcher(store, &logging.Logger{Logger: shardLogger}, batchInterval),
 	}
 	return shard, nil
-}
-
-func (s *lruShard) shardIndex() uint64 {
-	// Простой способ получить "ID" шарда для распределения файлов.
-	// Мы не можем использовать адрес памяти, так как он не постоянен.
-	// Вместо этого, мы можем использовать хэш от чего-то уникального,
-	// но для простоты, мы будем распределять файлы в `initialScan` менеджера.
-	// Эта функция здесь для примера, как можно было бы это сделать.
-	// В текущей реализации она не используется для определения индекса.
-	return 0
 }
 
 func (s *lruShard) populateFromScan(metaPaths []string) {
@@ -210,8 +192,8 @@ func (s *lruShard) populateFromScan(metaPaths []string) {
 		meta, err := s.store.ReadMeta(mPath)
 		if err != nil {
 			s.log.Warn().Err(err).Str("path", mPath).Msg("Failed to read metadata, removing artifact")
-			key := strings.TrimSuffix(filepath.Base(mPath), ".meta")
-			s.store.Delete(key)
+			_ = os.Remove(mPath)
+			_ = os.Remove(strings.TrimSuffix(mPath, metaSuffix) + contentSuffix)
 			continue
 		}
 		itemsToSort = append(itemsToSort, meta)
@@ -281,6 +263,7 @@ func (s *lruShard) Put(ctx context.Context, meta *ItemMeta) error {
 		oldMeta := oldElem.Value.(*lruEntry).meta
 		s.currentBytes.Add(-oldMeta.Size)
 		s.lruList.Remove(oldElem)
+		util.ReturnHeader(oldMeta.Headers)
 	}
 
 	entry := &lruEntry{key: meta.Key, meta: meta}
@@ -318,6 +301,7 @@ func (s *lruShard) Delete(ctx context.Context, key string) error {
 		s.currentBytes.Add(-meta.Size)
 		s.lruList.Remove(elem)
 		delete(s.items, key)
+		util.ReturnHeader(meta.Headers)
 	}
 	s.mu.Unlock()
 
@@ -351,6 +335,7 @@ func (s *lruShard) ensureSpace(requiredSize int64) {
 		entry := s.lruList.Remove(elem).(*lruEntry)
 		delete(s.items, entry.key)
 		s.currentBytes.Add(-entry.meta.Size)
+		util.ReturnHeader(entry.meta.Headers)
 
 		s.log.Info().
 			Str("key", entry.key).
