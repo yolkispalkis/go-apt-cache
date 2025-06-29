@@ -7,7 +7,7 @@
     "shutdownTimeout": "15s",
     "idleTimeout": "2m",
     "readHeaderTimeout": "10s",
-    "maxConcurrentFetches": 20,
+    "maxConcurrentFetches": 150,
     "userAgent": "go-apt-cache/dev"
   },
   "cache": {
@@ -24,7 +24,7 @@
       },
       {
         "pathPattern": "**/*.deb",
-        "ttl": "720h"
+        "ttl": "2160h"
       }
     ]
   },

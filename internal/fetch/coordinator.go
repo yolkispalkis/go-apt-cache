@@ -53,14 +53,20 @@ type Coordinator struct {
 
 func NewCoordinator(cfg config.ServerConfig, logger *logging.Logger) *Coordinator {
 	log := logger.WithComponent("fetchCoordinator")
+
+	maxConns := cfg.MaxConcurrent
+	if maxConns <= 0 {
+		maxConns = 20
+	}
+
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   15 * time.Second,
 			KeepAlive: 60 * time.Second,
 		}).DialContext,
-		MaxIdleConns:        cfg.MaxConcurrent * 2,
-		MaxIdleConnsPerHost: cfg.MaxConcurrent,
+		MaxIdleConns:        maxConns * 2,
+		MaxIdleConnsPerHost: maxConns,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 		DisableCompression:  true,
