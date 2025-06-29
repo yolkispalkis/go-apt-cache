@@ -12,12 +12,12 @@ import (
 )
 
 type Config struct {
-	Level      string `koanf:"level"`
-	File       string `koanf:"file"`
-	MaxSizeMB  int    `koanf:"maxSizeMB"`
-	MaxBackups int    `koanf:"maxBackups"`
-	MaxAgeDays int    `koanf:"maxAgeDays"`
-	NoConsole  bool   `koanf:"noConsole"`
+	Level      string `koanf:"level" yaml:"level"`
+	File       string `koanf:"file" yaml:"file"`
+	MaxSizeMB  int    `koanf:"maxSizeMB" yaml:"maxSizeMB"`
+	MaxBackups int    `koanf:"maxBackups" yaml:"maxBackups"`
+	MaxAgeDays int    `koanf:"maxAgeDays" yaml:"maxAgeDays"`
+	NoConsole  bool   `koanf:"noConsole" yaml:"noConsole"`
 }
 
 type Logger struct {

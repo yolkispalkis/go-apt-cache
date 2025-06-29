@@ -10,53 +10,54 @@ import (
 	"time"
 
 	json "github.com/goccy/go-json"
-
 	kjson "github.com/knadh/koanf/parsers/json"
+	kyaml "github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 	"github.com/yolkispalkis/go-apt-cache/internal/appinfo"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
+	"gopkg.in/yaml.v3"
 )
 
 type Repository struct {
-	Name    string `koanf:"name"`
-	URL     string `koanf:"url"`
-	Enabled bool   `koanf:"enabled"`
+	Name    string `koanf:"name" yaml:"name"`
+	URL     string `koanf:"url" yaml:"url"`
+	Enabled bool   `koanf:"enabled" yaml:"enabled"`
 }
 
 type ServerConfig struct {
-	ListenAddr        string        `koanf:"listenAddress"`
-	UnixPath          string        `koanf:"unixSocketPath"`
-	UnixPerms         os.FileMode   `koanf:"unixSocketPermissions"`
-	ReqTimeout        time.Duration `koanf:"requestTimeout"`
-	ShutdownTimeout   time.Duration `koanf:"shutdownTimeout"`
-	IdleTimeout       time.Duration `koanf:"idleTimeout"`
-	ReadHeaderTimeout time.Duration `koanf:"readHeaderTimeout"`
-	MaxConcurrent     int           `koanf:"maxConcurrentFetches"`
-	UserAgent         string        `koanf:"userAgent"`
+	ListenAddr        string        `koanf:"listenAddress" yaml:"listenAddress"`
+	UnixPath          string        `koanf:"unixSocketPath" yaml:"unixSocketPath"`
+	UnixPerms         os.FileMode   `koanf:"unixSocketPermissions" yaml:"unixSocketPermissions"`
+	ReqTimeout        time.Duration `koanf:"requestTimeout" yaml:"requestTimeout"`
+	ShutdownTimeout   time.Duration `koanf:"shutdownTimeout" yaml:"shutdownTimeout"`
+	IdleTimeout       time.Duration `koanf:"idleTimeout" yaml:"idleTimeout"`
+	ReadHeaderTimeout time.Duration `koanf:"readHeaderTimeout" yaml:"readHeaderTimeout"`
+	MaxConcurrent     int           `koanf:"maxConcurrentFetches" yaml:"maxConcurrentFetches"`
+	UserAgent         string        `koanf:"userAgent" yaml:"userAgent"`
 }
 
 type CacheOverride struct {
-	PathPattern string        `koanf:"pathPattern"`
-	TTL         time.Duration `koanf:"ttl"`
+	PathPattern string        `koanf:"pathPattern" yaml:"pathPattern"`
+	TTL         time.Duration `koanf:"ttl" yaml:"ttl"`
 }
 
 type CacheConfig struct {
-	Dir          string          `koanf:"directory"`
-	MaxSize      string          `koanf:"maxSize"`
-	Enabled      bool            `koanf:"enabled"`
-	CleanOnStart bool            `koanf:"cleanOnStart"`
-	BufferSize   string          `koanf:"bufferSize"`
-	Overrides    []CacheOverride `koanf:"overrides"`
-	NegativeTTL  time.Duration   `koanf:"negativeCacheTTL"`
+	Dir          string          `koanf:"directory" yaml:"directory"`
+	MaxSize      string          `koanf:"maxSize" yaml:"maxSize"`
+	Enabled      bool            `koanf:"enabled" yaml:"enabled"`
+	CleanOnStart bool            `koanf:"cleanOnStart" yaml:"cleanOnStart"`
+	BufferSize   string          `koanf:"bufferSize" yaml:"bufferSize"`
+	Overrides    []CacheOverride `koanf:"overrides" yaml:"overrides"`
+	NegativeTTL  time.Duration   `koanf:"negativeCacheTTL" yaml:"negativeCacheTTL"`
 }
 
 type Config struct {
-	Server       ServerConfig   `koanf:"server"`
-	Cache        CacheConfig    `koanf:"cache"`
-	Logging      logging.Config `koanf:"logging"`
-	Repositories []Repository   `koanf:"repositories"`
+	Server       ServerConfig   `koanf:"server" yaml:"server"`
+	Cache        CacheConfig    `koanf:"cache" yaml:"cache"`
+	Logging      logging.Config `koanf:"logging" yaml:"logging"`
+	Repositories []Repository   `koanf:"repositories" yaml:"repositories"`
 }
 
 func Default() *Config {
@@ -103,9 +104,20 @@ func Load(path string) (*Config, error) {
 	k := koanf.New(".")
 	cfg := Default()
 
-	if err := k.Load(file.Provider(path), kjson.Parser()); err != nil {
+	var parser koanf.Parser
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".yaml", ".yml":
+		parser = kyaml.Parser()
+	case ".json":
+		parser = kjson.Parser()
+	default:
+		return nil, fmt.Errorf("unsupported config file format: '%s'. Use .json, .yaml, or .yml", ext)
+	}
+
+	if err := k.Load(file.Provider(path), parser); err != nil {
 		if os.IsNotExist(err) {
-			return cfg, fmt.Errorf("config file not found at %s, please create one or use -create-config flag", path)
+			return nil, fmt.Errorf("config file not found at %s, please create one or use -create-config flag", path)
 		}
 		return nil, fmt.Errorf("error loading config file: %w", err)
 	}
@@ -166,10 +178,25 @@ func EnsureDefault(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("failed to create directory for config: %w", err)
 	}
-	data, err := json.MarshalIndent(Default(), "", "  ")
+
+	defaultCfg := Default()
+	var data []byte
+	var err error
+
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".yaml", ".yml", "":
+		data, err = yaml.Marshal(defaultCfg)
+	case ".json":
+		data, err = json.MarshalIndent(defaultCfg, "", "  ")
+	default:
+		return fmt.Errorf("unsupported config file format for creation: '%s'. Use .json, .yaml, or .yml", ext)
+	}
+
 	if err != nil {
 		return fmt.Errorf("failed to marshal default config: %w", err)
 	}
+
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("failed to write default config: %w", err)
 	}

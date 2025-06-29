@@ -30,7 +30,7 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	cfgPath := flag.String("config", "/etc/go-apt-cache/config.json", "Path to config file")
+	cfgPath := flag.String("config", "/etc/go-apt-cache/config.yaml", "Path to config file (.yaml, .yml, .json)")
 	createCfg := flag.Bool("create-config", false, "Create default config file and exit")
 	flag.Parse()
 

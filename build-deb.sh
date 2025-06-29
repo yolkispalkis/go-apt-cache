@@ -40,14 +40,14 @@ build_binary() {
 
 create_config() {
     echo "--- Creating default config file ---"
-    cp config.json.example "${CONFIG_DIR}/config.json"
-    chmod 644 "${CONFIG_DIR}/config.json"
+    cp config.yaml.example "${CONFIG_DIR}/config.yaml"
+    chmod 644 "${CONFIG_DIR}/config.yaml"
 }
 
 create_systemd_service() {
     echo "--- Creating systemd service file ---"
     local exec_path="/usr/local/bin/${PKG_NAME}"
-    local config_path="/etc/${PKG_NAME}/config.json"
+    local config_path="/etc/${PKG_NAME}/config.yaml"
 
     cat >"${SYSTEMD_DIR}/${PKG_NAME}.service" <<EOF
 [Unit]
@@ -169,7 +169,7 @@ EOF
 
 create_conffiles() {
     echo "--- Creating conffiles ---"
-    echo "/etc/${PKG_NAME}/config.json" >"${DEBIAN_DIR}/conffiles"
+    echo "/etc/${PKG_NAME}/config.yaml" >"${DEBIAN_DIR}/conffiles"
 }
 
 build_package() {
