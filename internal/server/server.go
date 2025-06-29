@@ -16,8 +16,6 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
-// Application является центральной структурой приложения, содержащей все зависимости.
-// Она определена здесь, чтобы быть доступной для всех компонентов сервера.
 type Application struct {
 	Config  *config.Config
 	Logger  *logging.Logger
@@ -25,7 +23,6 @@ type Application struct {
 	Fetcher *fetch.Coordinator
 }
 
-// NewApplication создает новый экземпляр Application.
 func NewApplication(cfg *config.Config, logger *logging.Logger, cache cache.Manager, fetcher *fetch.Coordinator) *Application {
 	return &Application{
 		Config:  cfg,
@@ -35,7 +32,6 @@ func NewApplication(cfg *config.Config, logger *logging.Logger, cache cache.Mana
 	}
 }
 
-// Server представляет HTTP-сервер приложения.
 type Server struct {
 	httpSrv   *http.Server
 	cfg       config.ServerConfig
@@ -43,7 +39,6 @@ type Server struct {
 	listeners []net.Listener
 }
 
-// New создает новый экземпляр сервера.
 func New(cfg config.ServerConfig, log *logging.Logger, handler http.Handler) *Server {
 	return &Server{
 		httpSrv: &http.Server{
@@ -56,7 +51,6 @@ func New(cfg config.ServerConfig, log *logging.Logger, handler http.Handler) *Se
 	}
 }
 
-// Start запускает сервер, настраивая и прослушивая сокеты.
 func (s *Server) Start() error {
 	if err := s.setupListeners(); err != nil {
 		return fmt.Errorf("failed to setup listeners: %w", err)
@@ -67,7 +61,7 @@ func (s *Server) Start() error {
 
 	errChan := make(chan error, 1)
 	for _, l := range s.listeners {
-		lis := l // Захватываем переменную для горутины
+		lis := l
 		s.log.Info().Str("network", lis.Addr().Network()).Str("address", lis.Addr().String()).Msg("Server listening")
 		go func() {
 			if err := s.httpSrv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -80,10 +74,9 @@ func (s *Server) Start() error {
 		}()
 	}
 
-	return <-errChan // Блокируемся до первой ошибки
+	return <-errChan
 }
 
-// Shutdown корректно останавливает сервер.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.log.Info().Msg("Attempting graceful server shutdown...")
 	err := s.httpSrv.Shutdown(ctx)
@@ -91,7 +84,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// setupListeners создает TCP и/или Unix-сокеты.
 func (s *Server) setupListeners() error {
 	if addr := s.cfg.ListenAddr; addr != "" {
 		tcpLn, err := net.Listen("tcp", addr)
@@ -138,7 +130,6 @@ func (s *Server) setupUnixSocket(sockPath string) (net.Listener, error) {
 	return unixLn, nil
 }
 
-// cleanupSocket удаляет файл Unix-сокета после остановки сервера.
 func (s *Server) cleanupSocket() {
 	if s.cfg.UnixPath != "" {
 		cleanSockPath := util.CleanPath(s.cfg.UnixPath)

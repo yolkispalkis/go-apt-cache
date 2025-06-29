@@ -11,7 +11,6 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-// Config хранит настройки логгирования.
 type Config struct {
 	Level      string `koanf:"level"`
 	File       string `koanf:"file"`
@@ -21,12 +20,10 @@ type Config struct {
 	NoConsole  bool   `koanf:"noConsole"`
 }
 
-// Logger - это обертка над zerolog.Logger для добавления контекста.
 type Logger struct {
 	zerolog.Logger
 }
 
-// New создает и настраивает новый логгер.
 func New(cfg Config) (*Logger, error) {
 	level := parseLevel(cfg.Level)
 	var writers []io.Writer
@@ -62,7 +59,6 @@ func New(cfg Config) (*Logger, error) {
 	return &Logger{zl}, nil
 }
 
-// WithComponent добавляет имя компонента в контекст логгера.
 func (l *Logger) WithComponent(name string) *Logger {
 	zl := l.With().Str("component", name).Logger()
 	return &Logger{zl}

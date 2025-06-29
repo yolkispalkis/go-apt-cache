@@ -20,7 +20,6 @@ const (
 	metaSuffix    = ".meta"
 )
 
-// diskStore управляет хранением файлов на диске.
 type diskStore struct {
 	baseDir string
 	log     *logging.Logger
@@ -73,14 +72,12 @@ func (ds *diskStore) PutContent(key string, r io.Reader) (int64, error) {
 	return written, os.Rename(tmpFile.Name(), path)
 }
 
-// WriteMetadata теперь основной метод для записи метаданных.
 func (ds *diskStore) WriteMetadata(meta *ItemMeta) error {
 	path := ds.keyToPath(meta.Key, metaSuffix)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return err
 	}
-	// Атомарная запись через временный файл
 	tmpFile, err := os.CreateTemp(dir, "temp-meta-")
 	if err != nil {
 		return err

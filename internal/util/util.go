@@ -34,7 +34,6 @@ var bufferPool = sync.Pool{New: func() any { return make([]byte, bufferPoolSize)
 func InitBufferPool(sizeStr string, log *logging.Logger) {
 	size, err := ParseSize(sizeStr)
 	if err != nil || size <= 0 {
-		// Исправлено: вызов логгера
 		log.Warn().
 			Str("configured_size", sizeStr).
 			Int64("default_size", bufferPoolSize).
@@ -44,7 +43,6 @@ func InitBufferPool(sizeStr string, log *logging.Logger) {
 	}
 	bufferPoolSize = size
 	bufferPool = sync.Pool{New: func() any { return make([]byte, bufferPoolSize) }}
-	// Исправлено: вызов логгера
 	log.Info().Str("size", FormatSize(bufferPoolSize)).Msg("Buffer pool initialized with configured size")
 }
 
@@ -197,7 +195,6 @@ func CompareETags(clientETagsStr, resourceETag string) bool {
 	return false
 }
 
-// ResponseWriterInterceptor для перехвата статуса и размера ответа.
 type ResponseWriterInterceptor struct {
 	http.ResponseWriter
 	status      int
@@ -238,7 +235,6 @@ func (w *ResponseWriterInterceptor) BytesWritten() int64 {
 	return w.bytes
 }
 
-// CheckConditional проверяет заголовки If-None-Match и If-Modified-Since.
 func CheckConditional(w http.ResponseWriter, r *http.Request, headers http.Header) bool {
 	etag := headers.Get("ETag")
 	lastModified := headers.Get("Last-Modified")

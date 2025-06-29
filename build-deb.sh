@@ -1,7 +1,6 @@
 #!/bin/bash
 set -e
 
-# --- Конфигурация сборки ---
 PKG_NAME="go-apt-cache"
 PKG_VERSION="3.0.1"
 PKG_ARCH="amd64"
@@ -10,7 +9,6 @@ PKG_DESCRIPTION="A high-performance caching proxy for APT repositories, written 
 APP_MAIN_PACKAGE="github.com/yolkispalkis/go-apt-cache"
 APP_CMD_PATH="./cmd/server"
 
-# --- Переменные для путей ---
 BUILD_DIR="$(pwd)/build"
 STAGE_DIR="${BUILD_DIR}/staging"
 DEBIAN_DIR="${STAGE_DIR}/DEBIAN"
@@ -20,11 +18,9 @@ SYSTEMD_DIR="${STAGE_DIR}/etc/systemd/system"
 DOC_DIR="${STAGE_DIR}/usr/share/doc/${PKG_NAME}"
 RUN_DIR_NAME="${PKG_NAME}"
 
-# --- Переменные для сервиса ---
 SERVICE_USER="${PKG_NAME}"
 SERVICE_GROUP="${PKG_NAME}"
 
-# --- Функции ---
 cleanup() {
     echo "--- Cleaning up previous build ---"
     rm -rf "${BUILD_DIR}"
@@ -50,7 +46,6 @@ create_config() {
 
 create_systemd_service() {
     echo "--- Creating systemd service file ---"
-    # ИСПРАВЛЕНО: Определяем пути, которые будут в целевой системе
     local exec_path="/usr/local/bin/${PKG_NAME}"
     local config_path="/etc/${PKG_NAME}/config.json"
 
@@ -71,7 +66,6 @@ WorkingDirectory=/var/cache/${PKG_NAME}
 RuntimeDirectory=${RUN_DIR_NAME}
 RuntimeDirectoryMode=0750
 
-# Security Hardening
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true

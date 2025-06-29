@@ -29,7 +29,6 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	// 1. Парсинг флагов и загрузка конфигурации.
 	cfgPath := flag.String("config", "/etc/go-apt-cache/config.json", "Path to config file")
 	createCfg := flag.Bool("create-config", false, "Create default config file and exit")
 	flag.Parse()
@@ -43,17 +42,14 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// 2. Настройка логгера.
 	logger, err := logging.New(cfg.Logging)
 	if err != nil {
 		return fmt.Errorf("failed to setup logging: %w", err)
 	}
 	logger.Info().Str("path", *cfgPath).Msg("Configuration loaded")
 
-	// 3. Инициализация зависимостей.
 	util.InitBufferPool(cfg.Cache.BufferSize, logger)
 
-	// ИСПРАВЛЕНО: Вызываем правильный конструктор cache.NewDiskLRU
 	cacheManager, err := cache.NewDiskLRU(cfg.Cache, logger)
 	if err != nil {
 		return fmt.Errorf("failed to initialize cache manager: %w", err)
@@ -64,7 +60,6 @@ func run(ctx context.Context) error {
 
 	app := server.NewApplication(cfg, logger, cacheManager, fetchCoordinator)
 
-	// 4. Создание и запуск HTTP-сервера.
 	srv := server.New(cfg.Server, logger, app.Routes())
 
 	errChan := make(chan error, 1)
@@ -76,7 +71,6 @@ func run(ctx context.Context) error {
 		errChan <- srv.Start()
 	}()
 
-	// 5. Обработка завершения работы.
 	select {
 	case err := <-errChan:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {

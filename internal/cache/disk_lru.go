@@ -1,4 +1,3 @@
-// internal/cache/disk_lru.go
 package cache
 
 import (
@@ -19,19 +18,16 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
-// lruEntry - элемент двусвязного списка для реализации LRU.
 type lruEntry struct {
 	key  string
 	meta *ItemMeta
 }
 
-// metadataUpdate - структура для асинхронного обновления метаданных.
 type metadataUpdate struct {
 	Key  string
 	Meta *ItemMeta
 }
 
-// metadataBatcher собирает обновления метаданных и периодически записывает их на диск.
 type metadataBatcher struct {
 	updates chan metadataUpdate
 	ticker  *time.Ticker
@@ -104,7 +100,6 @@ func (mb *metadataBatcher) close() {
 	mb.wg.Wait()
 }
 
-// DiskLRU - реализация дискового кеша с LRU-стратегией вытеснения.
 type DiskLRU struct {
 	cfg      config.CacheConfig
 	log      *logging.Logger
@@ -122,7 +117,6 @@ type DiskLRU struct {
 	metaBatcher *metadataBatcher
 }
 
-// NewDiskLRU создает новый экземпляр DiskLRU.
 func NewDiskLRU(cfg config.CacheConfig, logger *logging.Logger) (Manager, error) {
 	if !cfg.Enabled {
 		logger.Info().Msg("Cache is disabled in configuration.")
@@ -141,7 +135,7 @@ func NewDiskLRU(cfg config.CacheConfig, logger *logging.Logger) (Manager, error)
 		return nil, fmt.Errorf("failed to initialize disk store at %s: %w", cfg.Dir, err)
 	}
 
-	batchInterval := 30 * time.Second // Можно вынести в конфиг
+	batchInterval := 30 * time.Second
 
 	cache := &DiskLRU{
 		cfg:         cfg,
@@ -167,7 +161,7 @@ func (c *DiskLRU) initialScan() {
 		if err != nil {
 			c.initErr = err
 			c.log.Error().Err(err).Msg("Failed during initial scan")
-			c.ready = true // Помечаем как готовый, но с ошибкой
+			c.ready = true
 			return
 		}
 
@@ -178,7 +172,6 @@ func (c *DiskLRU) initialScan() {
 			meta, err := c.store.ReadMeta(mPath)
 			if err != nil {
 				c.log.Warn().Err(err).Str("path", mPath).Msg("Failed to read metadata, removing artifact")
-				// Ключ извлекаем из имени файла, т.к. прочитать его из JSON не удалось
 				key := strings.TrimSuffix(filepath.Base(mPath), ".meta")
 				c.store.Delete(key)
 				continue
@@ -187,7 +180,6 @@ func (c *DiskLRU) initialScan() {
 			totalSize += meta.Size
 		}
 
-		// ИСПРАВЛЕНО: Сортируем только по LastUsedAt из метаданных.
 		sort.Slice(itemsToSort, func(i, j int) bool {
 			return itemsToSort[i].LastUsedAt.Before(itemsToSort[j].LastUsedAt)
 		})
@@ -218,7 +210,6 @@ func (c *DiskLRU) checkReady() error {
 	return c.initErr
 }
 
-// Get получает элемент из кеша.
 func (c *DiskLRU) Get(ctx context.Context, key string) (*ItemMeta, bool) {
 	if err := c.checkReady(); err != nil {
 		c.log.Error().Err(err).Msg("Cache is not ready")
@@ -238,7 +229,6 @@ func (c *DiskLRU) Get(ctx context.Context, key string) (*ItemMeta, bool) {
 	return elem.Value.(*lruEntry).meta, true
 }
 
-// Put добавляет или обновляет метаданные элемента в кеше.
 func (c *DiskLRU) Put(ctx context.Context, meta *ItemMeta) error {
 	if err := c.checkReady(); err != nil {
 		return err
@@ -299,16 +289,11 @@ func (c *DiskLRU) Delete(ctx context.Context, key string) error {
 }
 
 func (c *DiskLRU) GetContent(ctx context.Context, key string) (io.ReadCloser, error) {
-	// ИСПРАВЛЕНО: Убрали обновление atime
 	return c.store.GetContent(key)
 }
 
 func (c *DiskLRU) PutContent(ctx context.Context, key string, r io.Reader) (int64, error) {
-	// Перед записью проверим, хватит ли места.
-	// Для простоты, предполагаем максимальный размер файла, если он неизвестен.
-	// В реальности, лучше сначала записать во временный файл, узнать размер, а потом вытеснять.
-	// Но для упрощения сделаем так.
-	c.ensureSpace(0) // Запускаем вытеснение, если уже переполнены
+	c.ensureSpace(0)
 	return c.store.PutContent(key, r)
 }
 

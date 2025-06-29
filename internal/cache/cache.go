@@ -8,7 +8,6 @@ import (
 	"time"
 )
 
-// ItemMeta хранит метаданные о кешированном объекте.
 type ItemMeta struct {
 	Key         string      `json:"key"`
 	UpstreamURL string      `json:"upstreamURL"`
@@ -20,12 +19,10 @@ type ItemMeta struct {
 	Size        int64       `json:"size"`
 }
 
-// IsStale проверяет, является ли элемент кеша устаревшим.
 func (m *ItemMeta) IsStale(now time.Time) bool {
 	return m.ExpiresAt.IsZero() || now.After(m.ExpiresAt)
 }
 
-// Manager - это интерфейс для управления кешем.
 type Manager interface {
 	Get(ctx context.Context, key string) (*ItemMeta, bool)
 	Put(ctx context.Context, meta *ItemMeta) error
@@ -35,7 +32,6 @@ type Manager interface {
 	Close()
 }
 
-// noopManager - заглушка для случая, когда кеш отключен.
 type noopManager struct{}
 
 func (n *noopManager) Get(ctx context.Context, key string) (*ItemMeta, bool) { return nil, false }

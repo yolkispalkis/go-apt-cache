@@ -19,7 +19,6 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
-// handleServeRepoContent - основной обработчик запросов к репозиториям.
 func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Request) {
 	repo := r.Context().Value(repoContextKey).(config.Repository)
 	relPath := chi.URLParam(r, "*")
@@ -27,11 +26,9 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 	upstreamURL := repo.URL + relPath
 	log := app.Logger.With().Str("key", key).Str("repo", repo.Name).Logger()
 
-	// 1. Проверка кеша.
 	meta, found := app.Cache.Get(r.Context(), key)
 	if found {
 		log.Debug().Msg("Cache hit")
-		// Обработка негативного кеша (404).
 		if meta.StatusCode == http.StatusNotFound {
 			if meta.IsStale(time.Now()) {
 				log.Info().Msg("Stale negative cache entry, re-fetching")
@@ -44,7 +41,6 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 			return
 		}
 
-		// Обработка обычного кеша.
 		if meta.IsStale(time.Now()) || r.Header.Get("Cache-Control") == "no-cache" {
 			log.Info().Msg("Revalidating stale/no-cache item")
 			app.revalidate(w, r, key, upstreamURL, meta)
@@ -54,15 +50,13 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 2. Кеш промахнулся, загружаем с апстрима.
 	log.Info().Msg("Cache miss, fetching from upstream")
 	app.fetchAndServe(w, r, key, upstreamURL, nil)
 }
 
-// serveFromCache отдает ответ, используя закешированные данные.
 func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key string, meta *cache.ItemMeta) {
 	if util.CheckConditional(w, r, meta.Headers) {
-		return // 304 Not Modified
+		return
 	}
 
 	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
@@ -77,7 +71,7 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			app.Logger.Warn().Str("key", key).Msg("Metadata found, but content is missing. Refetching.")
-			app.Cache.Delete(context.Background(), key) // Удаляем "сломанную" запись
+			app.Cache.Delete(context.Background(), key)
 			app.fetchAndServe(w, r, key, meta.UpstreamURL, nil)
 			return
 		}
@@ -91,7 +85,6 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 	io.Copy(w, content)
 }
 
-// fetchAndServe загружает данные с апстрима, отдает клиенту и кеширует.
 func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, key, upstreamURL string, revalMeta *cache.ItemMeta) {
 	opts := &fetch.Options{}
 	if revalMeta != nil {
@@ -107,10 +100,8 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 	}
 
 	if err != nil {
-		// Обработка 404 ошибки
 		if errors.Is(err, fetch.ErrUpstreamNotFound) {
 			app.Logger.Info().Str("key", key).Msg("Upstream returned 404 Not Found")
-			// Кешируем 404 ответ, если настроено
 			if app.Config.Cache.NegativeTTL > 0 {
 				now := time.Now()
 				meta := &cache.ItemMeta{
@@ -131,7 +122,6 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 			return
 		}
 
-		// Обработка 304 Not Modified
 		if errors.Is(err, fetch.ErrUpstreamNotModified) {
 			app.Logger.Info().Str("key", key).Msg("Revalidation successful (304)")
 			if revalMeta != nil {
@@ -147,7 +137,6 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 			return
 		}
 
-		// Обработка других ошибок
 		app.Logger.Warn().Err(err).Str("key", key).Msg("Failed to fetch from upstream")
 		http.Error(w, "Upstream fetch failed", http.StatusBadGateway)
 		return
@@ -212,7 +201,6 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 	wg.Wait()
 }
 
-// revalidate выполняет условный запрос к апстриму.
 func (app *Application) revalidate(w http.ResponseWriter, r *http.Request, key, upstreamURL string, currentMeta *cache.ItemMeta) {
 	app.fetchAndServe(w, r, key, upstreamURL, currentMeta)
 }
@@ -224,8 +212,6 @@ func (app *Application) handleStatus(w http.ResponseWriter, r *http.Request) {
 	sb.WriteString("Cache status endpoint is active.\n")
 	w.Write([]byte(sb.String()))
 }
-
-// --- Логика вычисления свежести ---
 
 func calculateFreshness(headers http.Header, responseTime time.Time, relPath string, overrides []config.CacheOverride) time.Time {
 	if overrideTTL, ok := findOverrideTTL(relPath, overrides); ok {

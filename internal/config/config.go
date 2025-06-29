@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	kjson "github.com/knadh/koanf/parsers/json" // Исправлено
+	kjson "github.com/knadh/koanf/parsers/json"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 	"github.com/yolkispalkis/go-apt-cache/internal/appinfo"
@@ -18,8 +18,6 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
-// ... остальной код файла без изменений ...
-// (Код идентичен предыдущему ответу, только импорт исправлен)
 type Repository struct {
 	Name    string `koanf:"name"`
 	URL     string `koanf:"url"`
