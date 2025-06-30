@@ -356,7 +356,9 @@ func (s *lruShard) ensureSpace(sizeDelta int64) {
 			Time("last_used", entry.meta.LastUsedAt).
 			Msg("Evicting item from shard")
 
-		go s.store.Delete(entry.key)
+		if err := s.store.Delete(entry.key); err != nil {
+			s.log.Warn().Err(err).Str("key", entry.key).Msg("Failed to delete evicted item files")
+		}
 	}
 }
 

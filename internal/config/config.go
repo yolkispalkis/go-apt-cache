@@ -126,7 +126,12 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("error unmarshalling config: %w", err)
 	}
 
-	return cfg, validate(cfg)
+	if err := validate(cfg); err != nil {
+		return nil, err
+	}
+
+	normalize(cfg)
+	return cfg, nil
 }
 
 func validate(c *Config) error {
@@ -164,11 +169,17 @@ func validate(c *Config) error {
 		if u.Scheme != "http" && u.Scheme != "https" {
 			return fmt.Errorf("repo %q: URL scheme must be http or https", repo.Name)
 		}
+	}
+	return nil
+}
+
+func normalize(c *Config) {
+	for i := range c.Repositories {
+		repo := &c.Repositories[i]
 		if !strings.HasSuffix(repo.URL, "/") {
 			repo.URL += "/"
 		}
 	}
-	return nil
 }
 
 func EnsureDefault(path string) error {

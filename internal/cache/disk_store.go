@@ -127,7 +127,15 @@ func (ds *diskStore) ScanMetaFiles() ([]string, error) {
 func (ds *diskStore) Delete(key string) error {
 	contentPath := ds.keyToPath(key, contentSuffix)
 	metaPath := ds.keyToPath(key, metaSuffix)
-	_ = os.Remove(contentPath)
-	_ = os.Remove(metaPath)
+
+	errContent := os.Remove(contentPath)
+	errMeta := os.Remove(metaPath)
+
+	if errContent != nil && !os.IsNotExist(errContent) {
+		return fmt.Errorf("failed to remove content file: %w", errContent)
+	}
+	if errMeta != nil && !os.IsNotExist(errMeta) {
+		return fmt.Errorf("failed to remove meta file: %w", errMeta)
+	}
 	return nil
 }

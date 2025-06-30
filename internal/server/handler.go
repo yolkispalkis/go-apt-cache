@@ -143,6 +143,9 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 	fetchRes := sharedFetch.Result
 	err := sharedFetch.Err
 
+	if fetchRes != nil && fetchRes.Header != nil {
+		defer util.ReturnHeader(fetchRes.Header)
+	}
 	if fetchRes != nil && fetchRes.Body != nil {
 		defer fetchRes.Body.Close()
 	}
@@ -174,13 +177,18 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 		if errors.Is(err, fetch.ErrUpstreamNotModified) {
 			app.Logger.Info().Str("key", key).Msg("Revalidation successful (304)")
 			if revalMeta != nil {
-				revalMeta.ExpiresAt = calculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides)
-				revalMeta.LastUsedAt = time.Now()
-				util.UpdateCacheHeaders(revalMeta.Headers, fetchRes.Header)
-				if err := app.Cache.Put(r.Context(), revalMeta); err != nil {
+				updatedMeta := *revalMeta
+				updatedMeta.Headers = util.CopyHeader(revalMeta.Headers)
+
+				updatedMeta.ExpiresAt = calculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides)
+				updatedMeta.LastUsedAt = time.Now()
+				util.UpdateCacheHeaders(updatedMeta.Headers, fetchRes.Header)
+
+				if err := app.Cache.Put(r.Context(), &updatedMeta); err != nil {
 					app.Logger.Error().Err(err).Str("key", key).Msg("Failed to update metadata after 304")
+					util.ReturnHeader(updatedMeta.Headers)
 				}
-				app.serveFromCache(w, r, key, revalMeta, relPath)
+				app.serveFromCache(w, r, key, &updatedMeta, relPath)
 			}
 			return
 		}

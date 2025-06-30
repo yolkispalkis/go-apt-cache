@@ -95,7 +95,11 @@ func NewCoordinator(cfg config.ServerConfig, logger *logging.Logger) *Coordinato
 func (c *Coordinator) Fetch(ctx context.Context, key, upstreamURL string, opts *Options) (any, error, bool) {
 	resInterface, err, shared := c.sfGroup.Do(key, func() (any, error) {
 		c.log.Debug().Str("key", key).Msg("Executing actual fetch")
-		result, fetchErr := c.doFetch(ctx, upstreamURL, opts)
+
+		fetchCtx, cancel := context.WithTimeout(context.Background(), c.client.Timeout)
+		defer cancel()
+
+		result, fetchErr := c.doFetch(fetchCtx, upstreamURL, opts)
 
 		return &SharedFetch{
 			Result: result,

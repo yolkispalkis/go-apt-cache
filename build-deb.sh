@@ -112,7 +112,7 @@ systemctl daemon-reload
 if [ "\$1" = "configure" ]; then
     systemctl enable ${PKG_NAME}.service
     if [ -z "\${DPKG_ROOT}" ]; then
-        systemctl try-restart ${PKG_NAME}.service || true
+        systemctl start ${PKG_NAME}.service || true
     fi
 fi
 EOF
