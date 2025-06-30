@@ -60,7 +60,7 @@ func NewDiskLRU(cfg config.CacheConfig, logger *logging.Logger) (Manager, error)
 		manager.shards[i] = shard
 	}
 
-	go manager.initialScan()
+	manager.initialScan()
 
 	return manager, nil
 }
@@ -252,6 +252,16 @@ func (s *lruShard) Put(ctx context.Context, meta *ItemMeta) error {
 		return err
 	}
 
+	var sizeDelta int64
+	s.mu.RLock()
+	if oldElem, exists := s.items[meta.Key]; exists {
+		sizeDelta = meta.Size - oldElem.Value.(*lruEntry).meta.Size
+	} else {
+		sizeDelta = meta.Size
+	}
+	s.mu.RUnlock()
+	s.ensureSpace(sizeDelta)
+
 	if err := s.store.WriteMetadata(meta); err != nil {
 		return fmt.Errorf("disk store write for key %s: %w", meta.Key, err)
 	}
@@ -313,7 +323,6 @@ func (s *lruShard) GetContent(ctx context.Context, key string) (io.ReadCloser, e
 }
 
 func (s *lruShard) PutContent(ctx context.Context, key string, r io.Reader) (int64, error) {
-	s.ensureSpace(0)
 	return s.store.PutContent(key, r)
 }
 
@@ -323,11 +332,15 @@ func (s *lruShard) Close() {
 	}
 }
 
-func (s *lruShard) ensureSpace(requiredSize int64) {
+func (s *lruShard) ensureSpace(sizeDelta int64) {
+	if sizeDelta <= 0 || s.maxBytes <= 0 || s.currentBytes.Load()+sizeDelta <= s.maxBytes {
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for s.currentBytes.Load()+requiredSize > s.maxBytes && s.lruList.Len() > 0 {
+	for s.currentBytes.Load()+sizeDelta > s.maxBytes && s.lruList.Len() > 0 {
 		elem := s.lruList.Back()
 		if elem == nil {
 			return

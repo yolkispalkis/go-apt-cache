@@ -3,7 +3,7 @@ set -e
 
 PKG_NAME="go-apt-cache"
 PKG_VERSION="3.0.7"
-PKG_ARCH="amd64"
+PKG_ARCH=$(dpkg --print-architecture)
 PKG_MAINTAINER="yolkispalkis <me@w3h.su>"
 PKG_DESCRIPTION="A high-performance caching proxy for APT repositories, written in Go."
 APP_MAIN_PACKAGE="github.com/yolkispalkis/go-apt-cache"
@@ -34,7 +34,7 @@ create_dirs() {
 build_binary() {
     echo "--- Building ${PKG_NAME} binary ---"
     LD_FLAGS="-s -w -X '${APP_MAIN_PACKAGE}/internal/appinfo.AppVersion=${PKG_VERSION}'"
-    go build -ldflags="${LD_FLAGS}" -o "${BIN_DIR}/${PKG_NAME}" "${APP_CMD_PATH}"
+    GOARCH=${PKG_ARCH} go build -ldflags="${LD_FLAGS}" -o "${BIN_DIR}/${PKG_NAME}" "${APP_CMD_PATH}"
     chmod 755 "${BIN_DIR}/${PKG_NAME}"
 }
 
@@ -112,7 +112,7 @@ systemctl daemon-reload
 if [ "\$1" = "configure" ]; then
     systemctl enable ${PKG_NAME}.service
     if [ -z "\${DPKG_ROOT}" ]; then
-        systemctl restart ${PKG_NAME}.service
+        systemctl try-restart ${PKG_NAME}.service || true
     fi
 fi
 EOF
