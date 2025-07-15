@@ -52,6 +52,7 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 		app.fetchAndServe(w, r, key, upstreamURL, nil, cleanRelPath, log)
 		return
 	}
+	defer util.ReturnHeader(meta.Headers)
 
 	log.Debug().Msg("Cache hit")
 	if meta.StatusCode == http.StatusNotFound {
@@ -212,6 +213,7 @@ func handleSharedFetch(app *Application, w http.ResponseWriter, r *http.Request,
 		http.Error(w, "Failed to retrieve file after fetch", http.StatusInternalServerError)
 		return
 	}
+	defer util.ReturnHeader(meta.Headers)
 	app.serveFromCache(w, r, key, meta, relPath, log)
 }
 
@@ -233,7 +235,6 @@ func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, 
 			if putErr := app.Cache.Put(r.Context(), meta); putErr != nil {
 				log.Error().Err(putErr).Msg("Failed to save negative cache entry")
 			}
-			util.ReturnHeader(meta.Headers)
 		}
 		util.CopyWhitelistedHeaders(w.Header(), fetchRes.Header)
 		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
@@ -290,7 +291,6 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 		if err := app.Cache.Put(r.Context(), meta); err != nil {
 			log.Error().Err(err).Msg("Failed to save metadata for HEAD request")
 		}
-		util.ReturnHeader(meta.Headers)
 		return
 	}
 
@@ -307,14 +307,12 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 				log.Error().Err(err).Msg("Failed to write content to cache")
 			}
 			app.Cache.Delete(context.Background(), key)
-			util.ReturnHeader(m.Headers)
 			return
 		}
 		m.Size = written
 		if err := app.Cache.Put(context.Background(), m); err != nil {
 			log.Error().Err(err).Msg("Failed to save metadata after content write")
 		}
-		util.ReturnHeader(m.Headers)
 	}(meta)
 
 	tee := io.TeeReader(fetchRes.Body, pw)
