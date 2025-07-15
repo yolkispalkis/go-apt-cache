@@ -3,7 +3,6 @@ package cache
 import (
 	"container/list"
 	"context"
-	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -82,6 +81,10 @@ func (sm *ShardedManager) getShardIndex(key string) uint64 {
 
 func (sm *ShardedManager) getShard(key string) *lruShard {
 	return sm.shards[sm.getShardIndex(key)]
+}
+
+func (sm *ShardedManager) IsReady(key string) bool {
+	return sm.getShard(key).IsReady()
 }
 
 func (sm *ShardedManager) initialScan() error {
@@ -189,7 +192,7 @@ type lruShard struct {
 	lruList      *list.List
 	currentBytes atomic.Int64
 	initErr      error
-	ready        bool
+	ready        atomic.Bool
 	metaBatcher  *metadataBatcher
 }
 
@@ -236,20 +239,16 @@ func (s *lruShard) populateFromScan(metas []*ItemMeta) error {
 		Str("size", util.FormatSize(totalSize)).
 		Msg("Shard population complete")
 
-	s.ready = true
+	s.ready.Store(true)
 	return nil
 }
 
-func (s *lruShard) checkReady() error {
-	if !s.ready {
-		return errors.New("cache shard is not ready (initial scan in progress)")
-	}
-	return s.initErr
+func (s *lruShard) IsReady() bool {
+	return s.ready.Load()
 }
 
 func (s *lruShard) Get(ctx context.Context, key string) (*ItemMeta, bool) {
-	if err := s.checkReady(); err != nil {
-		s.log.Error().Err(err).Msg("Cache shard is not ready")
+	if !s.IsReady() {
 		return nil, false
 	}
 
@@ -269,8 +268,8 @@ func (s *lruShard) Get(ctx context.Context, key string) (*ItemMeta, bool) {
 }
 
 func (s *lruShard) Put(ctx context.Context, meta *ItemMeta) error {
-	if err := s.checkReady(); err != nil {
-		return err
+	if !s.IsReady() {
+		s.log.Debug().Str("key", meta.Key).Msg("Putting item while shard is not fully ready")
 	}
 
 	var sizeDelta int64
