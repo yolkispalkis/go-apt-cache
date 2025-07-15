@@ -129,7 +129,6 @@ func (lru *SimpleLRU) Put(ctx context.Context, meta *ItemMeta) error {
 	}
 
 	lru.mu.Lock()
-	defer lru.mu.Unlock()
 
 	if oldElem, exists := lru.items[meta.Key]; exists {
 		oldMeta := oldElem.Value.(*lruEntry).meta
@@ -138,12 +137,22 @@ func (lru *SimpleLRU) Put(ctx context.Context, meta *ItemMeta) error {
 		util.ReturnHeader(oldMeta.Headers)
 	}
 
-	lru.ensureSpace(meta.Size)
+	keysToEvict := lru.ensureSpaceLocked(meta.Size)
 
 	entry := &lruEntry{key: meta.Key, meta: meta}
 	elem := lru.lruList.PushFront(entry)
 	lru.items[meta.Key] = elem
 	lru.currentBytes += meta.Size
+
+	lru.mu.Unlock()
+
+	for _, key := range keysToEvict {
+		go func(k string) {
+			if err := lru.store.Delete(k); err != nil {
+				lru.log.Error().Err(err).Str("key", k).Msg("Failed to delete evicted item files")
+			}
+		}(key)
+	}
 
 	lru.log.Debug().Str("key", meta.Key).Str("size", util.FormatSize(meta.Size)).Msg("Item metadata added/updated")
 	return nil
@@ -175,16 +184,21 @@ func (lru *SimpleLRU) Close() {
 	lru.log.Info().Msg("SimpleLRU cache closed.")
 }
 
-func (lru *SimpleLRU) ensureSpace(needed int64) {
+func (lru *SimpleLRU) ensureSpaceLocked(needed int64) []string {
+	var keysToEvict []string
 	for lru.maxBytes > 0 && (lru.currentBytes+needed) > lru.maxBytes && lru.lruList.Len() > 0 {
-		lru.evictOne()
+		key := lru.evictOneLocked()
+		if key != "" {
+			keysToEvict = append(keysToEvict, key)
+		}
 	}
+	return keysToEvict
 }
 
-func (lru *SimpleLRU) evictOne() {
+func (lru *SimpleLRU) evictOneLocked() string {
 	elem := lru.lruList.Back()
 	if elem == nil {
-		return
+		return ""
 	}
 	entry := lru.lruList.Remove(elem).(*lruEntry)
 	delete(lru.items, entry.key)
@@ -197,7 +211,5 @@ func (lru *SimpleLRU) evictOne() {
 		Time("last_used", entry.meta.LastUsedAt).
 		Msg("Evicting item")
 
-	if err := lru.store.Delete(entry.key); err != nil {
-		lru.log.Error().Err(err).Str("key", entry.key).Msg("Failed to delete evicted item files")
-	}
+	return entry.key
 }

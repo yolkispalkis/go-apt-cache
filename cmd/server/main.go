@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
@@ -113,25 +112,14 @@ func run(ctx context.Context) error {
 }
 
 func cleanCacheDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return nil
 	}
-	defer d.Close()
-
-	names, err := d.Readdirnames(-1)
-	if err != nil {
-		return err
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("failed to remove cache directory: %w", err)
 	}
-
-	for _, name := range names {
-		err = os.RemoveAll(filepath.Join(dir, name))
-		if err != nil {
-			return err
-		}
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return fmt.Errorf("failed to recreate cache directory: %w", err)
 	}
 	return nil
 }

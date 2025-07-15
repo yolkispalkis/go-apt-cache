@@ -309,9 +309,11 @@ func (h *requestHandler) streamToClientAndCache(fetchRes *fetch.Result, meta *ca
 	var wg sync.WaitGroup
 	wg.Add(1)
 
+	ctx := h.r.Context()
+
 	go func(m *cache.ItemMeta) {
 		defer wg.Done()
-		written, err := h.cache.PutContent(h.r.Context(), h.key, pr)
+		written, err := h.cache.PutContent(ctx, h.key, pr)
 		if err != nil {
 			if !util.IsClientDisconnectedError(err) {
 				h.log.Error().Err(err).Msg("Failed to write content to cache")
@@ -320,7 +322,7 @@ func (h *requestHandler) streamToClientAndCache(fetchRes *fetch.Result, meta *ca
 			return
 		}
 		m.Size = written
-		if err := h.cache.Put(context.Background(), m); err != nil {
+		if err := h.cache.Put(ctx, m); err != nil {
 			h.log.Error().Err(err).Msg("Failed to save metadata after content write")
 		}
 	}(meta)
