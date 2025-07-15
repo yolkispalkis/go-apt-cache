@@ -134,7 +134,7 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 }
 
 func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, key, upstreamURL string, revalMeta *cache.ItemMeta, relPath string, log *logging.Logger) {
-	opts := extractOptions(revalMeta)
+	opts := extractOptions(r, revalMeta)
 	resInterface, _, shared := app.Fetcher.Fetch(r.Context(), key, upstreamURL, opts)
 
 	sharedFetch, ok := resInterface.(*fetch.SharedFetch)
@@ -146,12 +146,17 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 	handleFetchResult(app, w, r, key, upstreamURL, relPath, sharedFetch, shared, revalMeta, log)
 }
 
-func extractOptions(revalMeta *cache.ItemMeta) *fetch.Options {
-	if revalMeta == nil {
-		return &fetch.Options{}
+func extractOptions(r *http.Request, revalMeta *cache.ItemMeta) *fetch.Options {
+	if revalMeta != nil {
+		opts := &fetch.Options{IfNoneMatch: revalMeta.Headers.Get("ETag")}
+		if t, err := http.ParseTime(revalMeta.Headers.Get("Last-Modified")); err == nil {
+			opts.IfModSince = t
+		}
+		return opts
 	}
-	opts := &fetch.Options{IfNoneMatch: revalMeta.Headers.Get("ETag")}
-	if t, err := http.ParseTime(revalMeta.Headers.Get("Last-Modified")); err == nil {
+
+	opts := &fetch.Options{IfNoneMatch: r.Header.Get("If-None-Match")}
+	if t, err := http.ParseTime(r.Header.Get("If-Modified-Since")); err == nil {
 		opts.IfModSince = t
 	}
 	return opts
@@ -238,6 +243,9 @@ func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, 
 	if errors.Is(err, fetch.ErrUpstreamNotModified) {
 		log.Info().Err(err).Msg("Revalidation successful (304)")
 		if revalMeta == nil {
+			log.Warn().Msg("Upstream returned 304 on a cache miss. Forwarding to client, but unable to cache.")
+			util.CopyWhitelistedHeaders(w.Header(), fetchRes.Header)
+			w.WriteHeader(http.StatusNotModified)
 			return
 		}
 		updatedMeta := *revalMeta
@@ -260,12 +268,7 @@ func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, 
 }
 
 func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request, key, upstreamURL, relPath string, fetchRes *fetch.Result, log *logging.Logger) {
-	if util.CheckConditional(w, r, fetchRes.Header) {
-		return
-	}
-
 	now := time.Now()
-	// Делаем копию headers для meta, чтобы не потерять их после возврата в pool
 	headersCopy := util.CopyHeader(fetchRes.Header)
 
 	meta := &cache.ItemMeta{
@@ -276,7 +279,7 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 		StatusCode:  fetchRes.Status,
 		Headers:     headersCopy,
 		Size:        fetchRes.Size,
-		ExpiresAt:   calculateFreshness(headersCopy, now, relPath, app.Config.Cache.Overrides), // Используем копию для расчёта
+		ExpiresAt:   calculateFreshness(headersCopy, now, relPath, app.Config.Cache.Overrides),
 	}
 
 	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
@@ -294,8 +297,9 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 	pr, pw := io.Pipe()
 	var wg sync.WaitGroup
 	wg.Add(1)
+	var copyErr error
 
-	go func(m *cache.ItemMeta) { // Передаём meta в goroutine
+	go func(m *cache.ItemMeta) {
 		defer wg.Done()
 		written, err := app.Cache.PutContent(r.Context(), key, pr)
 		if err != nil {
@@ -303,19 +307,25 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 				log.Error().Err(err).Msg("Failed to write content to cache")
 			}
 			app.Cache.Delete(context.Background(), key)
-			util.ReturnHeader(m.Headers) // Возвращаем только если ошибка
+			util.ReturnHeader(m.Headers)
 			return
 		}
 		m.Size = written
 		if err := app.Cache.Put(context.Background(), m); err != nil {
 			log.Error().Err(err).Msg("Failed to save metadata after content write")
 		}
-		util.ReturnHeader(m.Headers) // Возвращаем после успешного Put
+		util.ReturnHeader(m.Headers)
 	}(meta)
 
 	tee := io.TeeReader(fetchRes.Body, pw)
-	w.WriteHeader(meta.StatusCode)
-	_, copyErr := io.Copy(w, tee)
+
+	if util.CheckConditional(w, r, meta.Headers) {
+		log.Debug().Msg("Client has fresh version, sending 304 and caching in background.")
+		_, copyErr = io.Copy(io.Discard, tee)
+	} else {
+		w.WriteHeader(meta.StatusCode)
+		_, copyErr = io.Copy(w, tee)
+	}
 
 	if copyErr != nil {
 		pw.CloseWithError(copyErr)
