@@ -260,13 +260,15 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 	}
 
 	now := time.Now()
+	headersCopy := util.CopyHeader(fetchRes.Header)
+
 	meta := &cache.ItemMeta{
 		Key:         key,
 		UpstreamURL: upstreamURL,
 		FetchedAt:   now,
 		LastUsedAt:  now,
 		StatusCode:  fetchRes.Status,
-		Headers:     util.CopyHeader(fetchRes.Header),
+		Headers:     headersCopy,
 		Size:        fetchRes.Size,
 		ExpiresAt:   calculateFreshness(fetchRes.Header, now, relPath, app.Config.Cache.Overrides),
 	}
