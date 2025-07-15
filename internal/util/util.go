@@ -66,7 +66,13 @@ func ParseSize(s string) (int64, error) {
 		}
 		return 0, fmt.Errorf("invalid size format: %q", s)
 	}
-	val, _ := strconv.ParseFloat(m[1], 64)
+	val, err := strconv.ParseFloat(m[1], 64) // Изменено: полная проверка
+	if err != nil {
+		return 0, err
+	}
+	if val != float64(int64(val)) { // Reject fractional
+		return 0, fmt.Errorf("fractional sizes not supported: %q", s)
+	}
 	var mult float64 = 1
 	switch m[2] {
 	case "K":
@@ -185,10 +191,11 @@ func CompareETags(clientETagsStr, resourceETag string) bool {
 	if clientETagsStr == "*" {
 		return true
 	}
-	normResourceETag := strings.Trim(strings.TrimPrefix(resourceETag, "W/"), `"`)
+	normResource := strings.TrimPrefix(strings.Trim(resourceETag, `"`), "W/")
+
 	for _, cTag := range strings.Split(clientETagsStr, ",") {
-		normClientTag := strings.Trim(strings.TrimPrefix(strings.TrimSpace(cTag), "W/"), `"`)
-		if normClientTag == normResourceETag {
+		normClient := strings.TrimPrefix(strings.Trim(strings.TrimSpace(cTag), `"`), "W/")
+		if normClient == normResource { // Match regardless of weak if tags equal
 			return true
 		}
 	}

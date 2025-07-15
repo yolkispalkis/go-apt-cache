@@ -50,6 +50,7 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 				app.fetchAndServe(w, r, key, upstreamURL, nil, cleanRelPath)
 			} else {
 				log.Debug().Msg("Serving 404 from negative cache")
+				util.CopyWhitelistedHeaders(w.Header(), meta.Headers) // Добавлено
 				http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			}
 			return
@@ -73,6 +74,13 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 		return
 	}
 
+	if r.Context().Value("refetching") != nil { // Guard
+		app.Logger.Error().Str("key", key).Msg("Refetch loop detected, aborting")
+		http.Error(w, "Internal cache error", http.StatusInternalServerError)
+		return
+	}
+	ctx := context.WithValue(r.Context(), "refetching", true)
+
 	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
 	w.Header().Set("X-Cache-Status", "HIT")
 
@@ -85,8 +93,8 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			app.Logger.Warn().Str("key", key).Msg("Metadata found, but content is missing. Refetching.")
-			app.Cache.Delete(r.Context(), key)
-			app.fetchAndServe(w, r, key, meta.UpstreamURL, nil, cleanRelPath)
+			app.Cache.Delete(ctx, key)
+			app.fetchAndServe(w, r.WithContext(ctx), key, meta.UpstreamURL, nil, cleanRelPath) // Use ctx
 			return
 		}
 		app.Logger.Error().Err(err).Str("key", key).Msg("Failed to get content for cached metadata")
@@ -96,7 +104,13 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 	defer content.Close()
 
 	w.WriteHeader(meta.StatusCode)
-	io.Copy(w, content)
+
+	buf := util.GetBuffer()
+	defer util.ReturnBuffer(buf)
+	_, err = io.CopyBuffer(w, content, buf) // Изменено на CopyBuffer
+	if err != nil {
+		app.Logger.Warn().Err(err).Str("key", key).Msg("Error copying cached content to response")
+	}
 }
 
 func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, key, upstreamURL string, revalMeta *cache.ItemMeta, relPath string) {
@@ -143,13 +157,14 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 	fetchRes := sharedFetch.Result
 	err := sharedFetch.Err
 
+	defer close(sharedFetch.Done) // Перенесено сюда, перед обработкой ошибок
+
 	if fetchRes != nil && fetchRes.Header != nil {
 		defer util.ReturnHeader(fetchRes.Header)
 	}
 	if fetchRes != nil && fetchRes.Body != nil {
 		defer fetchRes.Body.Close()
 	}
-	defer close(sharedFetch.Done)
 
 	if err != nil {
 		if errors.Is(err, fetch.ErrUpstreamNotFound) {
@@ -170,6 +185,7 @@ func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, ke
 					app.Logger.Error().Err(err).Str("key", key).Msg("Failed to save negative cache entry")
 				}
 			}
+			util.CopyWhitelistedHeaders(w.Header(), fetchRes.Header) // Добавлено: копируем заголовки
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}

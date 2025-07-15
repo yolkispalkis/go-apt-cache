@@ -79,9 +79,18 @@ func (sm *ShardedManager) initialScan() {
 	sm.log.Info().Msg("Starting initial disk scan for all shards...")
 	startTime := time.Now()
 
-	metaFiles, err := sm.store.ScanMetaFiles()
+	var metaFiles []string
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ { // Добавлен retry
+		metaFiles, err = sm.store.ScanMetaFiles()
+		if err == nil {
+			break
+		}
+		sm.log.Warn().Err(err).Int("attempt", attempt).Msg("Failed during initial scan, retrying")
+		time.Sleep(time.Second)
+	}
 	if err != nil {
-		sm.log.Error().Err(err).Msg("Failed during initial scan file listing")
+		sm.log.Error().Err(err).Msg("Failed during initial scan file listing after retries")
 		for _, s := range sm.shards {
 			s.initErr = err
 			s.ready = true
@@ -201,7 +210,7 @@ func (s *lruShard) populateFromScan(metaPaths []string) {
 	}
 
 	sort.Slice(itemsToSort, func(i, j int) bool {
-		return itemsToSort[i].LastUsedAt.Before(itemsToSort[j].LastUsedAt)
+		return itemsToSort[i].LastUsedAt.After(itemsToSort[j].LastUsedAt) // Изменено на After (descending)
 	})
 
 	s.mu.Lock()
@@ -212,6 +221,11 @@ func (s *lruShard) populateFromScan(metaPaths []string) {
 	}
 	s.mu.Unlock()
 	s.currentBytes.Store(totalSize)
+
+	// Добавлено: возвращаем headers после использования (они больше не нужны в slice)
+	for _, meta := range itemsToSort {
+		util.ReturnHeader(meta.Headers)
+	}
 
 	s.log.Debug().
 		Int("items", len(itemsToSort)).
@@ -260,11 +274,13 @@ func (s *lruShard) Put(ctx context.Context, meta *ItemMeta) error {
 		sizeDelta = meta.Size
 	}
 	s.mu.RUnlock()
-	s.ensureSpace(sizeDelta)
 
+	// Перенесено: ensureSpace после WriteMetadata
 	if err := s.store.WriteMetadata(meta); err != nil {
 		return fmt.Errorf("disk store write for key %s: %w", meta.Key, err)
 	}
+
+	s.ensureSpace(sizeDelta) // Теперь эвикция только если мета сохранена
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -280,6 +296,10 @@ func (s *lruShard) Put(ctx context.Context, meta *ItemMeta) error {
 	elem := s.lruList.PushFront(entry)
 	s.items[meta.Key] = elem
 	s.currentBytes.Add(meta.Size)
+	if s.currentBytes.Load() < 0 { // Коррекция
+		s.log.Warn().Str("key", meta.Key).Msg("Negative cache size detected, resetting to 0")
+		s.currentBytes.Store(0)
+	}
 
 	s.log.Debug().Str("key", meta.Key).Str("size", util.FormatSize(meta.Size)).Msg("Item metadata added/updated in shard")
 	return nil
@@ -298,9 +318,13 @@ func (s *lruShard) MarkUsed(ctx context.Context, key string) {
 	s.lruList.MoveToFront(elem)
 
 	metaCopy := *meta
-	metaCopy.Headers = util.CopyHeader(meta.Headers)
+	metaCopy.Headers = util.CopyHeader(meta.Headers) // Перенесено внутрь мьютекса
 	s.mu.Unlock()
 
+	if ctx.Err() != nil { // Check cancel
+		util.ReturnHeader(metaCopy.Headers)
+		return
+	}
 	s.metaBatcher.schedule(key, &metaCopy)
 }
 
@@ -357,7 +381,11 @@ func (s *lruShard) ensureSpace(sizeDelta int64) {
 			Msg("Evicting item from shard")
 
 		if err := s.store.Delete(entry.key); err != nil {
-			s.log.Warn().Err(err).Str("key", entry.key).Msg("Failed to delete evicted item files")
+			s.log.Warn().Err(err).Str("key", entry.key).Msg("Failed to delete evicted item files, retrying once")
+			time.Sleep(100 * time.Millisecond) // Короткая задержка
+			if err := s.store.Delete(entry.key); err != nil {
+				s.log.Error().Err(err).Str("key", entry.key).Msg("Failed to delete evicted item files after retry; orphan files possible")
+			}
 		}
 	}
 }
@@ -373,12 +401,14 @@ type metadataUpdate struct {
 }
 
 type metadataBatcher struct {
-	updates chan metadataUpdate
-	ticker  *time.Ticker
-	store   *diskStore
-	log     *logging.Logger
-	done    chan struct{}
-	wg      sync.WaitGroup
+	updates      chan metadataUpdate
+	ticker       *time.Ticker
+	store        *diskStore
+	log          *logging.Logger
+	done         chan struct{}
+	wg           sync.WaitGroup
+	closeOnce    sync.Once    // Добавлено для idempotent close
+	droppedCount atomic.Int64 // Добавлено для логирования drops
 }
 
 func newMetadataBatcher(store *diskStore, logger *logging.Logger, interval time.Duration) *metadataBatcher {
@@ -433,13 +463,16 @@ func (mb *metadataBatcher) schedule(key string, meta *ItemMeta) {
 	select {
 	case mb.updates <- metadataUpdate{Key: key, Meta: meta}:
 	default:
-		mb.log.Warn().Str("key", key).Msg("Metadata update queue full, dropping update")
+		mb.droppedCount.Add(1)
+		mb.log.Warn().Str("key", key).Int64("total_dropped", mb.droppedCount.Load()).Msg("Metadata update queue full, dropping update")
 		util.ReturnHeader(meta.Headers)
 	}
 }
 
 func (mb *metadataBatcher) close() {
-	close(mb.done)
+	mb.closeOnce.Do(func() {
+		close(mb.done)
+	})
 	mb.ticker.Stop()
 	mb.wg.Wait()
 }

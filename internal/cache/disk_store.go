@@ -57,20 +57,25 @@ func (ds *diskStore) PutContent(key string, r io.Reader) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer os.Remove(tmpFile.Name())
+	tmpName := tmpFile.Name() // Захватываем имя
+	defer func() {
+		if err := os.Remove(tmpName); err != nil && !os.IsNotExist(err) { // Игнорим только NotExist
+			ds.log.Warn().Err(err).Str("temp_file", tmpName).Msg("Failed to clean up temporary file")
+		}
+	}()
 
 	buf := util.GetBuffer()
 	written, err := io.CopyBuffer(tmpFile, r, buf)
 	util.ReturnBuffer(buf)
 
 	if err != nil {
-		tmpFile.Close()
+		tmpFile.Close() // Закрываем перед return
 		return 0, err
 	}
 	if err := tmpFile.Close(); err != nil {
 		return 0, err
 	}
-	return written, os.Rename(tmpFile.Name(), path)
+	return written, os.Rename(tmpName, path)
 }
 
 func (ds *diskStore) WriteMetadata(meta *ItemMeta) error {

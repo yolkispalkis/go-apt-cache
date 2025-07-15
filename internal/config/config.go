@@ -146,8 +146,12 @@ func validate(c *Config) error {
 		if c.Cache.Dir == "" {
 			return errors.New("cache.directory must be set if cache is enabled")
 		}
-		if _, err := util.ParseSize(c.Cache.MaxSize); err != nil {
+		maxBytes, err := util.ParseSize(c.Cache.MaxSize)
+		if err != nil {
 			return fmt.Errorf("invalid cache.maxSize %q: %w", c.Cache.MaxSize, err)
+		}
+		if maxBytes <= 0 { // Добавлено
+			return errors.New("cache.maxSize must be greater than 0 if cache is enabled")
 		}
 	}
 
@@ -176,9 +180,11 @@ func validate(c *Config) error {
 func normalize(c *Config) {
 	for i := range c.Repositories {
 		repo := &c.Repositories[i]
-		if !strings.HasSuffix(repo.URL, "/") {
-			repo.URL += "/"
+		u, _ := url.Parse(repo.URL) // Assume valid from validate
+		if u.Path != "" && !strings.HasSuffix(u.Path, "/") {
+			u.Path += "/"
 		}
+		repo.URL = u.String() // Safe rebuild
 	}
 }
 
