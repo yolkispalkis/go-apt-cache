@@ -24,135 +24,164 @@ import (
 const (
 	cacheStatusHit  = "HIT"
 	cacheStatusMiss = "MISS"
-	refetchKey      = "refetching" // Context key for loop guard
 )
 
-func handleServeRepoContent(w http.ResponseWriter, r *http.Request) {
-	logger := r.Context().Value(loggerContextKey).(*logging.Logger)
-	cacheManager := r.Context().Value(cacheContextKey).(cache.Manager)
-	fetcher := r.Context().Value(fetcherContextKey).(*fetch.Coordinator)
-	cfg := r.Context().Value(configContextKey).(*config.Config)
-	repo := r.Context().Value(repoContextKey).(config.Repository)
+type requestHandler struct {
+	w   http.ResponseWriter
+	r   *http.Request
+	log *logging.Logger
 
+	cache   cache.Manager
+	fetcher *fetch.Coordinator
+	cfg     *config.Config
+
+	repo         config.Repository
+	key          string
+	upstreamURL  string
+	cleanRelPath string
+}
+
+func newRequestHandler(w http.ResponseWriter, r *http.Request) (*requestHandler, error) {
+	repo := r.Context().Value(repoContextKey).(config.Repository)
 	relPath := chi.URLParam(r, "*")
 	cleanRelPath := filepath.Clean(relPath)
 
 	if strings.HasPrefix(cleanRelPath, "..") || cleanRelPath == ".." || cleanRelPath == "." {
+		logger := r.Context().Value(loggerContextKey).(*logging.Logger)
 		logger.Warn().
 			Str("repo", repo.Name).
 			Str("remote_addr", r.RemoteAddr).
 			Str("raw_path", relPath).
 			Msg("Path traversal attempt blocked")
-		http.Error(w, "Invalid path", http.StatusBadRequest)
-		return
+		return nil, errors.New("invalid path")
 	}
 
 	key := repo.Name + "/" + cleanRelPath
-	upstreamURL := repo.URL + cleanRelPath
-	log := logger.WithContext("key", key, "repo", repo.Name)
+	h := &requestHandler{
+		w:            w,
+		r:            r,
+		log:          r.Context().Value(loggerContextKey).(*logging.Logger).WithContext("key", key, "repo", repo.Name),
+		cache:        r.Context().Value(cacheContextKey).(cache.Manager),
+		fetcher:      r.Context().Value(fetcherContextKey).(*fetch.Coordinator),
+		cfg:          r.Context().Value(configContextKey).(*config.Config),
+		repo:         repo,
+		key:          key,
+		upstreamURL:  repo.URL + cleanRelPath,
+		cleanRelPath: cleanRelPath,
+	}
+	return h, nil
+}
 
-	meta, found := cacheManager.Get(r.Context(), key)
+func (h *requestHandler) process() {
+	meta, found := h.cache.Get(h.r.Context(), h.key)
 	if !found {
-		log.Info().Msg("Cache miss, fetching from upstream")
-		fetchAndServe(w, r, key, upstreamURL, nil, cleanRelPath, log, fetcher, cacheManager, cfg)
+		h.log.Info().Msg("Cache miss, fetching from upstream")
+		h.fetchAndServe(nil)
 		return
 	}
 	defer util.ReturnHeader(meta.Headers)
 
-	log.Debug().Msg("Cache hit")
+	h.log.Debug().Msg("Cache hit")
+
 	if meta.StatusCode == http.StatusNotFound {
-		handleNegativeCache(w, r, key, upstreamURL, meta, cleanRelPath, log, fetcher, cacheManager, cfg)
+		h.handleNegativeCache(meta)
 		return
 	}
 
 	if meta.IsStale(time.Now()) {
-		log.Info().Msg("Revalidating stale item")
-		fetchAndServe(w, r, key, upstreamURL, meta, cleanRelPath, log, fetcher, cacheManager, cfg)
+		h.log.Info().Msg("Revalidating stale item")
+		h.fetchAndServe(meta)
 		return
 	}
 
-	serveFromCache(w, r, key, meta, cleanRelPath, log, fetcher, cacheManager, cfg)
+	h.serveFromCache(meta)
 }
 
-func serveFromCache(w http.ResponseWriter, r *http.Request, key string, meta *cache.ItemMeta, cleanRelPath string, log *logging.Logger, fetcher *fetch.Coordinator, cacheManager cache.Manager, cfg *config.Config) {
-	logConditionalRequest(r, meta, log)
+func (h *requestHandler) serveFromCache(meta *cache.ItemMeta) {
+	logConditionalRequest(h.r, meta, h.log)
 
-	if clientHasFreshVersion(r) {
-		if util.CheckConditional(w, r, meta.Headers) {
-			log.Debug().Msg("Conditional check succeeded, returning 304")
+	if clientHasFreshVersion(h.r) {
+		if util.CheckConditional(h.w, h.r, meta.Headers) {
+			h.log.Debug().Msg("Conditional check succeeded, returning 304")
 			return
 		}
 	}
 
-	log.Debug().Msg("Conditional check failed or not applicable, serving full response")
+	h.log.Debug().Msg("Conditional check failed or not applicable, serving full response")
 
-	if r.Context().Value(refetchKey) != nil {
-		log.Error().Msg("Refetch loop detected, aborting")
-		http.Error(w, "Internal cache error", http.StatusInternalServerError)
-		return
-	}
-	ctx := context.WithValue(r.Context(), refetchKey, true)
+	util.CopyWhitelistedHeaders(h.w.Header(), meta.Headers)
+	h.w.Header().Set("X-Cache-Status", cacheStatusHit)
 
-	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
-	w.Header().Set("X-Cache-Status", cacheStatusHit)
-
-	if r.Method == http.MethodHead {
-		w.WriteHeader(meta.StatusCode)
+	if h.r.Method == http.MethodHead {
+		h.w.WriteHeader(meta.StatusCode)
 		return
 	}
 
-	content, err := cacheManager.GetContent(ctx, key)
+	content, err := h.cache.GetContent(h.r.Context(), h.key)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			log.Warn().Msg("Metadata found, but content is missing. Refetching.")
-			cacheManager.Delete(ctx, key)
-			fetchAndServe(w, r.WithContext(ctx), key, meta.UpstreamURL, nil, cleanRelPath, log, fetcher, cacheManager, cfg)
+			h.log.Warn().Msg("Metadata found, but content is missing. Refetching.")
+			h.cache.Delete(h.r.Context(), h.key)
+			h.fetchAndServe(nil)
 			return
 		}
-		log.Error().Err(err).Msg("Failed to get content for cached metadata")
-		http.Error(w, "Cache content unavailable", http.StatusInternalServerError)
+		h.log.Error().Err(err).Msg("Failed to get content for cached metadata")
+		http.Error(h.w, "Cache content unavailable", http.StatusInternalServerError)
 		return
 	}
 	defer content.Close()
 
-	w.WriteHeader(meta.StatusCode)
+	h.w.WriteHeader(meta.StatusCode)
 
 	buf := util.GetBuffer()
 	defer util.ReturnBuffer(buf)
-	if _, copyErr := io.CopyBuffer(w, content, buf); copyErr != nil {
-		log.Warn().Err(copyErr).Msg("Error copying cached content to response")
+	if _, copyErr := io.CopyBuffer(h.w, content, buf); copyErr != nil {
+		h.log.Warn().Err(copyErr).Msg("Error copying cached content to response")
 	}
 }
 
-func handleNegativeCache(w http.ResponseWriter, r *http.Request, key, upstreamURL string, meta *cache.ItemMeta, cleanRelPath string, log *logging.Logger, fetcher *fetch.Coordinator, cacheManager cache.Manager, cfg *config.Config) {
+func (h *requestHandler) handleNegativeCache(meta *cache.ItemMeta) {
 	if meta.IsStale(time.Now()) {
-		log.Info().Msg("Stale negative cache entry, re-fetching")
-		cacheManager.Delete(r.Context(), key)
-		fetchAndServe(w, r, key, upstreamURL, nil, cleanRelPath, log, fetcher, cacheManager, cfg)
+		h.log.Info().Msg("Stale negative cache entry, re-fetching")
+		h.cache.Delete(h.r.Context(), h.key)
+		h.fetchAndServe(nil)
 		return
 	}
 
-	log.Debug().Msg("Serving 404 from negative cache")
-	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
-	http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+	h.log.Debug().Msg("Serving 404 from negative cache")
+	util.CopyWhitelistedHeaders(h.w.Header(), meta.Headers)
+	http.Error(h.w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 }
 
-func fetchAndServe(w http.ResponseWriter, r *http.Request, key, upstreamURL string, revalMeta *cache.ItemMeta, relPath string, log *logging.Logger, fetcher *fetch.Coordinator, cacheManager cache.Manager, cfg *config.Config) {
-	opts := extractOptions(r, revalMeta)
-	resInterface, _, shared := fetcher.Fetch(r.Context(), key, upstreamURL, opts)
+func (h *requestHandler) fetchAndServe(revalMeta *cache.ItemMeta) {
+	opts := extractOptions(h.r, revalMeta)
+	resInterface, _, shared := h.fetcher.Fetch(h.r.Context(), h.key, h.upstreamURL, opts)
 
 	sharedFetch, ok := resInterface.(*fetch.SharedFetch)
 	if !ok {
-		handleInvalidFetchType(log, key, resInterface, w)
+		if resInterface == nil {
+			h.log.Warn().Msg("Fetch initiation failed, possibly due to client disconnect.")
+			return
+		}
+		h.log.Error().Msgf("Unexpected type from singleflight: %T", resInterface)
+		http.Error(h.w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	handleFetchResult(w, r, key, upstreamURL, relPath, sharedFetch, shared, revalMeta, log, fetcher, cacheManager, cfg)
+	h.handleFetchResult(sharedFetch, shared, revalMeta)
 }
 
-func handleFetchResult(w http.ResponseWriter, r *http.Request, key, upstreamURL, relPath string, sharedFetch *fetch.SharedFetch, shared bool, revalMeta *cache.ItemMeta, log *logging.Logger, fetcher *fetch.Coordinator, cacheManager cache.Manager, cfg *config.Config) {
+func (h *requestHandler) handleFetchResult(sharedFetch *fetch.SharedFetch, shared bool, revalMeta *cache.ItemMeta) {
 	if shared {
-		handleSharedFetch(w, r, key, relPath, log, fetcher, cacheManager, cfg)
+		h.log.Debug().Msg("Shared fetch completed, serving from cache.")
+		meta, found := h.cache.Get(h.r.Context(), h.key)
+		if !found {
+			h.log.Error().Msg("Item not found in cache after shared fetch")
+			http.Error(h.w, "Failed to retrieve file after fetch", http.StatusInternalServerError)
+			return
+		}
+		defer util.ReturnHeader(meta.Headers)
+		h.serveFromCache(meta)
 		return
 	}
 
@@ -169,131 +198,116 @@ func handleFetchResult(w http.ResponseWriter, r *http.Request, key, upstreamURL,
 	}
 
 	if err != nil {
-		handleFetchError(w, r, key, relPath, err, fetchRes, revalMeta, log, cacheManager, cfg)
+		h.handleFetchError(err, fetchRes, revalMeta)
 		return
 	}
 
-	handleFetchSuccess(w, r, key, upstreamURL, relPath, fetchRes, log, cacheManager, cfg)
+	h.handleFetchSuccess(fetchRes)
 }
 
-func handleSharedFetch(w http.ResponseWriter, r *http.Request, key, relPath string, log *logging.Logger, fetcher *fetch.Coordinator, cacheManager cache.Manager, cfg *config.Config) {
-	log.Debug().Msg("Shared fetch completed, serving from cache.")
-
-	meta, found := cacheManager.Get(r.Context(), key)
-	if !found {
-		log.Error().Msg("Item not found in cache after shared fetch")
-		http.Error(w, "Failed to retrieve file after fetch", http.StatusInternalServerError)
-		return
-	}
-	defer util.ReturnHeader(meta.Headers)
-	serveFromCache(w, r, key, meta, relPath, log, fetcher, cacheManager, cfg)
-}
-
-func handleFetchError(w http.ResponseWriter, r *http.Request, key, relPath string, err error, fetchRes *fetch.Result, revalMeta *cache.ItemMeta, log *logging.Logger, cacheManager cache.Manager, cfg *config.Config) {
+func (h *requestHandler) handleFetchError(err error, fetchRes *fetch.Result, revalMeta *cache.ItemMeta) {
 	if revalMeta != nil && (errors.Is(err, fetch.ErrNetwork) || errors.Is(err, fetch.ErrUpstreamServer)) {
-		handleGracefulOffline(w, r, key, relPath, err, revalMeta, log, cacheManager, cfg)
+		h.handleGracefulOffline(err, revalMeta)
 		return
 	}
 
 	if errors.Is(err, fetch.ErrUpstreamNotFound) {
-		handleNegativeCaching(w, r, key, fetchRes, log, cacheManager, cfg)
+		h.handleNegativeCaching(fetchRes)
 		return
 	}
 
 	if errors.Is(err, fetch.ErrUpstreamNotModified) {
-		handleRevalidation(w, r, key, relPath, fetchRes, revalMeta, log, cacheManager, cfg)
+		h.handleRevalidation(fetchRes, revalMeta)
 		return
 	}
 
-	log.Warn().Err(err).Msg("Failed to fetch from upstream")
-	http.Error(w, "Upstream fetch failed", http.StatusBadGateway)
+	h.log.Warn().Err(err).Msg("Failed to fetch from upstream")
+	http.Error(h.w, "Upstream fetch failed", http.StatusBadGateway)
 }
 
-func handleGracefulOffline(w http.ResponseWriter, r *http.Request, key, relPath string, err error, revalMeta *cache.ItemMeta, log *logging.Logger, cacheManager cache.Manager, cfg *config.Config) {
-	log.Warn().Err(err).Str("key", key).Msg("Upstream fetch failed, serving stale content from cache (grace mode).")
-	var dummyFetcher *fetch.Coordinator
-	serveFromCache(w, r, key, revalMeta, relPath, log, dummyFetcher, cacheManager, cfg)
+func (h *requestHandler) handleGracefulOffline(err error, revalMeta *cache.ItemMeta) {
+	h.log.Warn().Err(err).Msg("Upstream fetch failed, serving stale content from cache (grace mode).")
+	h.serveFromCache(revalMeta)
 }
 
-func handleNegativeCaching(w http.ResponseWriter, r *http.Request, key string, fetchRes *fetch.Result, log *logging.Logger, cacheManager cache.Manager, cfg *config.Config) {
-	log.Info().Msg("Upstream returned 404 Not Found")
-	if cfg.Cache.NegativeTTL > 0 {
+func (h *requestHandler) handleNegativeCaching(fetchRes *fetch.Result) {
+	h.log.Info().Msg("Upstream returned 404 Not Found")
+	if h.cfg.Cache.NegativeTTL > 0 {
 		now := time.Now()
 		meta := &cache.ItemMeta{
-			Key:         key,
+			Key:         h.key,
 			UpstreamURL: fetchRes.Header.Get("Request-Url"),
 			FetchedAt:   now,
 			LastUsedAt:  now,
 			StatusCode:  http.StatusNotFound,
 			Headers:     util.CopyHeader(fetchRes.Header),
 			Size:        0,
-			ExpiresAt:   now.Add(cfg.Cache.NegativeTTL),
+			ExpiresAt:   now.Add(h.cfg.Cache.NegativeTTL),
 		}
-		if putErr := cacheManager.Put(r.Context(), meta); putErr != nil {
-			log.Error().Err(putErr).Msg("Failed to save negative cache entry")
+		if putErr := h.cache.Put(h.r.Context(), meta); putErr != nil {
+			h.log.Error().Err(putErr).Msg("Failed to save negative cache entry")
 		}
 	}
-	util.CopyWhitelistedHeaders(w.Header(), fetchRes.Header)
-	http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+	util.CopyWhitelistedHeaders(h.w.Header(), fetchRes.Header)
+	http.Error(h.w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 }
 
-func handleRevalidation(w http.ResponseWriter, r *http.Request, key, relPath string, fetchRes *fetch.Result, revalMeta *cache.ItemMeta, log *logging.Logger, cacheManager cache.Manager, cfg *config.Config) {
+func (h *requestHandler) handleRevalidation(fetchRes *fetch.Result, revalMeta *cache.ItemMeta) {
 	if revalMeta == nil {
-		log.Info().Msg("Conditional cache miss: upstream confirmed not modified. Forwarding 304 to client.")
-		util.CopyWhitelistedHeaders(w.Header(), fetchRes.Header)
-		w.WriteHeader(http.StatusNotModified)
+		h.log.Info().Msg("Conditional cache miss: upstream confirmed not modified. Forwarding 304 to client.")
+		util.CopyWhitelistedHeaders(h.w.Header(), fetchRes.Header)
+		h.w.WriteHeader(http.StatusNotModified)
 		return
 	}
 
-	log.Info().Msg("Revalidation successful (304), updating metadata.")
+	h.log.Info().Msg("Revalidation successful (304), updating metadata.")
 	updatedMeta := *revalMeta
 	updatedMeta.Headers = util.CopyHeader(revalMeta.Headers)
-	updatedMeta.ExpiresAt = calculateFreshness(fetchRes.Header, time.Now(), relPath, cfg.Cache.Overrides)
+	updatedMeta.ExpiresAt = calculateFreshness(fetchRes.Header, time.Now(), h.cleanRelPath, h.cfg.Cache.Overrides)
 	updatedMeta.LastUsedAt = time.Now()
 	util.UpdateCacheHeaders(updatedMeta.Headers, fetchRes.Header)
 
-	if putErr := cacheManager.Put(r.Context(), &updatedMeta); putErr != nil {
-		log.Error().Err(putErr).Msg("Failed to update metadata after 304")
+	if putErr := h.cache.Put(h.r.Context(), &updatedMeta); putErr != nil {
+		h.log.Error().Err(putErr).Msg("Failed to update metadata after 304")
 		util.ReturnHeader(updatedMeta.Headers)
 		return
 	}
-	var dummyFetcher *fetch.Coordinator
-	serveFromCache(w, r, key, &updatedMeta, relPath, log, dummyFetcher, cacheManager, cfg)
+	h.serveFromCache(&updatedMeta)
 }
 
-func handleFetchSuccess(w http.ResponseWriter, r *http.Request, key, upstreamURL, relPath string, fetchRes *fetch.Result, log *logging.Logger, cacheManager cache.Manager, cfg *config.Config) {
-	meta := createCacheMeta(key, upstreamURL, relPath, fetchRes, cfg)
+func (h *requestHandler) handleFetchSuccess(fetchRes *fetch.Result) {
+	meta := h.createCacheMeta(fetchRes)
 
-	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
-	w.Header().Set("X-Cache-Status", cacheStatusMiss)
+	util.CopyWhitelistedHeaders(h.w.Header(), meta.Headers)
+	h.w.Header().Set("X-Cache-Status", cacheStatusMiss)
 
-	if r.Method == http.MethodHead {
-		w.WriteHeader(meta.StatusCode)
-		if err := cacheManager.Put(r.Context(), meta); err != nil {
-			log.Error().Err(err).Msg("Failed to save metadata for HEAD request")
+	if h.r.Method == http.MethodHead {
+		h.w.WriteHeader(meta.StatusCode)
+		if err := h.cache.Put(h.r.Context(), meta); err != nil {
+			h.log.Error().Err(err).Msg("Failed to save metadata for HEAD request")
 		}
 		return
 	}
 
-	streamToClientAndCache(w, r, key, fetchRes, meta, log, cacheManager)
+	h.streamToClientAndCache(fetchRes, meta)
 }
 
-func createCacheMeta(key, upstreamURL, relPath string, fetchRes *fetch.Result, cfg *config.Config) *cache.ItemMeta {
+func (h *requestHandler) createCacheMeta(fetchRes *fetch.Result) *cache.ItemMeta {
 	now := time.Now()
 	headersCopy := util.CopyHeader(fetchRes.Header)
 	return &cache.ItemMeta{
-		Key:         key,
-		UpstreamURL: upstreamURL,
+		Key:         h.key,
+		UpstreamURL: h.upstreamURL,
 		FetchedAt:   now,
 		LastUsedAt:  now,
 		StatusCode:  fetchRes.Status,
 		Headers:     headersCopy,
 		Size:        fetchRes.Size,
-		ExpiresAt:   calculateFreshness(headersCopy, now, relPath, cfg.Cache.Overrides),
+		ExpiresAt:   calculateFreshness(headersCopy, now, h.cleanRelPath, h.cfg.Cache.Overrides),
 	}
 }
 
-func streamToClientAndCache(w http.ResponseWriter, r *http.Request, key string, fetchRes *fetch.Result, meta *cache.ItemMeta, log *logging.Logger, cacheManager cache.Manager) {
+func (h *requestHandler) streamToClientAndCache(fetchRes *fetch.Result, meta *cache.ItemMeta) {
 	pr, pw := io.Pipe()
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -301,28 +315,28 @@ func streamToClientAndCache(w http.ResponseWriter, r *http.Request, key string, 
 
 	go func(m *cache.ItemMeta) {
 		defer wg.Done()
-		written, err := cacheManager.PutContent(r.Context(), key, pr)
+		written, err := h.cache.PutContent(h.r.Context(), h.key, pr)
 		if err != nil {
 			if !util.IsClientDisconnectedError(err) {
-				log.Error().Err(err).Msg("Failed to write content to cache")
+				h.log.Error().Err(err).Msg("Failed to write content to cache")
 			}
-			cacheManager.Delete(context.Background(), key)
+			h.cache.Delete(context.Background(), h.key)
 			return
 		}
 		m.Size = written
-		if err := cacheManager.Put(context.Background(), m); err != nil {
-			log.Error().Err(err).Msg("Failed to save metadata after content write")
+		if err := h.cache.Put(context.Background(), m); err != nil {
+			h.log.Error().Err(err).Msg("Failed to save metadata after content write")
 		}
 	}(meta)
 
 	tee := io.TeeReader(fetchRes.Body, pw)
 
-	if util.CheckConditional(w, r, meta.Headers) {
-		log.Debug().Msg("Client has fresh version, sending 304 and caching in background.")
+	if util.CheckConditional(h.w, h.r, meta.Headers) {
+		h.log.Debug().Msg("Client has fresh version, sending 304 and caching in background.")
 		_, copyErr = io.Copy(io.Discard, tee)
 	} else {
-		w.WriteHeader(meta.StatusCode)
-		_, copyErr = io.Copy(w, tee)
+		h.w.WriteHeader(meta.StatusCode)
+		_, copyErr = io.Copy(h.w, tee)
 	}
 
 	if copyErr != nil {
@@ -334,13 +348,13 @@ func streamToClientAndCache(w http.ResponseWriter, r *http.Request, key string, 
 	wg.Wait()
 }
 
-func handleInvalidFetchType(log *logging.Logger, key string, resInterface any, w http.ResponseWriter) {
-	if resInterface == nil {
-		log.Warn().Str("key", key).Msg("Fetch initiation failed, possibly due to client disconnect.")
+func handleServeRepoContent(w http.ResponseWriter, r *http.Request) {
+	handler, err := newRequestHandler(w, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	log.Error().Str("key", key).Msgf("Unexpected type from singleflight: %T", resInterface)
-	http.Error(w, "Internal server error", http.StatusInternalServerError)
+	handler.process()
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {

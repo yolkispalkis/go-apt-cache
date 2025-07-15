@@ -150,8 +150,13 @@ func validate(c *Config) error {
 		if err != nil {
 			return fmt.Errorf("invalid cache.maxSize %q: %w", c.Cache.MaxSize, err)
 		}
-		if maxBytes <= 0 { // Добавлено
+		if maxBytes <= 0 {
 			return errors.New("cache.maxSize must be greater than 0 if cache is enabled")
+		}
+		for i, override := range c.Cache.Overrides {
+			if override.TTL <= 0 {
+				return fmt.Errorf("cache.overrides[%d]: ttl must be a positive duration", i)
+			}
 		}
 	}
 
@@ -180,11 +185,11 @@ func validate(c *Config) error {
 func normalize(c *Config) {
 	for i := range c.Repositories {
 		repo := &c.Repositories[i]
-		u, _ := url.Parse(repo.URL) // Assume valid from validate
+		u, _ := url.Parse(repo.URL)
 		if u.Path != "" && !strings.HasSuffix(u.Path, "/") {
 			u.Path += "/"
 		}
-		repo.URL = u.String() // Safe rebuild
+		repo.URL = u.String()
 	}
 }
 

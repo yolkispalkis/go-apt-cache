@@ -23,7 +23,7 @@ const (
 	numShards        = 64
 	defaultQueueSize = 1000
 	batchInterval    = 30 * time.Second
-	dropLogRateLimit = 10 * time.Second // Rate-limit drop logs
+	dropLogRateLimit = 10 * time.Second
 )
 
 type ShardedManager struct {
@@ -65,10 +65,11 @@ func NewDiskLRU(cfg config.CacheConfig, logger *logging.Logger) (Manager, error)
 		manager.shards[i] = shard
 	}
 
-	if err := manager.initialScan(); err != nil {
-		log.Error().Err(err).Msg("Initial scan failed")
-		// Continue, but shards may have partial data
-	}
+	go func() {
+		if err := manager.initialScan(); err != nil {
+			log.Error().Err(err).Msg("Initial background scan failed")
+		}
+	}()
 
 	return manager, nil
 }
@@ -83,7 +84,6 @@ func (sm *ShardedManager) getShard(key string) *lruShard {
 	return sm.shards[sm.getShardIndex(key)]
 }
 
-// initialScan scans disk and populates shards concurrently.
 func (sm *ShardedManager) initialScan() error {
 	sm.log.Info().Msg("Starting initial disk scan for all shards...")
 	startTime := time.Now()
@@ -208,7 +208,6 @@ func newLRUShard(index int, cfg config.CacheConfig, logger *logging.Logger, stor
 	return shard, nil
 }
 
-// populateFromScan loads metadata from paths into the shard's LRU.
 func (s *lruShard) populateFromScan(metas []*ItemMeta) error {
 	s.log.Debug().Int("items", len(metas)).Msg("Shard starting population from scan")
 	itemsToSort := make([]*ItemMeta, len(metas))
@@ -378,7 +377,6 @@ func (s *lruShard) ensureSpace(sizeDelta int64) {
 	}
 }
 
-// evictOne removes the least recently used item.
 func (s *lruShard) evictOne() error {
 	elem := s.lruList.Back()
 	if elem == nil {
