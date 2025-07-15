@@ -59,8 +59,8 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if meta.IsStale(time.Now()) || r.Header.Get("Cache-Control") == "no-cache" {
-		log.Info().Msg("Revalidating stale/no-cache item")
+	if meta.IsStale(time.Now()) {
+		log.Info().Msg("Revalidating stale item")
 		app.fetchAndServe(w, r, key, upstreamURL, meta, cleanRelPath, log)
 		return
 	}
