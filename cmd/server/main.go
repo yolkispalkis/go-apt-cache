@@ -60,7 +60,7 @@ func run(ctx context.Context) error {
 
 	util.InitBufferPool(cfg.Cache.BufferSize, logger)
 
-	cacheManager, err := cache.NewDiskLRU(cfg.Cache, logger)
+	cacheManager, err := cache.NewSimpleLRU(cfg.Cache, logger)
 	if err != nil {
 		return fmt.Errorf("failed to initialize cache manager: %w", err)
 	}

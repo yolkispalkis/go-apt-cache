@@ -30,7 +30,6 @@ type Manager interface {
 	GetContent(ctx context.Context, key string) (io.ReadCloser, error)
 	PutContent(ctx context.Context, key string, r io.Reader) (int64, error)
 	Close()
-	IsReady(key string) bool
 }
 
 type noopManager struct{}
@@ -45,6 +44,3 @@ func (n *noopManager) PutContent(ctx context.Context, key string, r io.Reader) (
 	return io.Copy(io.Discard, r)
 }
 func (n *noopManager) Close() {}
-func (n *noopManager) IsReady(key string) bool {
-	return true
-}

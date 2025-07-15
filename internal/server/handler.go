@@ -75,11 +75,7 @@ func newRequestHandler(w http.ResponseWriter, r *http.Request) (*requestHandler,
 func (h *requestHandler) process() {
 	meta, found := h.cache.Get(h.r.Context(), h.key)
 	if !found {
-		if !h.cache.IsReady(h.key) {
-			h.log.Info().Msg("Cache miss (shard not ready), fetching from upstream")
-		} else {
-			h.log.Info().Msg("Cache miss, fetching from upstream")
-		}
+		h.log.Info().Msg("Cache miss, fetching from upstream")
 		h.fetchAndServe(nil)
 		return
 	}
