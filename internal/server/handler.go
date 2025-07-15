@@ -232,6 +232,12 @@ func handleSharedFetch(app *Application, w http.ResponseWriter, r *http.Request,
 }
 
 func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, key, upstreamURL, relPath string, err error, fetchRes *fetch.Result, revalMeta *cache.ItemMeta, log *logging.Logger) {
+	if revalMeta != nil && (errors.Is(err, fetch.ErrNetwork) || errors.Is(err, fetch.ErrUpstreamServer)) {
+		log.Warn().Err(err).Str("key", key).Msg("Upstream fetch failed, serving stale content from cache (grace mode).")
+		app.serveFromCache(w, r, key, revalMeta, relPath, log)
+		return
+	}
+
 	if errors.Is(err, fetch.ErrUpstreamNotFound) {
 		log.Info().Err(err).Msg("Upstream returned 404 Not Found")
 		if app.Config.Cache.NegativeTTL > 0 {
@@ -275,7 +281,6 @@ func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, 
 			util.ReturnHeader(updatedMeta.Headers)
 			return
 		}
-
 		app.serveFromCache(w, r, key, &updatedMeta, relPath, log)
 		return
 	}
