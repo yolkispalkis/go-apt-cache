@@ -175,8 +175,13 @@ func handleFetchResult(app *Application, w http.ResponseWriter, r *http.Request,
 	fetchRes := sharedFetch.Result
 	err := sharedFetch.Err
 
-	if fetchRes != nil && fetchRes.Body != nil {
-		defer fetchRes.Body.Close()
+	if fetchRes != nil {
+		if fetchRes.Header != nil {
+			defer util.ReturnHeader(fetchRes.Header)
+		}
+		if fetchRes.Body != nil {
+			defer fetchRes.Body.Close()
+		}
 	}
 
 	if err != nil {

@@ -140,7 +140,6 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Opt
 	}
 
 	responseHeaders := util.CopyHeader(resp.Header)
-	defer util.ReturnHeader(responseHeaders)
 	for _, h := range hopByHopHeaders {
 		responseHeaders.Del(h)
 	}
