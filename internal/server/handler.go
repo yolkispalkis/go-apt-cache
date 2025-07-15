@@ -271,7 +271,7 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 		StatusCode:  fetchRes.Status,
 		Headers:     headersCopy,
 		Size:        fetchRes.Size,
-		ExpiresAt:   calculateFreshness(fetchRes.Header, now, relPath, app.Config.Cache.Overrides),
+		ExpiresAt:   calculateFreshness(headersCopy, now, relPath, app.Config.Cache.Overrides), // Используем копию для расчёта
 	}
 
 	util.CopyWhitelistedHeaders(w.Header(), meta.Headers)
