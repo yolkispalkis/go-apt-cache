@@ -315,7 +315,6 @@ func (h *requestHandler) streamToClientAndCache(fetchRes *fetch.Result, meta *ca
 	pr, pw := io.Pipe()
 	var wg sync.WaitGroup
 	wg.Add(1)
-	var copyErr error
 
 	go func(m *cache.ItemMeta) {
 		defer wg.Done()
@@ -335,13 +334,8 @@ func (h *requestHandler) streamToClientAndCache(fetchRes *fetch.Result, meta *ca
 
 	tee := io.TeeReader(fetchRes.Body, pw)
 
-	if util.CheckConditional(h.w, h.r, meta.Headers) {
-		h.log.Debug().Msg("Client has fresh version, sending 304 and caching in background.")
-		_, copyErr = io.Copy(io.Discard, tee)
-	} else {
-		h.w.WriteHeader(meta.StatusCode)
-		_, copyErr = io.Copy(h.w, tee)
-	}
+	h.w.WriteHeader(meta.StatusCode)
+	_, copyErr := io.Copy(h.w, tee)
 
 	if copyErr != nil {
 		pw.CloseWithError(copyErr)
