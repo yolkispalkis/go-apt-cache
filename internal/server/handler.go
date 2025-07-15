@@ -260,6 +260,7 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 	}
 
 	now := time.Now()
+	// Делаем копию headers для meta, чтобы не потерять их после возврата в pool
 	headersCopy := util.CopyHeader(fetchRes.Header)
 
 	meta := &cache.ItemMeta{
@@ -289,7 +290,7 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	go func() {
+	go func(m *cache.ItemMeta) { // Передаём meta в goroutine
 		defer wg.Done()
 		written, err := app.Cache.PutContent(r.Context(), key, pr)
 		if err != nil {
@@ -297,14 +298,15 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 				log.Error().Err(err).Msg("Failed to write content to cache")
 			}
 			app.Cache.Delete(context.Background(), key)
+			util.ReturnHeader(m.Headers) // Возвращаем только если ошибка
 			return
 		}
-		meta.Size = written
-		if err := app.Cache.Put(context.Background(), meta); err != nil {
+		m.Size = written
+		if err := app.Cache.Put(context.Background(), m); err != nil {
 			log.Error().Err(err).Msg("Failed to save metadata after content write")
 		}
-		util.ReturnHeader(meta.Headers)
-	}()
+		util.ReturnHeader(m.Headers) // Возвращаем после успешного Put
+	}(meta)
 
 	tee := io.TeeReader(fetchRes.Body, pw)
 	w.WriteHeader(meta.StatusCode)
