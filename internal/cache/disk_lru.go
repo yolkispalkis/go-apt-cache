@@ -19,7 +19,12 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
-const numShards = 64
+const (
+	numShards        = 64
+	defaultQueueSize = 1000
+	batchInterval    = 30 * time.Second
+	dropLogRateLimit = 10 * time.Second // Rate-limit drop logs
+)
 
 type ShardedManager struct {
 	shards []*lruShard
@@ -60,7 +65,10 @@ func NewDiskLRU(cfg config.CacheConfig, logger *logging.Logger) (Manager, error)
 		manager.shards[i] = shard
 	}
 
-	manager.initialScan()
+	if err := manager.initialScan(); err != nil {
+		log.Error().Err(err).Msg("Initial scan failed")
+		// Continue, but shards may have partial data
+	}
 
 	return manager, nil
 }
@@ -75,27 +83,23 @@ func (sm *ShardedManager) getShard(key string) *lruShard {
 	return sm.shards[sm.getShardIndex(key)]
 }
 
-func (sm *ShardedManager) initialScan() {
+// initialScan scans disk and populates shards concurrently.
+func (sm *ShardedManager) initialScan() error {
 	sm.log.Info().Msg("Starting initial disk scan for all shards...")
 	startTime := time.Now()
 
 	var metaFiles []string
-	var err error
-	for attempt := 1; attempt <= 3; attempt++ { // Добавлен retry
-		metaFiles, err = sm.store.ScanMetaFiles()
-		if err == nil {
+	var scanErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		metaFiles, scanErr = sm.store.ScanMetaFiles()
+		if scanErr == nil {
 			break
 		}
-		sm.log.Warn().Err(err).Int("attempt", attempt).Msg("Failed during initial scan, retrying")
+		sm.log.Warn().Err(scanErr).Int("attempt", attempt).Msg("Failed during initial scan, retrying")
 		time.Sleep(time.Second)
 	}
-	if err != nil {
-		sm.log.Error().Err(err).Msg("Failed during initial scan file listing after retries")
-		for _, s := range sm.shards {
-			s.initErr = err
-			s.ready = true
-		}
-		return
+	if scanErr != nil {
+		return fmt.Errorf("failed initial scan after retries: %w", scanErr)
 	}
 
 	shardMetaPaths := make([][]string, numShards)
@@ -116,16 +120,29 @@ func (sm *ShardedManager) initialScan() {
 	}
 
 	var wg sync.WaitGroup
+	errs := make(chan error, numShards)
 	for i, s := range sm.shards {
 		wg.Add(1)
-		go func(shard *lruShard, paths []string) {
+		go func(shard *lruShard, paths []string, idx int) {
 			defer wg.Done()
-			shard.populateFromScan(paths)
-		}(s, shardMetaPaths[i])
+			if popErr := shard.populateFromScan(paths); popErr != nil {
+				errs <- fmt.Errorf("shard %d: %w", idx, popErr)
+			}
+		}(s, shardMetaPaths[i], i)
 	}
 	wg.Wait()
+	close(errs)
+
+	var allErrs []error
+	for err := range errs {
+		allErrs = append(allErrs, err)
+	}
+	if len(allErrs) > 0 {
+		return fmt.Errorf("initial scan errors: %v", allErrs)
+	}
 
 	sm.log.Info().Dur("duration", time.Since(startTime)).Int("files", len(metaFiles)).Msg("All shards finished initial scan.")
+	return nil
 }
 
 func (sm *ShardedManager) Get(ctx context.Context, key string) (*ItemMeta, bool) {
@@ -177,7 +194,6 @@ type lruShard struct {
 }
 
 func newLRUShard(index int, cfg config.CacheConfig, logger *logging.Logger, store *diskStore, maxBytes int64) (*lruShard, error) {
-	batchInterval := 30 * time.Second
 	shardLogger := logger.With().Int("shard", index).Logger()
 	shard := &lruShard{
 		index:       index,
@@ -187,12 +203,13 @@ func newLRUShard(index int, cfg config.CacheConfig, logger *logging.Logger, stor
 		maxBytes:    maxBytes,
 		items:       make(map[string]*list.Element),
 		lruList:     list.New(),
-		metaBatcher: newMetadataBatcher(store, &logging.Logger{Logger: shardLogger}, batchInterval),
+		metaBatcher: newMetadataBatcher(store, &logging.Logger{Logger: shardLogger}, batchInterval, defaultQueueSize),
 	}
 	return shard, nil
 }
 
-func (s *lruShard) populateFromScan(metaPaths []string) {
+// populateFromScan loads metadata from paths into the shard's LRU.
+func (s *lruShard) populateFromScan(metaPaths []string) error {
 	s.log.Debug().Int("files", len(metaPaths)).Msg("Shard starting population from scan")
 	itemsToSort := make([]*ItemMeta, 0, len(metaPaths))
 	var totalSize int64
@@ -210,19 +227,18 @@ func (s *lruShard) populateFromScan(metaPaths []string) {
 	}
 
 	sort.Slice(itemsToSort, func(i, j int) bool {
-		return itemsToSort[i].LastUsedAt.After(itemsToSort[j].LastUsedAt) // Изменено на After (descending)
+		return itemsToSort[i].LastUsedAt.After(itemsToSort[j].LastUsedAt)
 	})
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, meta := range itemsToSort {
 		entry := &lruEntry{key: meta.Key, meta: meta}
 		elem := s.lruList.PushFront(entry)
 		s.items[meta.Key] = elem
 	}
-	s.mu.Unlock()
 	s.currentBytes.Store(totalSize)
 
-	// Добавлено: возвращаем headers после использования (они больше не нужны в slice)
 	for _, meta := range itemsToSort {
 		util.ReturnHeader(meta.Headers)
 	}
@@ -233,6 +249,7 @@ func (s *lruShard) populateFromScan(metaPaths []string) {
 		Msg("Shard population complete")
 
 	s.ready = true
+	return nil
 }
 
 func (s *lruShard) checkReady() error {
@@ -275,12 +292,11 @@ func (s *lruShard) Put(ctx context.Context, meta *ItemMeta) error {
 	}
 	s.mu.RUnlock()
 
-	// Перенесено: ensureSpace после WriteMetadata
 	if err := s.store.WriteMetadata(meta); err != nil {
 		return fmt.Errorf("disk store write for key %s: %w", meta.Key, err)
 	}
 
-	s.ensureSpace(sizeDelta) // Теперь эвикция только если мета сохранена
+	s.ensureSpace(sizeDelta)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -296,7 +312,7 @@ func (s *lruShard) Put(ctx context.Context, meta *ItemMeta) error {
 	elem := s.lruList.PushFront(entry)
 	s.items[meta.Key] = elem
 	s.currentBytes.Add(meta.Size)
-	if s.currentBytes.Load() < 0 { // Коррекция
+	if s.currentBytes.Load() < 0 {
 		s.log.Warn().Str("key", meta.Key).Msg("Negative cache size detected, resetting to 0")
 		s.currentBytes.Store(0)
 	}
@@ -318,10 +334,10 @@ func (s *lruShard) MarkUsed(ctx context.Context, key string) {
 	s.lruList.MoveToFront(elem)
 
 	metaCopy := *meta
-	metaCopy.Headers = util.CopyHeader(meta.Headers) // Перенесено внутрь мьютекса
+	metaCopy.Headers = util.CopyHeader(meta.Headers)
 	s.mu.Unlock()
 
-	if ctx.Err() != nil { // Check cancel
+	if ctx.Err() != nil {
 		util.ReturnHeader(metaCopy.Headers)
 		return
 	}
@@ -365,29 +381,38 @@ func (s *lruShard) ensureSpace(sizeDelta int64) {
 	defer s.mu.Unlock()
 
 	for s.currentBytes.Load()+sizeDelta > s.maxBytes && s.lruList.Len() > 0 {
-		elem := s.lruList.Back()
-		if elem == nil {
-			return
-		}
-		entry := s.lruList.Remove(elem).(*lruEntry)
-		delete(s.items, entry.key)
-		s.currentBytes.Add(-entry.meta.Size)
-		util.ReturnHeader(entry.meta.Headers)
-
-		s.log.Info().
-			Str("key", entry.key).
-			Str("size", util.FormatSize(entry.meta.Size)).
-			Time("last_used", entry.meta.LastUsedAt).
-			Msg("Evicting item from shard")
-
-		if err := s.store.Delete(entry.key); err != nil {
-			s.log.Warn().Err(err).Str("key", entry.key).Msg("Failed to delete evicted item files, retrying once")
-			time.Sleep(100 * time.Millisecond) // Короткая задержка
-			if err := s.store.Delete(entry.key); err != nil {
-				s.log.Error().Err(err).Str("key", entry.key).Msg("Failed to delete evicted item files after retry; orphan files possible")
-			}
+		if err := s.evictOne(); err != nil {
+			s.log.Warn().Err(err).Msg("Failed to evict item during space ensuring")
 		}
 	}
+}
+
+// evictOne removes the least recently used item.
+func (s *lruShard) evictOne() error {
+	elem := s.lruList.Back()
+	if elem == nil {
+		return nil
+	}
+	entry := s.lruList.Remove(elem).(*lruEntry)
+	delete(s.items, entry.key)
+	s.currentBytes.Add(-entry.meta.Size)
+	util.ReturnHeader(entry.meta.Headers)
+
+	s.log.Info().
+		Str("key", entry.key).
+		Str("size", util.FormatSize(entry.meta.Size)).
+		Time("last_used", entry.meta.LastUsedAt).
+		Msg("Evicting item from shard")
+
+	if err := s.store.Delete(entry.key); err != nil {
+		s.log.Warn().Err(err).Str("key", entry.key).Msg("Failed to delete evicted item files, retrying once")
+		time.Sleep(100 * time.Millisecond)
+		if err := s.store.Delete(entry.key); err != nil {
+			s.log.Error().Err(err).Str("key", entry.key).Msg("Failed to delete evicted item files after retry; orphan files possible")
+			return err
+		}
+	}
+	return nil
 }
 
 type lruEntry struct {
@@ -407,13 +432,14 @@ type metadataBatcher struct {
 	log          *logging.Logger
 	done         chan struct{}
 	wg           sync.WaitGroup
-	closeOnce    sync.Once    // Добавлено для idempotent close
-	droppedCount atomic.Int64 // Добавлено для логирования drops
+	closeOnce    sync.Once
+	droppedCount atomic.Int64
+	lastDropLog  time.Time
 }
 
-func newMetadataBatcher(store *diskStore, logger *logging.Logger, interval time.Duration) *metadataBatcher {
+func newMetadataBatcher(store *diskStore, logger *logging.Logger, interval time.Duration, queueSize int) *metadataBatcher {
 	mb := &metadataBatcher{
-		updates: make(chan metadataUpdate, 1000),
+		updates: make(chan metadataUpdate, queueSize),
 		ticker:  time.NewTicker(interval),
 		store:   store,
 		log:     logger,
@@ -464,7 +490,11 @@ func (mb *metadataBatcher) schedule(key string, meta *ItemMeta) {
 	case mb.updates <- metadataUpdate{Key: key, Meta: meta}:
 	default:
 		mb.droppedCount.Add(1)
-		mb.log.Warn().Str("key", key).Int64("total_dropped", mb.droppedCount.Load()).Msg("Metadata update queue full, dropping update")
+		now := time.Now()
+		if now.Sub(mb.lastDropLog) > dropLogRateLimit {
+			mb.log.Warn().Str("key", key).Int64("total_dropped", mb.droppedCount.Load()).Msg("Metadata update queue full, dropping update")
+			mb.lastDropLog = now
+		}
 		util.ReturnHeader(meta.Headers)
 	}
 }

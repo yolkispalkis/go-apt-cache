@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -16,9 +17,19 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 )
 
+const (
+	sizePattern = `^(\d+(?:\.\d+)?)\s*([KMGT])?B?$`
+	repoPattern = `^[a-zA-Z0-9._-]+$`
+
+	kb = 1 << 10
+	mb = 1 << 20
+	gb = 1 << 30
+	tb = 1 << 40
+)
+
 var (
-	sizeRe     = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([KMGT])?B?$`)
-	repoNameRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+	sizeRe     = regexp.MustCompile(sizePattern)
+	repoNameRe = regexp.MustCompile(repoPattern)
 )
 
 var headerProxyWhitelist = map[string]struct{}{
@@ -31,6 +42,7 @@ var headerPool = sync.Pool{New: func() any { return make(http.Header, 16) }}
 var bufferPoolSize int64 = 64 * 1024
 var bufferPool = sync.Pool{New: func() any { return make([]byte, bufferPoolSize) }}
 
+// InitBufferPool initializes the buffer pool with the given size.
 func InitBufferPool(sizeStr string, log *logging.Logger) {
 	size, err := ParseSize(sizeStr)
 	if err != nil || size <= 0 {
@@ -54,6 +66,7 @@ func MustParseSize(s string) int64 {
 	return size
 }
 
+// ParseSize parses a size string like "10GB" or "1.5MB", allowing fractional with rounding.
 func ParseSize(s string) (int64, error) {
 	if s == "" {
 		return 0, errors.New("size string is empty")
@@ -66,27 +79,28 @@ func ParseSize(s string) (int64, error) {
 		}
 		return 0, fmt.Errorf("invalid size format: %q", s)
 	}
-	val, err := strconv.ParseFloat(m[1], 64) // Изменено: полная проверка
+	val, err := strconv.ParseFloat(m[1], 64)
 	if err != nil {
 		return 0, err
 	}
-	if val != float64(int64(val)) { // Reject fractional
-		return 0, fmt.Errorf("fractional sizes not supported: %q", s)
-	}
+	// Round fractional to nearest byte
+	val = math.Round(val)
+
 	var mult float64 = 1
 	switch m[2] {
 	case "K":
-		mult = 1 << 10
+		mult = kb
 	case "M":
-		mult = 1 << 20
+		mult = mb
 	case "G":
-		mult = 1 << 30
+		mult = gb
 	case "T":
-		mult = 1 << 40
+		mult = tb
 	}
 	return int64(val * mult), nil
 }
 
+// FormatSize formats bytes to human-readable string.
 func FormatSize(b int64) string {
 	const unit = 1024
 	if b < unit {
@@ -102,6 +116,7 @@ func FormatSize(b int64) string {
 
 func CleanPath(p string) string { return filepath.Clean(p) }
 
+// IsRepoNameSafe checks if repo name is safe (no traversal, valid chars).
 func IsRepoNameSafe(n string) bool {
 	if n == "" || n == "." || n == ".." || strings.ContainsAny(n, "/\\") {
 		return false
@@ -153,18 +168,21 @@ func UpdateCacheHeaders(dst, src http.Header) {
 	}
 }
 
+// ParseCacheControl parses Cache-Control header into a map.
 func ParseCacheControl(v string) map[string]string {
 	dirs := make(map[string]string)
-	for _, p := range strings.Split(v, ",") {
+	fields := strings.FieldsFunc(v, func(r rune) bool { return r == ',' })
+	for _, p := range fields {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
-		if key, val, ok := strings.Cut(p, "="); ok {
-			dirs[strings.ToLower(key)] = strings.Trim(val, `"`)
-		} else {
-			dirs[strings.ToLower(p)] = ""
+		key, val, ok := strings.Cut(p, "=")
+		key = strings.ToLower(key)
+		if ok {
+			val = strings.Trim(val, `"`)
 		}
+		dirs[key] = val
 	}
 	return dirs
 }
@@ -184,6 +202,12 @@ func IsClientDisconnectedError(err error) bool {
 	return strings.Contains(errStr, "broken pipe") || strings.Contains(errStr, "connection reset by peer")
 }
 
+// normalizeETag removes quotes and W/ prefix.
+func normalizeETag(etag string) string {
+	return strings.TrimPrefix(strings.Trim(etag, `"`), "W/")
+}
+
+// CompareETags compares client ETags with resource ETag, handling wildcards and weak tags.
 func CompareETags(clientETagsStr, resourceETag string) bool {
 	if clientETagsStr == "" || resourceETag == "" {
 		return false
@@ -191,11 +215,11 @@ func CompareETags(clientETagsStr, resourceETag string) bool {
 	if clientETagsStr == "*" {
 		return true
 	}
-	normResource := strings.TrimPrefix(strings.Trim(resourceETag, `"`), "W/")
+	normResource := normalizeETag(resourceETag)
 
 	for _, cTag := range strings.Split(clientETagsStr, ",") {
-		normClient := strings.TrimPrefix(strings.Trim(strings.TrimSpace(cTag), `"`), "W/")
-		if normClient == normResource { // Match regardless of weak if tags equal
+		normClient := normalizeETag(strings.TrimSpace(cTag))
+		if normClient == normResource {
 			return true
 		}
 	}
