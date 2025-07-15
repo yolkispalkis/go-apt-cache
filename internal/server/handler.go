@@ -83,9 +83,18 @@ func handleNegativeCache(app *Application, w http.ResponseWriter, r *http.Reques
 }
 
 func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key string, meta *cache.ItemMeta, cleanRelPath string, log *logging.Logger) {
+	log.Debug().
+		Str("client_if_none_match", r.Header.Get("If-None-Match")).
+		Str("client_if_modified_since", r.Header.Get("If-Modified-Since")).
+		Str("cached_etag", meta.Headers.Get("ETag")).
+		Str("cached_last_modified", meta.Headers.Get("Last-Modified")).
+		Msg("Checking conditional request")
+
 	if util.CheckConditional(w, r, meta.Headers) {
+		log.Debug().Msg("Conditional check succeeded, returning 304")
 		return
 	}
+	log.Debug().Msg("Conditional check failed, serving full response")
 
 	if r.Context().Value(refetchKey) != nil {
 		log.Error().Msg("Refetch loop detected, aborting")
