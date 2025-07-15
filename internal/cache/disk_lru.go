@@ -102,9 +102,9 @@ func (sm *ShardedManager) initialScan() error {
 		return fmt.Errorf("failed initial scan after retries: %w", scanErr)
 	}
 
-	shardMetaPaths := make([][]string, numShards)
-	for i := range shardMetaPaths {
-		shardMetaPaths[i] = make([]string, 0)
+	shardMetas := make([][]*ItemMeta, numShards)
+	for i := range shardMetas {
+		shardMetas[i] = make([]*ItemMeta, 0)
 	}
 
 	for _, mPath := range metaFiles {
@@ -116,19 +116,19 @@ func (sm *ShardedManager) initialScan() error {
 			continue
 		}
 		targetShardIndex := sm.getShardIndex(meta.Key)
-		shardMetaPaths[targetShardIndex] = append(shardMetaPaths[targetShardIndex], mPath)
+		shardMetas[targetShardIndex] = append(shardMetas[targetShardIndex], meta)
 	}
 
 	var wg sync.WaitGroup
 	errs := make(chan error, numShards)
 	for i, s := range sm.shards {
 		wg.Add(1)
-		go func(shard *lruShard, paths []string, idx int) {
+		go func(shard *lruShard, metas []*ItemMeta, idx int) {
 			defer wg.Done()
-			if popErr := shard.populateFromScan(paths); popErr != nil {
+			if popErr := shard.populateFromScan(metas); popErr != nil {
 				errs <- fmt.Errorf("shard %d: %w", idx, popErr)
 			}
-		}(s, shardMetaPaths[i], i)
+		}(s, shardMetas[i], i)
 	}
 	wg.Wait()
 	close(errs)
@@ -209,20 +209,13 @@ func newLRUShard(index int, cfg config.CacheConfig, logger *logging.Logger, stor
 }
 
 // populateFromScan loads metadata from paths into the shard's LRU.
-func (s *lruShard) populateFromScan(metaPaths []string) error {
-	s.log.Debug().Int("files", len(metaPaths)).Msg("Shard starting population from scan")
-	itemsToSort := make([]*ItemMeta, 0, len(metaPaths))
+func (s *lruShard) populateFromScan(metas []*ItemMeta) error {
+	s.log.Debug().Int("items", len(metas)).Msg("Shard starting population from scan")
+	itemsToSort := make([]*ItemMeta, len(metas))
+	copy(itemsToSort, metas)
 	var totalSize int64
 
-	for _, mPath := range metaPaths {
-		meta, err := s.store.ReadMeta(mPath)
-		if err != nil {
-			s.log.Warn().Err(err).Str("path", mPath).Msg("Failed to read metadata, removing artifact")
-			_ = os.Remove(mPath)
-			_ = os.Remove(strings.TrimSuffix(mPath, metaSuffix) + contentSuffix)
-			continue
-		}
-		itemsToSort = append(itemsToSort, meta)
+	for _, meta := range itemsToSort {
 		totalSize += meta.Size
 	}
 
@@ -238,10 +231,6 @@ func (s *lruShard) populateFromScan(metaPaths []string) error {
 		s.items[meta.Key] = elem
 	}
 	s.currentBytes.Store(totalSize)
-
-	for _, meta := range itemsToSort {
-		util.ReturnHeader(meta.Headers)
-	}
 
 	s.log.Debug().
 		Int("items", len(itemsToSort)).
@@ -275,7 +264,9 @@ func (s *lruShard) Get(ctx context.Context, key string) (*ItemMeta, bool) {
 
 	go s.MarkUsed(ctx, key)
 
-	return elem.Value.(*lruEntry).meta, true
+	metaCopy := *elem.Value.(*lruEntry).meta
+	metaCopy.Headers = util.CopyHeader(metaCopy.Headers)
+	return &metaCopy, true
 }
 
 func (s *lruShard) Put(ctx context.Context, meta *ItemMeta) error {

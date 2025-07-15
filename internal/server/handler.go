@@ -14,11 +14,10 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/go-chi/chi/v5"
-	"github.com/rs/zerolog" // Импорт для zerolog.Logger
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/fetch"
-	"github.com/yolkispalkis/go-apt-cache/internal/logging" // Импорт для *logging.Logger
+	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
@@ -45,7 +44,8 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 
 	key := repo.Name + "/" + cleanRelPath
 	upstreamURL := repo.URL + cleanRelPath
-	log := app.Logger.With().Str("key", key).Str("repo", repo.Name).Logger() // *logging.Logger -> zerolog.Logger
+	zl := app.Logger.With().Str("key", key).Str("repo", repo.Name).Logger()
+	log := &logging.Logger{Logger: zl}
 
 	meta, found := app.Cache.Get(r.Context(), key)
 	if !found {
@@ -69,7 +69,7 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 	app.serveFromCache(w, r, key, meta, cleanRelPath, log)
 }
 
-func handleNegativeCache(app *Application, w http.ResponseWriter, r *http.Request, key, upstreamURL string, meta *cache.ItemMeta, cleanRelPath string, log zerolog.Logger) {
+func handleNegativeCache(app *Application, w http.ResponseWriter, r *http.Request, key, upstreamURL string, meta *cache.ItemMeta, cleanRelPath string, log *logging.Logger) {
 	if meta.IsStale(time.Now()) {
 		log.Info().Msg("Stale negative cache entry, re-fetching")
 		app.Cache.Delete(r.Context(), key)
@@ -82,13 +82,13 @@ func handleNegativeCache(app *Application, w http.ResponseWriter, r *http.Reques
 	http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 }
 
-func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key string, meta *cache.ItemMeta, cleanRelPath string, log zerolog.Logger) {
+func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key string, meta *cache.ItemMeta, cleanRelPath string, log *logging.Logger) {
 	if util.CheckConditional(w, r, meta.Headers) {
 		return
 	}
 
 	if r.Context().Value(refetchKey) != nil {
-		log.Err(errors.New("refetch loop detected")).Msg("Aborting due to refetch loop")
+		log.Error().Msg("Refetch loop detected, aborting")
 		http.Error(w, "Internal cache error", http.StatusInternalServerError)
 		return
 	}
@@ -110,7 +110,7 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 			app.fetchAndServe(w, r.WithContext(ctx), key, meta.UpstreamURL, nil, cleanRelPath)
 			return
 		}
-		log.Err(err).Msg("Failed to get content for cached metadata")
+		log.Error().Err(err).Msg("Failed to get content for cached metadata")
 		http.Error(w, "Cache content unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -164,14 +164,9 @@ func handleFetchResult(app *Application, w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	defer close(sharedFetch.Done)
-
 	fetchRes := sharedFetch.Result
 	err := sharedFetch.Err
 
-	if fetchRes != nil && fetchRes.Header != nil {
-		defer util.ReturnHeader(fetchRes.Header)
-	}
 	if fetchRes != nil && fetchRes.Body != nil {
 		defer fetchRes.Body.Close()
 	}
@@ -185,25 +180,28 @@ func handleFetchResult(app *Application, w http.ResponseWriter, r *http.Request,
 }
 
 func handleSharedFetch(app *Application, w http.ResponseWriter, r *http.Request, key, relPath string, sharedFetch *fetch.SharedFetch) {
-	log := app.Logger.With().Str("key", key).Logger() // Убрал лишний .Logger()
-	log.Debug().Msg("Following a shared fetch, waiting for leader.")
-	select {
-	case <-sharedFetch.Done:
-		log.Debug().Msg("Leader finished, proceeding to serve from cache.")
-		meta, found := app.Cache.Get(r.Context(), key)
-		if !found {
-			log.Err(errors.New("item not found after fetch")).Msg("Leader was supposed to cache the item")
-			http.Error(w, "Failed to retrieve file after fetch", http.StatusInternalServerError)
-			return
-		}
-		app.serveFromCache(w, r, key, meta, relPath, log)
-	case <-r.Context().Done():
-		log.Info().Msg("Client disconnected while waiting for leader.")
+	zl := app.Logger.With().Str("key", key).Logger()
+	log := &logging.Logger{Logger: zl}
+	log.Debug().Msg("Shared fetch completed, serving from cache.")
+
+	if sharedFetch.Err != nil {
+		log.Warn().Err(sharedFetch.Err).Msg("Shared fetch failed")
+		http.Error(w, "Upstream fetch failed", http.StatusBadGateway)
+		return
 	}
+
+	meta, found := app.Cache.Get(r.Context(), key)
+	if !found {
+		log.Error().Msg("Item not found in cache after shared fetch")
+		http.Error(w, "Failed to retrieve file after fetch", http.StatusInternalServerError)
+		return
+	}
+	app.serveFromCache(w, r, key, meta, relPath, log)
 }
 
 func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, key, upstreamURL, relPath string, err error, fetchRes *fetch.Result, revalMeta *cache.ItemMeta) {
-	log := app.Logger.With().Str("key", key).Err(err).Logger() // Убрал лишний .Logger()
+	zl := app.Logger.With().Str("key", key).Err(err).Logger()
+	log := &logging.Logger{Logger: zl}
 	if errors.Is(err, fetch.ErrUpstreamNotFound) {
 		log.Info().Msg("Upstream returned 404 Not Found")
 		if app.Config.Cache.NegativeTTL > 0 {
@@ -219,8 +217,9 @@ func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, 
 				ExpiresAt:   now.Add(app.Config.Cache.NegativeTTL),
 			}
 			if putErr := app.Cache.Put(r.Context(), meta); putErr != nil {
-				log.Err(putErr).Msg("Failed to save negative cache entry")
+				log.Error().Err(putErr).Msg("Failed to save negative cache entry")
 			}
+			util.ReturnHeader(meta.Headers)
 		}
 		util.CopyWhitelistedHeaders(w.Header(), fetchRes.Header)
 		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
@@ -239,7 +238,7 @@ func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, 
 		util.UpdateCacheHeaders(updatedMeta.Headers, fetchRes.Header)
 
 		if putErr := app.Cache.Put(r.Context(), &updatedMeta); putErr != nil {
-			log.Err(putErr).Msg("Failed to update metadata after 304")
+			log.Error().Err(putErr).Msg("Failed to update metadata after 304")
 			util.ReturnHeader(updatedMeta.Headers)
 			return
 		}
@@ -276,6 +275,7 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 		if err := app.Cache.Put(r.Context(), meta); err != nil {
 			app.Logger.Error().Err(err).Str("key", key).Msg("Failed to save metadata for HEAD request")
 		}
+		util.ReturnHeader(meta.Headers)
 		return
 	}
 
@@ -297,6 +297,7 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 		if err := app.Cache.Put(context.Background(), meta); err != nil {
 			app.Logger.Error().Err(err).Str("key", key).Msg("Failed to save metadata after content write")
 		}
+		util.ReturnHeader(meta.Headers)
 	}()
 
 	tee := io.TeeReader(fetchRes.Body, pw)

@@ -47,7 +47,6 @@ type Options struct {
 type SharedFetch struct {
 	Result *Result
 	Err    error
-	Done   chan struct{}
 }
 
 type Coordinator struct {
@@ -93,18 +92,18 @@ func NewCoordinator(cfg config.ServerConfig, logger *logging.Logger) *Coordinato
 }
 
 func (c *Coordinator) Fetch(ctx context.Context, key, upstreamURL string, opts *Options) (any, error, bool) {
+	if err := ctx.Err(); err != nil {
+		return nil, err, false
+	}
+
 	resInterface, err, shared := c.sfGroup.Do(key, func() (any, error) {
 		c.log.Debug().Str("key", key).Msg("Executing actual fetch")
 
-		fetchCtx, cancel := context.WithTimeout(context.Background(), c.client.Timeout)
-		defer cancel()
-
-		result, fetchErr := c.doFetch(fetchCtx, upstreamURL, opts)
+		result, fetchErr := c.doFetch(ctx, upstreamURL, opts)
 
 		return &SharedFetch{
 			Result: result,
 			Err:    fetchErr,
-			Done:   make(chan struct{}),
 		}, fetchErr
 	})
 
@@ -141,6 +140,7 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Opt
 	}
 
 	responseHeaders := util.CopyHeader(resp.Header)
+	defer util.ReturnHeader(responseHeaders)
 	for _, h := range hopByHopHeaders {
 		responseHeaders.Del(h)
 	}
