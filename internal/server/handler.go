@@ -83,12 +83,20 @@ func handleNegativeCache(app *Application, w http.ResponseWriter, r *http.Reques
 }
 
 func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key string, meta *cache.ItemMeta, cleanRelPath string, log *logging.Logger) {
-	log.Debug().
-		Str("client_if_none_match", r.Header.Get("If-None-Match")).
-		Str("client_if_modified_since", r.Header.Get("If-Modified-Since")).
-		Str("cached_etag", meta.Headers.Get("ETag")).
-		Str("cached_last_modified", meta.Headers.Get("Last-Modified")).
-		Msg("Checking conditional request")
+	event := log.Debug()
+	if inm := r.Header.Get("If-None-Match"); inm != "" {
+		event.Str("client_if_none_match", inm)
+	}
+	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
+		event.Str("client_if_modified_since", ims)
+	}
+	if etag := meta.Headers.Get("ETag"); etag != "" {
+		event.Str("cached_etag", etag)
+	}
+	if lm := meta.Headers.Get("Last-Modified"); lm != "" {
+		event.Str("cached_last_modified", lm)
+	}
+	event.Msg("Checking conditional request")
 
 	if util.CheckConditional(w, r, meta.Headers) {
 		log.Debug().Msg("Conditional check succeeded, returning 304")
@@ -242,13 +250,14 @@ func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, 
 	}
 
 	if errors.Is(err, fetch.ErrUpstreamNotModified) {
-		log.Info().Err(err).Msg("Revalidation successful (304)")
 		if revalMeta == nil {
-			log.Warn().Msg("Upstream returned 304 on a cache miss. Forwarding to client, but unable to cache.")
+			log.Info().Msg("Conditional cache miss: upstream confirmed not modified. Forwarding 304 to client.")
 			util.CopyWhitelistedHeaders(w.Header(), fetchRes.Header)
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
+
+		log.Info().Msg("Revalidation successful (304), updating metadata.")
 		updatedMeta := *revalMeta
 		updatedMeta.Headers = util.CopyHeader(revalMeta.Headers)
 		updatedMeta.ExpiresAt = calculateFreshness(fetchRes.Header, time.Now(), relPath, app.Config.Cache.Overrides)
@@ -260,6 +269,7 @@ func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, 
 			util.ReturnHeader(updatedMeta.Headers)
 			return
 		}
+
 		app.serveFromCache(w, r, key, &updatedMeta, relPath, log)
 		return
 	}
