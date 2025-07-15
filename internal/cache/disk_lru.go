@@ -194,16 +194,16 @@ type lruShard struct {
 }
 
 func newLRUShard(index int, cfg config.CacheConfig, logger *logging.Logger, store *diskStore, maxBytes int64) (*lruShard, error) {
-	shardLogger := logger.With().Int("shard", index).Logger()
+	shardLogger := logger.WithContext("shard", index)
 	shard := &lruShard{
 		index:       index,
 		cfg:         cfg,
-		log:         &logging.Logger{Logger: shardLogger},
+		log:         shardLogger,
 		store:       store,
 		maxBytes:    maxBytes,
 		items:       make(map[string]*list.Element),
 		lruList:     list.New(),
-		metaBatcher: newMetadataBatcher(store, &logging.Logger{Logger: shardLogger}, batchInterval, defaultQueueSize),
+		metaBatcher: newMetadataBatcher(store, shardLogger, batchInterval, defaultQueueSize),
 	}
 	return shard, nil
 }

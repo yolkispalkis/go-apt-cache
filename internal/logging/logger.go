@@ -59,8 +59,32 @@ func New(cfg Config) (*Logger, error) {
 	return &Logger{zl}, nil
 }
 
+// WithComponent создает дочерний логгер с полем "component".
 func (l *Logger) WithComponent(name string) *Logger {
 	zl := l.With().Str("component", name).Logger()
+	return &Logger{zl}
+}
+
+// WithContext создает дочерний логгер с дополнительными полями контекста.
+// Аргументы должны быть парами: "ключ1", значение1, "ключ2", значение2, ...
+func (l *Logger) WithContext(args ...any) *Logger {
+	if len(args) == 0 {
+		return l
+	}
+	if len(args)%2 != 0 {
+		l.Error().Interface("args", args).Msg("WithContext called with odd number of arguments")
+		return l
+	}
+
+	ctx := l.With()
+	for i := 0; i < len(args); i += 2 {
+		key, ok := args[i].(string)
+		if !ok {
+			continue // Пропускаем, если ключ не строка
+		}
+		ctx.Interface(key, args[i+1])
+	}
+	zl := ctx.Logger()
 	return &Logger{zl}
 }
 

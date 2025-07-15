@@ -44,13 +44,12 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 
 	key := repo.Name + "/" + cleanRelPath
 	upstreamURL := repo.URL + cleanRelPath
-	zl := app.Logger.With().Str("key", key).Str("repo", repo.Name).Logger()
-	log := &logging.Logger{Logger: zl}
+	log := app.Logger.WithContext("key", key, "repo", repo.Name)
 
 	meta, found := app.Cache.Get(r.Context(), key)
 	if !found {
 		log.Info().Msg("Cache miss, fetching from upstream")
-		app.fetchAndServe(w, r, key, upstreamURL, nil, cleanRelPath)
+		app.fetchAndServe(w, r, key, upstreamURL, nil, cleanRelPath, log)
 		return
 	}
 
@@ -62,7 +61,7 @@ func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Re
 
 	if meta.IsStale(time.Now()) || r.Header.Get("Cache-Control") == "no-cache" {
 		log.Info().Msg("Revalidating stale/no-cache item")
-		app.fetchAndServe(w, r, key, upstreamURL, meta, cleanRelPath)
+		app.fetchAndServe(w, r, key, upstreamURL, meta, cleanRelPath, log)
 		return
 	}
 
@@ -73,7 +72,7 @@ func handleNegativeCache(app *Application, w http.ResponseWriter, r *http.Reques
 	if meta.IsStale(time.Now()) {
 		log.Info().Msg("Stale negative cache entry, re-fetching")
 		app.Cache.Delete(r.Context(), key)
-		app.fetchAndServe(w, r, key, upstreamURL, nil, cleanRelPath)
+		app.fetchAndServe(w, r, key, upstreamURL, nil, cleanRelPath, log)
 		return
 	}
 
@@ -116,7 +115,7 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 		if errors.Is(err, os.ErrNotExist) {
 			log.Warn().Msg("Metadata found, but content is missing. Refetching.")
 			app.Cache.Delete(ctx, key)
-			app.fetchAndServe(w, r.WithContext(ctx), key, meta.UpstreamURL, nil, cleanRelPath)
+			app.fetchAndServe(w, r.WithContext(ctx), key, meta.UpstreamURL, nil, cleanRelPath, log)
 			return
 		}
 		log.Error().Err(err).Msg("Failed to get content for cached metadata")
@@ -134,17 +133,17 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 	}
 }
 
-func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, key, upstreamURL string, revalMeta *cache.ItemMeta, relPath string) {
+func (app *Application) fetchAndServe(w http.ResponseWriter, r *http.Request, key, upstreamURL string, revalMeta *cache.ItemMeta, relPath string, log *logging.Logger) {
 	opts := extractOptions(revalMeta)
 	resInterface, _, shared := app.Fetcher.Fetch(r.Context(), key, upstreamURL, opts)
 
 	sharedFetch, ok := resInterface.(*fetch.SharedFetch)
 	if !ok {
-		handleInvalidFetchType(app.Logger, key, resInterface, w)
+		handleInvalidFetchType(log, key, resInterface, w)
 		return
 	}
 
-	handleFetchResult(app, w, r, key, upstreamURL, relPath, sharedFetch, shared, revalMeta)
+	handleFetchResult(app, w, r, key, upstreamURL, relPath, sharedFetch, shared, revalMeta, log)
 }
 
 func extractOptions(revalMeta *cache.ItemMeta) *fetch.Options {
@@ -158,18 +157,18 @@ func extractOptions(revalMeta *cache.ItemMeta) *fetch.Options {
 	return opts
 }
 
-func handleInvalidFetchType(logger *logging.Logger, key string, resInterface any, w http.ResponseWriter) {
+func handleInvalidFetchType(log *logging.Logger, key string, resInterface any, w http.ResponseWriter) {
 	if resInterface == nil {
-		logger.Warn().Str("key", key).Msg("Fetch initiation failed, possibly due to client disconnect.")
+		log.Warn().Str("key", key).Msg("Fetch initiation failed, possibly due to client disconnect.")
 		return
 	}
-	logger.Error().Str("key", key).Msgf("Unexpected type from singleflight: %T", resInterface)
+	log.Error().Str("key", key).Msgf("Unexpected type from singleflight: %T", resInterface)
 	http.Error(w, "Internal server error", http.StatusInternalServerError)
 }
 
-func handleFetchResult(app *Application, w http.ResponseWriter, r *http.Request, key, upstreamURL, relPath string, sharedFetch *fetch.SharedFetch, shared bool, revalMeta *cache.ItemMeta) {
+func handleFetchResult(app *Application, w http.ResponseWriter, r *http.Request, key, upstreamURL, relPath string, sharedFetch *fetch.SharedFetch, shared bool, revalMeta *cache.ItemMeta, log *logging.Logger) {
 	if shared {
-		handleSharedFetch(app, w, r, key, relPath, sharedFetch)
+		handleSharedFetch(app, w, r, key, relPath, sharedFetch, log)
 		return
 	}
 
@@ -181,16 +180,14 @@ func handleFetchResult(app *Application, w http.ResponseWriter, r *http.Request,
 	}
 
 	if err != nil {
-		handleFetchError(app, w, r, key, upstreamURL, relPath, err, fetchRes, revalMeta)
+		handleFetchError(app, w, r, key, upstreamURL, relPath, err, fetchRes, revalMeta, log)
 		return
 	}
 
-	handleFetchSuccess(app, w, r, key, upstreamURL, relPath, fetchRes)
+	handleFetchSuccess(app, w, r, key, upstreamURL, relPath, fetchRes, log)
 }
 
-func handleSharedFetch(app *Application, w http.ResponseWriter, r *http.Request, key, relPath string, sharedFetch *fetch.SharedFetch) {
-	zl := app.Logger.With().Str("key", key).Logger()
-	log := &logging.Logger{Logger: zl}
+func handleSharedFetch(app *Application, w http.ResponseWriter, r *http.Request, key, relPath string, sharedFetch *fetch.SharedFetch, log *logging.Logger) {
 	log.Debug().Msg("Shared fetch completed, serving from cache.")
 
 	if sharedFetch.Err != nil {
@@ -208,11 +205,9 @@ func handleSharedFetch(app *Application, w http.ResponseWriter, r *http.Request,
 	app.serveFromCache(w, r, key, meta, relPath, log)
 }
 
-func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, key, upstreamURL, relPath string, err error, fetchRes *fetch.Result, revalMeta *cache.ItemMeta) {
-	zl := app.Logger.With().Str("key", key).Err(err).Logger()
-	log := &logging.Logger{Logger: zl}
+func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, key, upstreamURL, relPath string, err error, fetchRes *fetch.Result, revalMeta *cache.ItemMeta, log *logging.Logger) {
 	if errors.Is(err, fetch.ErrUpstreamNotFound) {
-		log.Info().Msg("Upstream returned 404 Not Found")
+		log.Info().Err(err).Msg("Upstream returned 404 Not Found")
 		if app.Config.Cache.NegativeTTL > 0 {
 			now := time.Now()
 			meta := &cache.ItemMeta{
@@ -236,7 +231,7 @@ func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, 
 	}
 
 	if errors.Is(err, fetch.ErrUpstreamNotModified) {
-		log.Info().Msg("Revalidation successful (304)")
+		log.Info().Err(err).Msg("Revalidation successful (304)")
 		if revalMeta == nil {
 			return
 		}
@@ -255,11 +250,11 @@ func handleFetchError(app *Application, w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	log.Warn().Msg("Failed to fetch from upstream")
+	log.Warn().Err(err).Msg("Failed to fetch from upstream")
 	http.Error(w, "Upstream fetch failed", http.StatusBadGateway)
 }
 
-func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request, key, upstreamURL, relPath string, fetchRes *fetch.Result) {
+func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request, key, upstreamURL, relPath string, fetchRes *fetch.Result, log *logging.Logger) {
 	if util.CheckConditional(w, r, fetchRes.Header) {
 		return
 	}
@@ -282,7 +277,7 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 	if r.Method == http.MethodHead {
 		w.WriteHeader(meta.StatusCode)
 		if err := app.Cache.Put(r.Context(), meta); err != nil {
-			app.Logger.Error().Err(err).Str("key", key).Msg("Failed to save metadata for HEAD request")
+			log.Error().Err(err).Msg("Failed to save metadata for HEAD request")
 		}
 		util.ReturnHeader(meta.Headers)
 		return
@@ -297,14 +292,14 @@ func handleFetchSuccess(app *Application, w http.ResponseWriter, r *http.Request
 		written, err := app.Cache.PutContent(r.Context(), key, pr)
 		if err != nil {
 			if !util.IsClientDisconnectedError(err) {
-				app.Logger.Error().Err(err).Str("key", key).Msg("Failed to write content to cache")
+				log.Error().Err(err).Msg("Failed to write content to cache")
 			}
 			app.Cache.Delete(context.Background(), key)
 			return
 		}
 		meta.Size = written
 		if err := app.Cache.Put(context.Background(), meta); err != nil {
-			app.Logger.Error().Err(err).Str("key", key).Msg("Failed to save metadata after content write")
+			log.Error().Err(err).Msg("Failed to save metadata after content write")
 		}
 		util.ReturnHeader(meta.Headers)
 	}()
