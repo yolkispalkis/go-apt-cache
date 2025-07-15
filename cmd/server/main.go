@@ -18,6 +18,12 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
+// Переменные для информации о приложении, заполняются при сборке
+var (
+	AppName    = "go-apt-cache"
+	AppVersion = "dev"
+)
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -33,15 +39,17 @@ func bootstrap() (*server.Server, func(), error) {
 	createCfg := flag.Bool("create-config", false, "Create default config file and exit")
 	flag.Parse()
 
+	defaultCfg := config.Default(AppName, AppVersion)
+
 	if *createCfg {
-		err := config.EnsureDefault(*cfgPath)
+		err := config.EnsureDefault(*cfgPath, defaultCfg)
 		if err == nil {
 			os.Exit(0)
 		}
 		return nil, nil, err
 	}
 
-	cfg, err := config.Load(*cfgPath)
+	cfg, err := config.Load(*cfgPath, defaultCfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to load config: %w", err)
 	}

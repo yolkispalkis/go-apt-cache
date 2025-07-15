@@ -14,7 +14,6 @@ import (
 	kyaml "github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
-	"github.com/yolkispalkis/go-apt-cache/internal/appinfo"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 	"gopkg.in/yaml.v3"
@@ -60,7 +59,7 @@ type Config struct {
 	Repositories []Repository   `koanf:"repositories" yaml:"repositories"`
 }
 
-func Default() *Config {
+func Default(appName, appVersion string) *Config {
 	return &Config{
 		Server: ServerConfig{
 			ListenAddr:        ":8080",
@@ -71,7 +70,7 @@ func Default() *Config {
 			IdleTimeout:       120 * time.Second,
 			ReadHeaderTimeout: 10 * time.Second,
 			MaxConcurrent:     20,
-			UserAgent:         appinfo.UserAgent(),
+			UserAgent:         fmt.Sprintf("%s/%s", appName, appVersion),
 		},
 		Cache: CacheConfig{
 			Dir:          "/var/cache/go-apt-cache",
@@ -100,9 +99,9 @@ func Default() *Config {
 	}
 }
 
-func Load(path string) (*Config, error) {
+func Load(path string, defaultConfig *Config) (*Config, error) {
 	k := koanf.New(".")
-	cfg := Default()
+	cfg := defaultConfig
 
 	var parser koanf.Parser
 	ext := strings.ToLower(filepath.Ext(path))
@@ -193,7 +192,7 @@ func normalize(c *Config) {
 	}
 }
 
-func EnsureDefault(path string) error {
+func EnsureDefault(path string, defaultCfg *Config) error {
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("config file already exists at %s", path)
 	}
@@ -201,7 +200,6 @@ func EnsureDefault(path string) error {
 		return fmt.Errorf("failed to create directory for config: %w", err)
 	}
 
-	defaultCfg := Default()
 	var data []byte
 	var err error
 
