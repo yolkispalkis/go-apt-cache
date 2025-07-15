@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -39,14 +40,13 @@ type requestHandler struct {
 	cleanRelPath string
 }
 
-func newRequestHandler(w http.ResponseWriter, r *http.Request) (*requestHandler, error) {
+func (app *Application) newRequestHandler(w http.ResponseWriter, r *http.Request) (*requestHandler, error) {
 	repo := r.Context().Value(repoContextKey).(config.Repository)
 	relPath := chi.URLParam(r, "*")
 	cleanRelPath := filepath.Clean(relPath)
 
 	if strings.HasPrefix(cleanRelPath, "..") || cleanRelPath == ".." || cleanRelPath == "." {
-		logger := r.Context().Value(loggerContextKey).(*logging.Logger)
-		logger.Warn().
+		app.Logger.Warn().
 			Str("repo", repo.Name).
 			Str("remote_addr", r.RemoteAddr).
 			Str("raw_path", relPath).
@@ -58,16 +58,21 @@ func newRequestHandler(w http.ResponseWriter, r *http.Request) (*requestHandler,
 	h := &requestHandler{
 		w:            w,
 		r:            r,
-		log:          r.Context().Value(loggerContextKey).(*logging.Logger).WithContext("key", key, "repo", repo.Name),
-		cache:        r.Context().Value(cacheContextKey).(cache.Manager),
-		fetcher:      r.Context().Value(fetcherContextKey).(*fetch.Coordinator),
-		cfg:          r.Context().Value(configContextKey).(*config.Config),
+		log:          app.Logger.WithContext("key", key, "repo", repo.Name),
+		cache:        app.Cache,
+		fetcher:      app.Fetcher,
+		cfg:          app.Config,
 		repo:         repo,
 		key:          key,
 		upstreamURL:  repo.URL + cleanRelPath,
 		cleanRelPath: cleanRelPath,
 	}
 	return h, nil
+}
+
+func (h *requestHandler) sendError(statusCode int, message string, err error) {
+	h.log.Warn().Err(err).Msg(message)
+	http.Error(h.w, message, statusCode)
 }
 
 func (h *requestHandler) process() {
@@ -121,8 +126,7 @@ func (h *requestHandler) serveFromCache(meta *cache.ItemMeta) {
 			h.fetchAndServe(nil)
 			return
 		}
-		h.log.Error().Err(err).Msg("Failed to get content for cached metadata")
-		http.Error(h.w, "Cache content unavailable", http.StatusInternalServerError)
+		h.sendError(http.StatusInternalServerError, "Cache content unavailable", err)
 		return
 	}
 	defer content.Close()
@@ -159,8 +163,7 @@ func (h *requestHandler) fetchAndServe(revalMeta *cache.ItemMeta) {
 			h.log.Warn().Msg("Fetch initiation failed, possibly due to client disconnect.")
 			return
 		}
-		h.log.Error().Msgf("Unexpected type from singleflight: %T", resInterface)
-		http.Error(h.w, "Internal server error", http.StatusInternalServerError)
+		h.sendError(http.StatusInternalServerError, "Internal server error", fmt.Errorf("unexpected type from singleflight: %T", resInterface))
 		return
 	}
 
@@ -172,8 +175,7 @@ func (h *requestHandler) handleFetchResult(sharedFetch *fetch.SharedFetch, share
 		h.log.Debug().Msg("Shared fetch completed, serving from cache.")
 		meta, found := h.cache.Get(h.r.Context(), h.key)
 		if !found {
-			h.log.Error().Msg("Item not found in cache after shared fetch")
-			http.Error(h.w, "Failed to retrieve file after fetch", http.StatusInternalServerError)
+			h.sendError(http.StatusInternalServerError, "Failed to retrieve file after fetch", errors.New("item not found in cache after shared fetch"))
 			return
 		}
 		defer util.ReturnHeader(meta.Headers)
@@ -217,8 +219,7 @@ func (h *requestHandler) handleFetchError(err error, fetchRes *fetch.Result, rev
 		return
 	}
 
-	h.log.Warn().Err(err).Msg("Failed to fetch from upstream")
-	http.Error(h.w, "Upstream fetch failed", http.StatusBadGateway)
+	h.sendError(http.StatusBadGateway, "Upstream fetch failed", err)
 }
 
 func (h *requestHandler) handleGracefulOffline(err error, revalMeta *cache.ItemMeta) {
@@ -338,8 +339,8 @@ func (h *requestHandler) streamToClientAndCache(fetchRes *fetch.Result, meta *ca
 	wg.Wait()
 }
 
-func handleServeRepoContent(w http.ResponseWriter, r *http.Request) {
-	handler, err := newRequestHandler(w, r)
+func (app *Application) handleServeRepoContent(w http.ResponseWriter, r *http.Request) {
+	handler, err := app.newRequestHandler(w, r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -347,7 +348,7 @@ func handleServeRepoContent(w http.ResponseWriter, r *http.Request) {
 	handler.process()
 }
 
-func handleStatus(w http.ResponseWriter, r *http.Request) {
+func (app *Application) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	var sb strings.Builder
 	sb.WriteString("OK\n")

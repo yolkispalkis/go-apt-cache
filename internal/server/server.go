@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
@@ -82,6 +83,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.httpSrv.Shutdown(ctx)
 	s.cleanupSocket()
 	return err
+}
+
+func (s *Server) Logger() *logging.Logger {
+	return s.log
+}
+
+func (s *Server) ShutdownTimeout() time.Duration {
+	return s.cfg.ShutdownTimeout
 }
 
 func (s *Server) setupListeners() error {
