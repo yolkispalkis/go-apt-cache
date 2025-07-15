@@ -84,11 +84,14 @@ func handleNegativeCache(app *Application, w http.ResponseWriter, r *http.Reques
 
 func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key string, meta *cache.ItemMeta, cleanRelPath string, log *logging.Logger) {
 	event := log.Debug()
-	if inm := r.Header.Get("If-None-Match"); inm != "" {
-		event.Str("client_if_none_match", inm)
+	clientIfNoneMatch := r.Header.Get("If-None-Match")
+	clientIfModifiedSince := r.Header.Get("If-Modified-Since")
+
+	if clientIfNoneMatch != "" {
+		event.Str("client_if_none_match", clientIfNoneMatch)
 	}
-	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
-		event.Str("client_if_modified_since", ims)
+	if clientIfModifiedSince != "" {
+		event.Str("client_if_modified_since", clientIfModifiedSince)
 	}
 	if etag := meta.Headers.Get("ETag"); etag != "" {
 		event.Str("cached_etag", etag)
@@ -98,11 +101,14 @@ func (app *Application) serveFromCache(w http.ResponseWriter, r *http.Request, k
 	}
 	event.Msg("Checking conditional request")
 
-	if util.CheckConditional(w, r, meta.Headers) {
-		log.Debug().Msg("Conditional check succeeded, returning 304")
-		return
+	if clientIfNoneMatch != "" || clientIfModifiedSince != "" {
+		if util.CheckConditional(w, r, meta.Headers) {
+			log.Debug().Msg("Conditional check succeeded, returning 304")
+			return
+		}
 	}
-	log.Debug().Msg("Conditional check failed, serving full response")
+
+	log.Debug().Msg("Conditional check failed or not applicable, serving full response")
 
 	if r.Context().Value(refetchKey) != nil {
 		log.Error().Msg("Refetch loop detected, aborting")
