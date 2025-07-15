@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
 	"github.com/yolkispalkis/go-apt-cache/internal/logging"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
@@ -168,6 +169,21 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Opt
 		resp.Body.Close()
 		return result, fmt.Errorf("%w (status %d)", ErrUpstreamServer, resp.StatusCode)
 	}
+}
+
+func NewFetchOptions(r *http.Request, revalMeta *cache.ItemMeta) *Options {
+	if revalMeta != nil {
+		opts := &Options{IfNoneMatch: revalMeta.Headers.Get("ETag")}
+		if t, err := http.ParseTime(revalMeta.Headers.Get("Last-Modified")); err == nil {
+			opts.IfModSince = t
+		}
+		return opts
+	}
+	opts := &Options{IfNoneMatch: r.Header.Get("If-None-Match")}
+	if t, err := http.ParseTime(r.Header.Get("If-Modified-Since")); err == nil {
+		opts.IfModSince = t
+	}
+	return opts
 }
 
 func logProxyInfo(logger *logging.Logger) {

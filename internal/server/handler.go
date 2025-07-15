@@ -7,12 +7,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/bmatcuk/doublestar/v4"
 	"github.com/go-chi/chi/v5"
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
@@ -98,16 +96,14 @@ func (h *requestHandler) process() {
 }
 
 func (h *requestHandler) serveFromCache(meta *cache.ItemMeta) {
-	logConditionalRequest(h.r, meta, h.log)
-
-	if clientHasFreshVersion(h.r) {
+	if util.ClientHasFreshVersion(h.r) {
+		logConditionalRequest(h.r, meta, h.log)
 		if util.CheckConditional(h.w, h.r, meta.Headers) {
 			h.log.Debug().Msg("Conditional check succeeded, returning 304")
 			return
 		}
+		h.log.Debug().Msg("Conditional check failed, serving full response")
 	}
-
-	h.log.Debug().Msg("Conditional check failed or not applicable, serving full response")
 
 	util.CopyWhitelistedHeaders(h.w.Header(), meta.Headers)
 	h.w.Header().Set("X-Cache-Status", cacheStatusHit)
@@ -154,7 +150,7 @@ func (h *requestHandler) handleNegativeCache(meta *cache.ItemMeta) {
 }
 
 func (h *requestHandler) fetchAndServe(revalMeta *cache.ItemMeta) {
-	opts := extractOptions(h.r, revalMeta)
+	opts := fetch.NewFetchOptions(h.r, revalMeta)
 	resInterface, _, shared := h.fetcher.Fetch(h.r.Context(), h.key, h.upstreamURL, opts)
 
 	sharedFetch, ok := resInterface.(*fetch.SharedFetch)
@@ -263,7 +259,7 @@ func (h *requestHandler) handleRevalidation(fetchRes *fetch.Result, revalMeta *c
 	h.log.Info().Msg("Revalidation successful (304), updating metadata.")
 	updatedMeta := *revalMeta
 	updatedMeta.Headers = util.CopyHeader(revalMeta.Headers)
-	updatedMeta.ExpiresAt = calculateFreshness(fetchRes.Header, time.Now(), h.cleanRelPath, h.cfg.Cache.Overrides)
+	updatedMeta.ExpiresAt = cache.CalculateFreshness(fetchRes.Header, time.Now(), h.cleanRelPath, h.cfg.Cache.Overrides)
 	updatedMeta.LastUsedAt = time.Now()
 	util.UpdateCacheHeaders(updatedMeta.Headers, fetchRes.Header)
 
@@ -303,7 +299,7 @@ func (h *requestHandler) createCacheMeta(fetchRes *fetch.Result) *cache.ItemMeta
 		StatusCode:  fetchRes.Status,
 		Headers:     headersCopy,
 		Size:        fetchRes.Size,
-		ExpiresAt:   calculateFreshness(headersCopy, now, h.cleanRelPath, h.cfg.Cache.Overrides),
+		ExpiresAt:   cache.CalculateFreshness(headersCopy, now, h.cleanRelPath, h.cfg.Cache.Overrides),
 	}
 }
 
@@ -374,68 +370,4 @@ func logConditionalRequest(r *http.Request, meta *cache.ItemMeta, log *logging.L
 		event.Str("cached_last_modified", lm)
 	}
 	event.Msg("Checking conditional request")
-}
-
-func clientHasFreshVersion(r *http.Request) bool {
-	return r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != ""
-}
-
-func extractOptions(r *http.Request, revalMeta *cache.ItemMeta) *fetch.Options {
-	if revalMeta != nil {
-		opts := &fetch.Options{IfNoneMatch: revalMeta.Headers.Get("ETag")}
-		if t, err := http.ParseTime(revalMeta.Headers.Get("Last-Modified")); err == nil {
-			opts.IfModSince = t
-		}
-		return opts
-	}
-	opts := &fetch.Options{IfNoneMatch: r.Header.Get("If-None-Match")}
-	if t, err := http.ParseTime(r.Header.Get("If-Modified-Since")); err == nil {
-		opts.IfModSince = t
-	}
-	return opts
-}
-
-func calculateFreshness(headers http.Header, responseTime time.Time, relPath string, overrides []config.CacheOverride) time.Time {
-	if overrideTTL, ok := findOverrideTTL(relPath, overrides); ok {
-		return responseTime.Add(overrideTTL)
-	}
-	cc := util.ParseCacheControl(headers.Get("Cache-Control"))
-	if _, ok := cc["no-store"]; ok {
-		return time.Time{}
-	}
-	if _, ok := cc["no-cache"]; ok {
-		return responseTime
-	}
-	var lifetime time.Duration
-	if sMaxAge, ok := cc["s-maxage"]; ok {
-		if sec, err := strconv.ParseInt(sMaxAge, 10, 64); err == nil {
-			lifetime = time.Duration(sec) * time.Second
-		}
-	} else if maxAge, ok := cc["max-age"]; ok {
-		if sec, err := strconv.ParseInt(maxAge, 10, 64); err == nil {
-			lifetime = time.Duration(sec) * time.Second
-		}
-	} else if expiresStr := headers.Get("Expires"); expiresStr != "" {
-		if expires, err := http.ParseTime(expiresStr); err == nil {
-			lifetime = expires.Sub(responseTime)
-		}
-	} else if lmStr := headers.Get("Last-Modified"); lmStr != "" {
-		if lm, err := http.ParseTime(lmStr); err == nil {
-			lifetime = responseTime.Sub(lm) / 10
-		}
-	}
-	if lifetime < 0 {
-		lifetime = 0
-	}
-	return responseTime.Add(lifetime)
-}
-
-func findOverrideTTL(relPath string, overrides []config.CacheOverride) (time.Duration, bool) {
-	for _, rule := range overrides {
-		matched, err := doublestar.Match(rule.PathPattern, relPath)
-		if err == nil && matched {
-			return rule.TTL, true
-		}
-	}
-	return 0, false
 }

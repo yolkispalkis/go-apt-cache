@@ -42,7 +42,6 @@ var headerPool = sync.Pool{New: func() any { return make(http.Header, 16) }}
 var bufferPoolSize int64 = 64 * 1024
 var bufferPool = sync.Pool{New: func() any { return make([]byte, bufferPoolSize) }}
 
-// InitBufferPool initializes the buffer pool with the given size.
 func InitBufferPool(sizeStr string, log *logging.Logger) {
 	size, err := ParseSize(sizeStr)
 	if err != nil || size <= 0 {
@@ -66,7 +65,6 @@ func MustParseSize(s string) int64 {
 	return size
 }
 
-// ParseSize parses a size string like "10GB" or "1.5MB", allowing fractional with rounding.
 func ParseSize(s string) (int64, error) {
 	if s == "" {
 		return 0, errors.New("size string is empty")
@@ -83,7 +81,6 @@ func ParseSize(s string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	// Round fractional to nearest byte
 	val = math.Round(val)
 
 	var mult float64 = 1
@@ -100,7 +97,6 @@ func ParseSize(s string) (int64, error) {
 	return int64(val * mult), nil
 }
 
-// FormatSize formats bytes to human-readable string.
 func FormatSize(b int64) string {
 	const unit = 1024
 	if b < unit {
@@ -116,7 +112,6 @@ func FormatSize(b int64) string {
 
 func CleanPath(p string) string { return filepath.Clean(p) }
 
-// IsRepoNameSafe checks if repo name is safe (no traversal, valid chars).
 func IsRepoNameSafe(n string) bool {
 	if n == "" || n == "." || n == ".." || strings.ContainsAny(n, "/\\") {
 		return false
@@ -168,7 +163,6 @@ func UpdateCacheHeaders(dst, src http.Header) {
 	}
 }
 
-// ParseCacheControl parses Cache-Control header into a map.
 func ParseCacheControl(v string) map[string]string {
 	dirs := make(map[string]string)
 	fields := strings.FieldsFunc(v, func(r rune) bool { return r == ',' })
@@ -202,12 +196,10 @@ func IsClientDisconnectedError(err error) bool {
 	return strings.Contains(errStr, "broken pipe") || strings.Contains(errStr, "connection reset by peer")
 }
 
-// normalizeETag removes quotes and W/ prefix.
 func normalizeETag(etag string) string {
 	return strings.TrimPrefix(strings.Trim(etag, `"`), "W/")
 }
 
-// CompareETags compares client ETags with resource ETag, handling wildcards and weak tags.
 func CompareETags(clientETagsStr, resourceETag string) bool {
 	if clientETagsStr == "" || resourceETag == "" {
 		return false
@@ -304,4 +296,8 @@ func CheckConditional(w http.ResponseWriter, r *http.Request, headers http.Heade
 		}
 	}
 	return false
+}
+
+func ClientHasFreshVersion(r *http.Request) bool {
+	return r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != ""
 }
