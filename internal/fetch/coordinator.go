@@ -43,6 +43,7 @@ type Result struct {
 type Options struct {
 	IfModSince  time.Time
 	IfNoneMatch string
+	UseHEAD     bool
 }
 
 type SharedFetch struct {
@@ -99,30 +100,30 @@ func (c *Coordinator) Fetch(ctx context.Context, key, upstreamURL string, opts *
 
 	resInterface, err, shared := c.sfGroup.Do(key, func() (any, error) {
 		c.log.Debug().Str("key", key).Msg("Executing actual fetch")
-
 		result, fetchErr := c.doFetch(ctx, upstreamURL, opts)
-
-		return &SharedFetch{
-			Result: result,
-			Err:    fetchErr,
-		}, fetchErr
+		return &SharedFetch{Result: result, Err: fetchErr}, fetchErr
 	})
 
 	if shared {
 		c.log.Debug().Str("key", key).Msg("Shared fetch result")
 	}
-
 	return resInterface, err, shared
 }
 
 func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Options) (*Result, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
+	method := http.MethodGet
+	if opts != nil && opts.UseHEAD {
+		method = http.MethodHead
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, upstreamURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrRequestSetup, err)
 	}
 
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", "*/*")
+
 	if opts != nil {
 		if !opts.IfModSince.IsZero() {
 			req.Header.Set("If-Modified-Since", opts.IfModSince.UTC().Format(http.TimeFormat))
@@ -140,66 +141,74 @@ func (c *Coordinator) doFetch(ctx context.Context, upstreamURL string, opts *Opt
 		return nil, fmt.Errorf("%w: %w", ErrNetwork, err)
 	}
 
-	responseHeaders := util.CopyHeader(resp.Header)
+	hdr := util.CopyHeader(resp.Header)
 	for _, h := range hopByHopHeaders {
-		responseHeaders.Del(h)
+		hdr.Del(h)
 	}
-
-	result := &Result{Status: resp.StatusCode, Header: responseHeaders}
+	result := &Result{Status: resp.StatusCode, Header: hdr}
 
 	switch {
 	case resp.StatusCode == http.StatusNotModified:
 		resp.Body.Close()
 		return result, ErrUpstreamNotModified
+
 	case resp.StatusCode == http.StatusNotFound:
 		resp.Body.Close()
 		return result, ErrUpstreamNotFound
+
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		result.Body = resp.Body
-		if cl := resp.Header.Get("Content-Length"); cl != "" {
-			if size, err := strconv.ParseInt(cl, 10, 64); err == nil {
-				result.Size = size
+		// тело возвращаем только для GET
+		if method == http.MethodGet {
+			result.Body = resp.Body
+			if cl := resp.Header.Get("Content-Length"); cl != "" {
+				if sz, err := strconv.ParseInt(cl, 10, 64); err == nil {
+					result.Size = sz
+				}
 			}
+		} else {
+			resp.Body.Close()
 		}
 		return result, nil
+
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		resp.Body.Close()
 		return result, fmt.Errorf("%w (status %d)", ErrUpstreamClient, resp.StatusCode)
+
 	default:
 		resp.Body.Close()
 		return result, fmt.Errorf("%w (status %d)", ErrUpstreamServer, resp.StatusCode)
 	}
 }
 
-func NewFetchOptions(r *http.Request, revalMeta *cache.ItemMeta) *Options {
-	if revalMeta != nil {
-		opts := &Options{IfNoneMatch: revalMeta.Headers.Get("ETag")}
-		if t, err := http.ParseTime(revalMeta.Headers.Get("Last-Modified")); err == nil {
-			opts.IfModSince = t
+func NewFetchOptions(r *http.Request, meta *cache.ItemMeta) *Options {
+	if meta != nil {
+		o := &Options{IfNoneMatch: meta.Headers.Get("ETag")}
+		if t, err := http.ParseTime(meta.Headers.Get("Last-Modified")); err == nil {
+			o.IfModSince = t
 		}
-		return opts
+		return o
 	}
-	opts := &Options{IfNoneMatch: r.Header.Get("If-None-Match")}
+	o := &Options{IfNoneMatch: r.Header.Get("If-None-Match")}
 	if t, err := http.ParseTime(r.Header.Get("If-Modified-Since")); err == nil {
-		opts.IfModSince = t
+		o.IfModSince = t
 	}
-	return opts
+	return o
 }
 
-func logProxyInfo(logger *logging.Logger) {
-	for _, scheme := range []string{"http", "https"} {
-		reqURL, _ := url.Parse(fmt.Sprintf("%s://example.com", scheme))
+func logProxyInfo(log *logging.Logger) {
+	for _, s := range []string{"http", "https"} {
+		reqURL, _ := url.Parse(fmt.Sprintf("%s://example.com", s))
 		proxyURL, err := http.ProxyFromEnvironment(&http.Request{URL: reqURL})
 		if err != nil {
-			logger.Error().Err(err).Str("scheme", scheme).Msg("Error getting proxy from environment")
+			log.Error().Err(err).Str("scheme", s).Msg("Proxy detection error")
 			continue
 		}
 		if proxyURL != nil {
-			safeProxyURL := *proxyURL
-			safeProxyURL.User = nil
-			logger.Info().Str("scheme", scheme).Str("proxy_url", safeProxyURL.String()).Msg("System proxy configured for upstream requests")
+			noAuth := *proxyURL
+			noAuth.User = nil
+			log.Info().Str("scheme", s).Str("proxy_url", noAuth.String()).Msg("System proxy configured")
 		} else {
-			logger.Info().Str("scheme", scheme).Msg("No system proxy configured for upstream requests")
+			log.Info().Str("scheme", s).Msg("No system proxy configured")
 		}
 	}
 }
