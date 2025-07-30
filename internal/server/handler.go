@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -43,7 +42,6 @@ type requestHandler struct {
 
 func (app *Application) newRequestHandler(w http.ResponseWriter, r *http.Request) (*requestHandler, error) {
 	repo := r.Context().Value(repoContextKey).(config.Repository)
-
 	relPath := chi.URLParam(r, "*")
 
 	if u1, err := url.PathUnescape(relPath); err == nil {
@@ -52,7 +50,6 @@ func (app *Application) newRequestHandler(w http.ResponseWriter, r *http.Request
 			relPath = u2
 		}
 	}
-
 	hasTrailing := strings.HasSuffix(relPath, "/") && relPath != "/"
 	cleanRelPath := filepath.Clean(relPath)
 	if cleanRelPath == "." {
@@ -63,11 +60,7 @@ func (app *Application) newRequestHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	if strings.HasPrefix(cleanRelPath, "..") || cleanRelPath == ".." {
-		app.Logger.Warn().
-			Str("repo", repo.Name).
-			Str("remote_addr", r.RemoteAddr).
-			Str("raw_path", relPath).
-			Msg("Path traversal attempt blocked")
+		app.Logger.Warn().Str("repo", repo.Name).Str("remote_addr", r.RemoteAddr).Str("raw_path", relPath).Msg("Path traversal blocked")
 		return nil, errors.New("invalid path")
 	}
 
@@ -75,7 +68,6 @@ func (app *Application) newRequestHandler(w http.ResponseWriter, r *http.Request
 	if cleanRelPath != "" {
 		key += cleanRelPath
 	}
-	upstreamURL := repo.URL + cleanRelPath
 
 	return &requestHandler{
 		w:            w,
@@ -86,7 +78,7 @@ func (app *Application) newRequestHandler(w http.ResponseWriter, r *http.Request
 		cfg:          app.Config,
 		repo:         repo,
 		key:          key,
-		upstreamURL:  upstreamURL,
+		upstreamURL:  repo.URL + cleanRelPath,
 		cleanRelPath: cleanRelPath,
 	}, nil
 }
@@ -99,21 +91,17 @@ func (h *requestHandler) sendError(code int, msg string, err error) {
 func (h *requestHandler) process() {
 	meta, ok := h.cache.Get(h.r.Context(), h.key)
 	if !ok {
-		h.log.Info().Msg("Cache miss, fetching from upstream")
+		h.log.Info().Msg("Cache miss, fetching")
 		h.fetchAndServe(nil)
 		return
 	}
 
-	h.log.Debug().Msg("Cache hit")
-
 	switch {
 	case meta.StatusCode == http.StatusNotFound:
 		h.serveNegative(meta)
-
 	case meta.IsStale(time.Now()):
 		h.log.Info().Msg("Revalidating stale item")
 		h.fetchAndServe(meta)
-
 	default:
 		h.serveFromCache(meta)
 	}
@@ -123,7 +111,6 @@ func (h *requestHandler) serveFromCache(meta *cache.ItemMeta) {
 	if util.ClientHasFreshVersion(h.r) {
 		logConditionalRequest(h.r, meta, h.log)
 		if util.CheckConditional(h.w, h.r, meta.Headers) {
-			h.log.Debug().Msg("Client already has fresh copy (304)")
 			return
 		}
 	}
@@ -136,10 +123,9 @@ func (h *requestHandler) serveFromCache(meta *cache.ItemMeta) {
 		return
 	}
 
-	rc, err := h.cache.GetContent(h.r.Context(), h.key)
+	content, err := h.cache.GetContent(h.r.Context(), h.key)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			h.log.Warn().Msg("Metadata exists, content missing – re-fetching")
 			h.cache.Delete(h.r.Context(), h.key)
 			h.fetchAndServe(nil)
 			return
@@ -147,20 +133,16 @@ func (h *requestHandler) serveFromCache(meta *cache.ItemMeta) {
 		h.sendError(http.StatusInternalServerError, "Cache content unavailable", err)
 		return
 	}
-	defer rc.Close()
+	defer content.Close()
 
 	h.w.WriteHeader(meta.StatusCode)
 	buf := util.GetBuffer()
 	defer util.ReturnBuffer(buf)
-
-	if _, err := io.CopyBuffer(h.w, rc, buf); err != nil {
-		h.log.Warn().Err(err).Msg("Copy cached content → client failed")
-	}
+	_, _ = io.CopyBuffer(h.w, content, buf)
 }
 
 func (h *requestHandler) serveNegative(meta *cache.ItemMeta) {
 	if meta.IsStale(time.Now()) {
-		h.log.Info().Msg("Stale negative cache entry – refetching")
 		h.cache.Delete(h.r.Context(), h.key)
 		h.fetchAndServe(nil)
 		return
@@ -175,16 +157,8 @@ func (h *requestHandler) fetchAndServe(revalMeta *cache.ItemMeta) {
 		opts.UseHEAD = true
 	}
 
-	res, _, shared := h.fetcher.Fetch(h.r.Context(), h.key, h.upstreamURL, opts)
-	sf, ok := res.(*fetch.SharedFetch)
-	if !ok {
-		if res == nil {
-			h.log.Warn().Msg("Fetch aborted (client disconnect?)")
-			return
-		}
-		h.sendError(http.StatusInternalServerError, "Internal error (singleflight)", fmt.Errorf("%T", res))
-		return
-	}
+	raw, _, shared := h.fetcher.Fetch(h.r.Context(), h.key, h.upstreamURL, opts)
+	sf := raw.(*fetch.SharedFetch)
 
 	if shared {
 		if meta, ok := h.cache.Get(h.r.Context(), h.key); ok {
@@ -197,8 +171,20 @@ func (h *requestHandler) fetchAndServe(revalMeta *cache.ItemMeta) {
 
 	if opts.UseHEAD && sf.Err == nil && sf.Result != nil &&
 		sf.Result.Body == nil && sf.Result.Status >= 200 && sf.Result.Status < 300 {
-		h.log.Debug().Msg("HEAD indicates resource changed, performing full GET")
-		h.fetchAndServe(nil)
+
+		if resourceChanged(revalMeta, sf.Result.Header) {
+			h.log.Debug().Msg("HEAD validators changed → full GET")
+			h.fetchAndServe(nil)
+			return
+		}
+
+		h.log.Debug().Msg("HEAD validators unchanged → updating metadata")
+		updated := *revalMeta
+		updated.LastUsedAt = time.Now()
+		updated.ExpiresAt = cache.CalculateFreshness(sf.Result.Header, time.Now(), h.cleanRelPath, h.cfg.Cache.Overrides)
+		util.UpdateCacheHeaders(updated.Headers, sf.Result.Header)
+		_ = h.cache.Put(h.r.Context(), &updated)
+		h.serveFromCache(&updated)
 		return
 	}
 
@@ -206,21 +192,35 @@ func (h *requestHandler) fetchAndServe(revalMeta *cache.ItemMeta) {
 		h.handleFetchError(sf.Err, sf.Result, revalMeta)
 		return
 	}
+
 	h.handleFetchSuccess(sf.Result)
 }
 
-func (h *requestHandler) handleFetchError(err error, res *fetch.Result, revalMeta *cache.ItemMeta) {
+func resourceChanged(old *cache.ItemMeta, hdr http.Header) bool {
+	if old == nil {
+		return true
+	}
 	switch {
-	case revalMeta != nil && (errors.Is(err, fetch.ErrNetwork) || errors.Is(err, fetch.ErrUpstreamServer)):
-		h.log.Warn().Err(err).Msg("Upstream error; grace-mode serve stale")
-		h.serveFromCache(revalMeta)
+	case hdr.Get("ETag") != "" && hdr.Get("ETag") == old.Headers.Get("ETag"):
+		return false
+	case hdr.Get("Last-Modified") != "" && hdr.Get("Last-Modified") == old.Headers.Get("Last-Modified"):
+		return false
+	case hdr.Get("Content-Length") != "" && hdr.Get("Content-Length") == old.Headers.Get("Content-Length"):
+		return false
+	default:
+		return true
+	}
+}
 
+func (h *requestHandler) handleFetchError(err error, res *fetch.Result, stale *cache.ItemMeta) {
+	switch {
+	case stale != nil && (errors.Is(err, fetch.ErrNetwork) || errors.Is(err, fetch.ErrUpstreamServer)):
+		h.log.Warn().Err(err).Msg("Upstream error; serving stale")
+		h.serveFromCache(stale)
 	case errors.Is(err, fetch.ErrUpstreamNotFound):
 		h.handleUpstream404(res)
-
 	case errors.Is(err, fetch.ErrUpstreamNotModified):
-		h.handleRevalidation(res, revalMeta)
-
+		h.handleRevalidation(res, stale)
 	default:
 		h.sendError(http.StatusBadGateway, "Upstream fetch failed", err)
 	}
@@ -231,8 +231,6 @@ func (h *requestHandler) handleUpstream404(res *fetch.Result) {
 		h.sendError(http.StatusNotFound, "Not found", nil)
 		return
 	}
-
-	h.log.Info().Msg("Upstream 404 – storing negative cache")
 	if h.cfg.Cache.NegativeTTL > 0 {
 		now := time.Now()
 		meta := &cache.ItemMeta{
@@ -256,22 +254,17 @@ func (h *requestHandler) handleRevalidation(res *fetch.Result, old *cache.ItemMe
 		h.w.WriteHeader(http.StatusNotModified)
 		return
 	}
-
-	h.log.Info().Msg("Revalidation succeeded (304) – update metadata")
-
-	newMeta := *old
-	newMeta.Headers = util.CopyHeader(old.Headers)
-
-	freshHdr := res.Header
-	if len(freshHdr) == 0 {
-		freshHdr = old.Headers
+	updated := *old
+	updated.Headers = util.CopyHeader(old.Headers)
+	fresh := res.Header
+	if len(fresh) == 0 {
+		fresh = old.Headers
 	}
-	newMeta.ExpiresAt = cache.CalculateFreshness(freshHdr, time.Now(), h.cleanRelPath, h.cfg.Cache.Overrides)
-	newMeta.LastUsedAt = time.Now()
-	util.UpdateCacheHeaders(newMeta.Headers, res.Header)
-
-	_ = h.cache.Put(h.r.Context(), &newMeta)
-	h.serveFromCache(&newMeta)
+	updated.ExpiresAt = cache.CalculateFreshness(fresh, time.Now(), h.cleanRelPath, h.cfg.Cache.Overrides)
+	updated.LastUsedAt = time.Now()
+	util.UpdateCacheHeaders(updated.Headers, res.Header)
+	_ = h.cache.Put(h.r.Context(), &updated)
+	h.serveFromCache(&updated)
 }
 
 func (h *requestHandler) handleFetchSuccess(res *fetch.Result) {
@@ -310,21 +303,20 @@ func (h *requestHandler) streamAndStore(res *fetch.Result, meta *cache.ItemMeta)
 
 	go func() {
 		defer wg.Done()
-		written, err := h.cache.PutContent(h.r.Context(), h.key, pr)
+		n, err := h.cache.PutContent(h.r.Context(), h.key, pr)
 		if err != nil {
 			if !util.IsClientDisconnectedError(err) {
-				h.log.Error().Err(err).Msg("Write content to cache failed")
+				h.log.Error().Err(err).Msg("Write to cache failed")
 			}
 			_ = h.cache.Delete(context.Background(), h.key)
 			return
 		}
-		meta.Size = written
+		meta.Size = n
 		_ = h.cache.Put(h.r.Context(), meta)
 	}()
 
 	h.w.WriteHeader(meta.StatusCode)
 	_, copyErr := io.Copy(h.w, io.TeeReader(res.Body, pw))
-
 	if copyErr != nil {
 		pw.CloseWithError(copyErr)
 	} else {
