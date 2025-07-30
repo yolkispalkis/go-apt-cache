@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -158,34 +159,51 @@ func (h *requestHandler) fetchAndServe(revalMeta *cache.ItemMeta) {
 	}
 
 	raw, _, shared := h.fetcher.Fetch(h.r.Context(), h.key, h.upstreamURL, opts)
-	sf := raw.(*fetch.SharedFetch)
+	sf, ok := raw.(*fetch.SharedFetch)
+	if !ok {
+		if raw == nil {
+			h.log.Warn().Msg("Fetch aborted (client cancel)")
+			return
+		}
+		h.sendError(http.StatusInternalServerError, "singleflight type mismatch", fmt.Errorf("%T", raw))
+		return
+	}
 
 	if shared {
 		if meta, ok := h.cache.Get(h.r.Context(), h.key); ok {
 			h.serveFromCache(meta)
 		} else {
-			h.sendError(http.StatusInternalServerError, "Shared fetch produced no item", nil)
+			h.sendError(http.StatusInternalServerError, "shared fetch: item lost", nil)
 		}
 		return
 	}
 
-	if opts.UseHEAD && sf.Err == nil && sf.Result != nil &&
-		sf.Result.Body == nil && sf.Result.Status >= 200 && sf.Result.Status < 300 {
+	if opts.UseHEAD {
 
-		if resourceChanged(revalMeta, sf.Result.Header) {
-			h.log.Debug().Msg("HEAD validators changed → full GET")
+		if sf.Err != nil && errors.Is(sf.Err, fetch.ErrUpstreamClient) {
+			h.log.Debug().Int("status", sf.Result.Status).Msg("HEAD 4xx, retrying GET")
 			h.fetchAndServe(nil)
 			return
 		}
 
-		h.log.Debug().Msg("HEAD validators unchanged → updating metadata")
-		updated := *revalMeta
-		updated.LastUsedAt = time.Now()
-		updated.ExpiresAt = cache.CalculateFreshness(sf.Result.Header, time.Now(), h.cleanRelPath, h.cfg.Cache.Overrides)
-		util.UpdateCacheHeaders(updated.Headers, sf.Result.Header)
-		_ = h.cache.Put(h.r.Context(), &updated)
-		h.serveFromCache(&updated)
-		return
+		if sf.Err == nil && sf.Result != nil && sf.Result.Body == nil &&
+			sf.Result.Status >= 200 && sf.Result.Status < 300 {
+
+			if resourceChanged(revalMeta, sf.Result.Header) {
+				h.log.Debug().Msg("HEAD validators changed, perform full GET")
+				h.fetchAndServe(nil)
+				return
+			}
+
+			updated := *revalMeta
+			updated.LastUsedAt = time.Now()
+			updated.ExpiresAt = cache.CalculateFreshness(sf.Result.Header, time.Now(), h.cleanRelPath, h.cfg.Cache.Overrides)
+
+			util.UpdateCacheHeaders(updated.Headers, sf.Result.Header)
+			_ = h.cache.Put(h.r.Context(), &updated)
+			h.serveFromCache(&updated)
+			return
+		}
 	}
 
 	if sf.Err != nil {
