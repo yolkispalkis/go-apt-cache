@@ -2,7 +2,7 @@
 set -e
 
 PKG_NAME="go-apt-cache"
-PKG_VERSION="3.1.9"
+PKG_VERSION="3.2.0"
 PKG_ARCH=$(dpkg --print-architecture)
 PKG_MAINTAINER="yolkispalkis <me@w3h.su>"
 PKG_DESCRIPTION="A high-performance caching proxy for APT repositories, written in Go."
