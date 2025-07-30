@@ -39,7 +39,12 @@ func newDiskStore(baseDir string, logger *logging.Logger) (*diskStore, error) {
 func (ds *diskStore) keyToPath(key, suffix string) string {
 	hash := sha256.Sum256([]byte(key))
 	hashStr := hex.EncodeToString(hash[:])
-	return filepath.Join(ds.baseDir, hashStr[:2], hashStr[2:]+suffix)
+
+	// aa/bb/aabbccddeeff…
+	dir1 := hashStr[:2]
+	dir2 := hashStr[2:4]
+
+	return filepath.Join(ds.baseDir, dir1, dir2, hashStr+suffix)
 }
 
 func (ds *diskStore) GetContent(key string) (*os.File, error) {
