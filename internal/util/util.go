@@ -33,12 +33,19 @@ var (
 )
 
 var headerProxyWhitelist = map[string]struct{}{
-	"Accept-Ranges": {}, "Cache-Control": {}, "Content-Length": {},
-	"Content-Type": {}, "Date": {}, "ETag": {}, "Last-Modified": {},
-	"Content-Disposition": {}, "Expires": {}, "Vary": {}, "Age": {},
+	"Accept-Ranges":       {},
+	"Cache-Control":       {},
+	"Content-Length":      {},
+	"Content-Type":        {},
+	"Date":                {},
+	"ETag":                {},
+	"Last-Modified":       {},
+	"Content-Disposition": {},
+	"Expires":             {},
+	"Vary":                {},
+	"Age":                 {},
 }
 
-var headerPool = sync.Pool{New: func() any { return make(http.Header, 16) }}
 var bufferPoolSize int64 = 64 * 1024
 var bufferPool = sync.Pool{New: func() any { return make([]byte, bufferPoolSize) }}
 
@@ -123,21 +130,10 @@ func CopyHeader(h http.Header) http.Header {
 	if h == nil {
 		return nil
 	}
-	h2 := headerPool.Get().(http.Header)
-	for k := range h2 {
-		delete(h2, k)
-	}
-	for k, vv := range h {
-		h2[k] = append(h2[k][:0], vv...)
-	}
-	return h2
+	return h.Clone()
 }
 
-func ReturnHeader(h http.Header) {
-	if h != nil {
-		headerPool.Put(h)
-	}
-}
+func ReturnHeader(http.Header) {}
 
 func GetBuffer() []byte { return bufferPool.Get().([]byte) }
 

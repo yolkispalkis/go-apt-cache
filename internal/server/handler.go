@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +44,15 @@ type requestHandler struct {
 func (app *Application) newRequestHandler(w http.ResponseWriter, r *http.Request) (*requestHandler, error) {
 	repo := r.Context().Value(repoContextKey).(config.Repository)
 	relPath := chi.URLParam(r, "*")
+
+	/* двойное URL-раскодирование → защита от %252e%252e etc. */
+	if un, err := url.PathUnescape(relPath); err == nil {
+		relPath = un
+		if un2, err2 := url.PathUnescape(relPath); err2 == nil {
+			relPath = un2
+		}
+	}
+
 	cleanRelPath := filepath.Clean(relPath)
 
 	if strings.HasPrefix(cleanRelPath, "..") || cleanRelPath == ".." || cleanRelPath == "." {
@@ -233,7 +243,7 @@ func (h *requestHandler) handleNegativeCaching(fetchRes *fetch.Result) {
 		now := time.Now()
 		meta := &cache.ItemMeta{
 			Key:         h.key,
-			UpstreamURL: fetchRes.Header.Get("Request-Url"),
+			UpstreamURL: h.upstreamURL,
 			FetchedAt:   now,
 			LastUsedAt:  now,
 			StatusCode:  http.StatusNotFound,
@@ -260,7 +270,15 @@ func (h *requestHandler) handleRevalidation(fetchRes *fetch.Result, revalMeta *c
 	h.log.Info().Msg("Revalidation successful (304), updating metadata.")
 	updatedMeta := *revalMeta
 	updatedMeta.Headers = util.CopyHeader(revalMeta.Headers)
-	updatedMeta.ExpiresAt = cache.CalculateFreshness(fetchRes.Header, time.Now(), h.cleanRelPath, h.cfg.Cache.Overrides)
+
+	// 304 почти всегда без Cache-Control; fallback на старые хедеры
+	freshHeaders := fetchRes.Header
+	if len(freshHeaders) == 0 {
+		freshHeaders = revalMeta.Headers
+	}
+	updatedMeta.ExpiresAt = cache.CalculateFreshness(
+		freshHeaders, time.Now(), h.cleanRelPath, h.cfg.Cache.Overrides,
+	)
 	updatedMeta.LastUsedAt = time.Now()
 	util.UpdateCacheHeaders(updatedMeta.Headers, fetchRes.Header)
 

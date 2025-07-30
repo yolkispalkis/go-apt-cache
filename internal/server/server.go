@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
@@ -60,22 +61,34 @@ func (s *Server) Start() error {
 		return errors.New("no listeners configured (check listenAddress and unixSocketPath in config)")
 	}
 
-	errChan := make(chan error, 1)
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(s.listeners))
+
 	for _, l := range s.listeners {
 		lis := l
-		s.log.Info().Str("network", lis.Addr().Network()).Str("address", lis.Addr().String()).Msg("Server listening")
+		s.log.Info().
+			Str("network", lis.Addr().Network()).
+			Str("address", lis.Addr().String()).
+			Msg("Server listening")
+
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			if err := s.httpSrv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.log.Error().Err(err).Str("address", lis.Addr().String()).Msg("HTTP server error")
-				select {
-				case errChan <- err:
-				default:
-				}
+				errChan <- err
 			}
 		}()
 	}
 
-	return <-errChan
+	// закрываем канал, когда все listener-ы завершились
+	go func() { wg.Wait(); close(errChan) }()
+
+	// возвращаем первую же ошибку
+	if err, ok := <-errChan; ok {
+		return err
+	}
+	return nil
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -85,13 +98,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
-func (s *Server) Logger() *logging.Logger {
-	return s.log
-}
+func (s *Server) Logger() *logging.Logger { return s.log }
 
-func (s *Server) ShutdownTimeout() time.Duration {
-	return s.cfg.ShutdownTimeout
-}
+func (s *Server) ShutdownTimeout() time.Duration { return s.cfg.ShutdownTimeout }
 
 func (s *Server) setupListeners() error {
 	if addr := s.cfg.ListenAddr; addr != "" {

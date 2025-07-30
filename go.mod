@@ -6,7 +6,6 @@ require (
 	github.com/bmatcuk/doublestar/v4 v4.8.1
 	github.com/go-chi/chi/v5 v5.2.2
 	github.com/goccy/go-json v0.10.5
-	github.com/knadh/koanf/parsers/json v1.0.0
 	github.com/knadh/koanf/parsers/yaml v1.1.0
 	github.com/knadh/koanf/providers/file v1.2.0
 	github.com/knadh/koanf/v2 v2.2.1

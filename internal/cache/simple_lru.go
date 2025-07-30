@@ -106,20 +106,28 @@ func (lru *SimpleLRU) initialScan() error {
 }
 
 func (lru *SimpleLRU) Get(ctx context.Context, key string) (*ItemMeta, bool) {
-	lru.mu.RLock()
+	lru.mu.Lock()
 	elem, exists := lru.items[key]
-	lru.mu.RUnlock()
-
 	if !exists {
+		lru.mu.Unlock()
 		return nil, false
 	}
 
-	lru.mu.Lock()
 	lru.lruList.MoveToFront(elem)
+	entry := elem.Value.(*lruEntry)
+	entry.meta.LastUsedAt = time.Now()
+	metaPtr := entry.meta // беглый указатель для асинхронной записи
 	lru.mu.Unlock()
 
-	metaCopy := *elem.Value.(*lruEntry).meta
-	metaCopy.Headers = util.CopyHeader(metaCopy.Headers)
+	// Persist updated LastUsedAt – асинхронно, чтобы не держать лок
+	go func(m *ItemMeta) {
+		if err := lru.store.WriteMetadata(m); err != nil {
+			lru.log.Warn().Err(err).Str("key", m.Key).Msg("Failed to persist LastUsedAt")
+		}
+	}(metaPtr)
+
+	metaCopy := *metaPtr
+	metaCopy.Headers = util.CopyHeader(metaPtr.Headers)
 	return &metaCopy, true
 }
 
@@ -137,7 +145,10 @@ func (lru *SimpleLRU) Put(ctx context.Context, meta *ItemMeta) error {
 		util.ReturnHeader(oldMeta.Headers)
 	}
 
-	keysToEvict := lru.ensureSpaceLocked(meta.Size)
+	var keysToEvict []string
+	if meta.Size > 0 {
+		keysToEvict = lru.ensureSpaceLocked(meta.Size)
+	}
 
 	entry := &lruEntry{key: meta.Key, meta: meta}
 	elem := lru.lruList.PushFront(entry)

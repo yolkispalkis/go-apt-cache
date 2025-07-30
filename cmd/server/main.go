@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/yolkispalkis/go-apt-cache/internal/cache"
@@ -18,7 +19,7 @@ import (
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
-// Переменные для информации о приложении, заполняются при сборке
+// Значения перезаписываются ldflags-ами при сборке
 var (
 	AppName    = "go-apt-cache"
 	AppVersion = "dev"
@@ -119,7 +120,15 @@ func run(ctx context.Context) error {
 	return nil
 }
 
+// безопасная очистка кеш-директории
 func cleanCacheDir(dir string) error {
+	dir = filepath.Clean(dir)
+
+	// никогда не трогаем «/» или подозрительно короткие пути
+	if dir == "/" || dir == "" || len(dir) < 5 {
+		return fmt.Errorf("refusing to clean suspicious directory: %q", dir)
+	}
+
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		return nil
 	}
