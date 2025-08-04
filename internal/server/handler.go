@@ -156,9 +156,6 @@ func (h *requestHandler) serveNegative(meta *cache.ItemMeta) {
 
 func (h *requestHandler) fetchAndServe(revalMeta *cache.ItemMeta) {
 	opts := fetch.NewFetchOptions(h.r, revalMeta)
-	if revalMeta != nil {
-		opts.UseHEAD = true
-	}
 
 	raw, _, shared := h.fetcher.Fetch(h.r.Context(), h.key, h.upstreamURL, opts)
 	sf, ok := raw.(*fetch.SharedFetch)
@@ -175,37 +172,10 @@ func (h *requestHandler) fetchAndServe(revalMeta *cache.ItemMeta) {
 		if meta, ok := h.cache.Get(h.r.Context(), h.key); ok {
 			h.serveFromCache(meta)
 		} else {
-			h.sendError(http.StatusInternalServerError, "shared fetch: item lost", nil)
+			h.log.Info().Msg("Shared fetch leader failed or item was evicted; retrying fetch.")
+			h.fetchAndServe(nil)
 		}
 		return
-	}
-
-	if opts.UseHEAD {
-
-		if sf.Err != nil && errors.Is(sf.Err, fetch.ErrUpstreamClient) {
-			h.log.Debug().Int("status", sf.Result.Status).Msg("HEAD 4xx, retrying GET")
-			h.fetchAndServe(nil)
-			return
-		}
-
-		if sf.Err == nil && sf.Result != nil && sf.Result.Body == nil &&
-			sf.Result.Status >= 200 && sf.Result.Status < 300 {
-
-			if resourceChanged(revalMeta, sf.Result.Header) {
-				h.log.Debug().Msg("HEAD validators changed, perform full GET")
-				h.fetchAndServe(nil)
-				return
-			}
-
-			updated := *revalMeta
-			updated.LastUsedAt = time.Now()
-			updated.ExpiresAt = cache.CalculateFreshness(sf.Result.Header, time.Now(), h.cleanRelPath, h.cfg.Cache.Overrides)
-
-			util.UpdateCacheHeaders(updated.Headers, sf.Result.Header)
-			_ = h.cache.Put(h.r.Context(), &updated)
-			h.serveFromCache(&updated)
-			return
-		}
 	}
 
 	if sf.Err != nil {
@@ -216,32 +186,19 @@ func (h *requestHandler) fetchAndServe(revalMeta *cache.ItemMeta) {
 	h.handleFetchSuccess(sf.Result)
 }
 
-func resourceChanged(old *cache.ItemMeta, hdr http.Header) bool {
-	if old == nil {
-		return true
-	}
-	switch {
-	case hdr.Get("ETag") != "" && hdr.Get("ETag") == old.Headers.Get("ETag"):
-		return false
-	case hdr.Get("Last-Modified") != "" && hdr.Get("Last-Modified") == old.Headers.Get("Last-Modified"):
-		return false
-	case hdr.Get("Content-Length") != "" && hdr.Get("Content-Length") == old.Headers.Get("Content-Length"):
-		return false
-	default:
-		return true
-	}
-}
-
 func (h *requestHandler) handleFetchError(err error, res *fetch.Result, stale *cache.ItemMeta) {
 	switch {
+	case errors.Is(err, fetch.ErrUpstreamNotModified):
+		h.handleRevalidation(res, stale)
 	case stale != nil && (errors.Is(err, fetch.ErrNetwork) || errors.Is(err, fetch.ErrUpstreamServer)):
 		h.log.Warn().Err(err).Msg("Upstream error; serving stale")
 		h.serveFromCache(stale)
 	case errors.Is(err, fetch.ErrUpstreamNotFound):
 		h.handleUpstream404(res)
-	case errors.Is(err, fetch.ErrUpstreamNotModified):
-		h.handleRevalidation(res, stale)
 	default:
+		if stale != nil {
+			h.cache.Delete(h.r.Context(), h.key)
+		}
 		h.sendError(http.StatusBadGateway, "Upstream fetch failed", err)
 	}
 }
