@@ -168,18 +168,17 @@ func (h *requestHandler) fetchAndServe(revalMeta *cache.ItemMeta) {
 		return
 	}
 
+	if sf.Err != nil {
+		h.handleFetchError(sf.Err, sf.Result, revalMeta)
+		return
+	}
+
 	if shared {
 		if meta, ok := h.cache.Get(h.r.Context(), h.key); ok {
 			h.serveFromCache(meta)
 		} else {
-			h.log.Info().Msg("Shared fetch leader failed or item was evicted; retrying fetch.")
-			h.fetchAndServe(nil)
+			h.sendError(http.StatusServiceUnavailable, "Cache item unavailable after shared fetch, please retry", nil)
 		}
-		return
-	}
-
-	if sf.Err != nil {
-		h.handleFetchError(sf.Err, sf.Result, revalMeta)
 		return
 	}
 
