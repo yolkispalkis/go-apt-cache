@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -117,6 +118,7 @@ func (h *requestHandler) serveFromCache(meta *cache.ItemMeta) {
 	}
 
 	util.CopyWhitelistedHeaders(h.w.Header(), meta.Headers)
+	h.w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
 	h.w.Header().Set("X-Cache-Status", cacheStatusHit)
 
 	if h.r.Method == http.MethodHead {
@@ -315,6 +317,12 @@ func (h *requestHandler) buildMeta(res *fetch.Result) *cache.ItemMeta {
 }
 
 func (h *requestHandler) streamAndStore(res *fetch.Result, meta *cache.ItemMeta) {
+	if err := h.cache.Put(h.r.Context(), meta); err != nil {
+		h.log.Error().Err(err).Msg("Failed to write preliminary metadata")
+		h.sendError(http.StatusInternalServerError, "failed to write cache metadata", err)
+		return
+	}
+
 	pr, pw := io.Pipe()
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -329,8 +337,15 @@ func (h *requestHandler) streamAndStore(res *fetch.Result, meta *cache.ItemMeta)
 			_ = h.cache.Delete(context.Background(), h.key)
 			return
 		}
-		meta.Size = n
-		_ = h.cache.Put(h.r.Context(), meta)
+
+		if meta.Size != n {
+			h.log.Debug().
+				Int64("header_size", meta.Size).
+				Int64("actual_size", n).
+				Msg("Content-Length mismatch, updating metadata with actual size.")
+			meta.Size = n
+			_ = h.cache.Put(h.r.Context(), meta)
+		}
 	}()
 
 	h.w.WriteHeader(meta.StatusCode)
