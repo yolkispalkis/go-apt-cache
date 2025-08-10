@@ -1,7 +1,7 @@
 Source: go-apt-cache
 Section: net
 Priority: optional
-Maintainer: Your Name <you@example.com>
+Maintainer: Yolkis Palkis <me@w3h.su>
 Build-Depends: debhelper-compat (= 13), golang-go
 Standards-Version: 4.6.2
 Homepage: https://github.com/yolkispalkis/go-apt-cache
