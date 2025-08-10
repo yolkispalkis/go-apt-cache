@@ -2,7 +2,7 @@ Source: go-apt-cache
 Section: net
 Priority: optional
 Maintainer: Your Name <you@example.com>
-Build-Depends: debhelper-compat (= 13), golang-any
+Build-Depends: debhelper-compat (= 13), golang-go
 Standards-Version: 4.6.2
 Homepage: https://github.com/yolkispalkis/go-apt-cache
 Rules-Requires-Root: no
