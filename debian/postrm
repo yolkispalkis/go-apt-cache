@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+#DEBHELPER#
+
+if [ "$1" = "purge" ]; then
+    rm -rf /var/cache/go-apt-cache /var/log/go-apt-cache
+    if getent passwd go-apt-cache >/dev/null; then
+        deluser --system go-apt-cache || true
+    fi
+    if getent group go-apt-cache >/dev/null; then
+        delgroup --system go-apt-cache || true
+    fi
+fi
+
+exit 0

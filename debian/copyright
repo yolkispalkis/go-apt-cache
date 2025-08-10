@@ -1,0 +1,14 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: go-apt-cache
+Upstream-Contact: Your Name <you@example.com>
+Source: https://github.com/yolkispalkis/go-apt-cache
+
+Files: *
+Copyright: 2024-2025 yolkispalkis
+License: MIT
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction...
+ .
+ On Debian systems, the complete text of the MIT license can be found at
+ /usr/share/common-licenses/MIT.

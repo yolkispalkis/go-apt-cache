@@ -1,0 +1,16 @@
+Source: go-apt-cache
+Section: net
+Priority: optional
+Maintainer: Your Name <you@example.com>
+Build-Depends: debhelper-compat (= 13), golang-any
+Standards-Version: 4.6.2
+Homepage: https://github.com/yolkispalkis/go-apt-cache
+Rules-Requires-Root: no
+
+Package: go-apt-cache
+Architecture: any
+Depends: ${misc:Depends}, adduser, systemd
+Description: RFC-compliant caching proxy for APT repositories (Go)
+ A modern, RFC 9111-compliant caching proxy for Debian/Ubuntu APT repositories.
+ Supports GET/HEAD, conditional requests, shared-cache semantics, Range on hits,
+ stale-while-revalidate, stale-if-error, local TTL overrides and negative caching.

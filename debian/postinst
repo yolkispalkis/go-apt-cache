@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+#DEBHELPER#
+
+PKG=go-apt-cache
+USER=$PKG
+GROUP=$PKG
+LOGDIR=/var/log/$PKG
+CACHEDIR=/var/cache/$PKG
+
+if ! getent group "$GROUP" >/dev/null; then
+    addgroup --system "$GROUP"
+fi
+if ! getent passwd "$USER" >/dev/null; then
+    adduser --system --ingroup "$GROUP" --no-create-home --home "$CACHEDIR" --shell /usr/sbin/nologin "$USER"
+fi
+
+mkdir -p "$CACHEDIR" "$LOGDIR"
+chown -R "$USER:$GROUP" "$CACHEDIR" "$LOGDIR"
+chmod 0750 "$CACHEDIR" "$LOGDIR"
+
+exit 0

@@ -2,35 +2,32 @@ server:
   listenAddress: ":8080"
   unixSocketPath: "/run/go-apt-cache/go-apt-cache.sock"
   unixSocketPermissions: 0660
-  requestTimeout: "1m"
+  requestTimeout: "60s"
   shutdownTimeout: "15s"
-  idleTimeout: "2m"
+  idleTimeout: "120s"
   readHeaderTimeout: "10s"
   maxConcurrentFetches: 150
   userAgent: "go-apt-cache/dev"
+
 cache:
   directory: "/var/cache/go-apt-cache"
   maxSize: "10GB"
   enabled: true
   cleanOnStart: false
   bufferSize: "256KB"
+  heuristicTTL10Percent: true
   negativeCacheTTL: "5m"
   overrides:
     - pathPattern: "dists/**"
       ttl: "5m"
     - pathPattern: "**/*.deb"
       ttl: "2160h"
+
 logging:
   level: "info"
   file: "/var/log/go-apt-cache/go-apt-cache.log"
-  maxSizeMB: 100
-  maxBackups: 3
-  maxAgeDays: 7
   noConsole: true
+
 repositories:
   - name: "ubuntu"
     url: "http://archive.ubuntu.com/ubuntu/"
-    enabled: true
-  - name: "debian"
-    url: "http://deb.debian.org/debian/"
-    enabled: false

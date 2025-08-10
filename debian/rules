@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+export DH_VERBOSE=1
+export CGO_ENABLED=0
+export GO111MODULE=on
+export GOFLAGS=-trimpath -mod=vendor
+
+VERSION := $(shell dpkg-parsechangelog -SVersion)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	go build -ldflags "-s -w -X main.AppVersion=$(VERSION)" -o build/go-apt-cache ./cmd/server
+
+override_dh_auto_install:
+	install -D -m0755 build/go-apt-cache debian/go-apt-cache/usr/bin/go-apt-cache
+	install -D -m0644 config.yaml.example debian/go-apt-cache/etc/go-apt-cache/config.yaml
+	install -D -m0644 debian/go-apt-cache.service debian/go-apt-cache/lib/systemd/system/go-apt-cache.service

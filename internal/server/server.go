@@ -8,153 +8,102 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
-	"github.com/yolkispalkis/go-apt-cache/internal/cache"
 	"github.com/yolkispalkis/go-apt-cache/internal/config"
-	"github.com/yolkispalkis/go-apt-cache/internal/fetch"
-	"github.com/yolkispalkis/go-apt-cache/internal/logging"
+	"github.com/yolkispalkis/go-apt-cache/internal/log"
 	"github.com/yolkispalkis/go-apt-cache/internal/util"
 )
 
-type Application struct {
-	Config  *config.Config
-	Logger  *logging.Logger
-	Cache   cache.Manager
-	Fetcher *fetch.Coordinator
-}
-
-func NewApplication(cfg *config.Config, logger *logging.Logger, cache cache.Manager, fetcher *fetch.Coordinator) *Application {
-	return &Application{
-		Config:  cfg,
-		Logger:  logger,
-		Cache:   cache,
-		Fetcher: fetcher,
-	}
-}
-
 type Server struct {
-	httpSrv   *http.Server
-	cfg       config.ServerConfig
-	log       *logging.Logger
-	listeners []net.Listener
+	http *http.Server
+	cfg  config.ServerConfig
+	log  *log.Logger
+	lns  []net.Listener
 }
 
-func New(cfg config.ServerConfig, log *logging.Logger, handler http.Handler) *Server {
+func New(cfg config.ServerConfig, lg *log.Logger, h http.Handler) *Server {
 	return &Server{
-		httpSrv: &http.Server{
-			Handler:           handler,
+		http: &http.Server{
+			Handler:           h,
 			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 			IdleTimeout:       cfg.IdleTimeout,
+			ReadTimeout:       cfg.ReqTimeout,
+			WriteTimeout:      cfg.ReqTimeout,
 		},
 		cfg: cfg,
-		log: log.WithComponent("server"),
+		log: lg.WithComponent("server"),
 	}
 }
 
 func (s *Server) Start() error {
-	if err := s.setupListeners(); err != nil {
-		return fmt.Errorf("failed to setup listeners: %w", err)
+	if err := s.open(); err != nil {
+		return err
 	}
-	if len(s.listeners) == 0 {
-		return errors.New("no listeners configured (check listenAddress and unixSocketPath in config)")
+	if len(s.lns) == 0 {
+		return errors.New("no listeners configured")
 	}
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(s.listeners))
-
-	for _, l := range s.listeners {
-		lis := l
-		s.log.Info().
-			Str("network", lis.Addr().Network()).
-			Str("address", lis.Addr().String()).
-			Msg("Server listening")
-
-		wg.Add(1)
+	errCh := make(chan error, len(s.lns))
+	for _, ln := range s.lns {
+		l := ln
+		s.log.Info().Str("network", l.Addr().Network()).Str("addr", l.Addr().String()).Msg("listening")
 		go func() {
-			defer wg.Done()
-			if err := s.httpSrv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				s.log.Error().Err(err).Str("address", lis.Addr().String()).Msg("HTTP server error")
-				errChan <- err
+			if err := s.http.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
 			}
 		}()
 	}
-
-	// закрываем канал, когда все listener-ы завершились
-	go func() { wg.Wait(); close(errChan) }()
-
-	// возвращаем первую же ошибку
-	if err, ok := <-errChan; ok {
+	if err, ok := <-errCh; ok {
 		return err
 	}
 	return nil
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.log.Info().Msg("Attempting graceful server shutdown...")
-	err := s.httpSrv.Shutdown(ctx)
-	s.cleanupSocket()
+	err := s.http.Shutdown(ctx)
+	s.cleanupUnix()
 	return err
 }
 
-func (s *Server) Logger() *logging.Logger { return s.log }
-
 func (s *Server) ShutdownTimeout() time.Duration { return s.cfg.ShutdownTimeout }
 
-func (s *Server) setupListeners() error {
+func (s *Server) open() error {
 	if addr := s.cfg.ListenAddr; addr != "" {
-		tcpLn, err := net.Listen("tcp", addr)
+		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			return fmt.Errorf("failed to listen on TCP %s: %w", addr, err)
+			return fmt.Errorf("tcp listen: %w", err)
 		}
-		s.listeners = append(s.listeners, tcpLn)
+		s.lns = append(s.lns, ln)
 	}
-
-	if sockPath := s.cfg.UnixPath; sockPath != "" {
-		unixLn, err := s.setupUnixSocket(sockPath)
-		if err != nil {
-			return fmt.Errorf("failed to listen on Unix socket %s: %w", sockPath, err)
+	if sp := s.cfg.UnixPath; sp != "" {
+		clean := util.CleanPath(sp)
+		_ = os.Remove(clean)
+		if err := os.MkdirAll(filepath.Dir(clean), 0755); err != nil {
+			return err
 		}
-		s.listeners = append(s.listeners, unixLn)
+		uln, err := net.Listen("unix", clean)
+		if err != nil {
+			return err
+		}
+		perms := s.cfg.UnixPerms
+		if perms == 0 {
+			perms = 0660
+		}
+		if err := os.Chmod(clean, perms); err != nil {
+			_ = uln.Close()
+			return err
+		}
+		s.lns = append(s.lns, uln)
 	}
 	return nil
 }
 
-func (s *Server) setupUnixSocket(sockPath string) (net.Listener, error) {
-	cleanSockPath := util.CleanPath(sockPath)
-	if err := os.Remove(cleanSockPath); err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("failed to remove existing socket file: %w", err)
+func (s *Server) cleanupUnix() {
+	if s.cfg.UnixPath == "" {
+		return
 	}
-
-	sockDir := filepath.Dir(cleanSockPath)
-	if err := os.MkdirAll(sockDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create socket directory %s: %w", sockDir, err)
-	}
-
-	unixLn, err := net.Listen("unix", cleanSockPath)
-	if err != nil {
-		return nil, err
-	}
-
-	perms := s.cfg.UnixPerms
-	if perms == 0 {
-		perms = 0660
-	}
-	if err := os.Chmod(cleanSockPath, perms); err != nil {
-		unixLn.Close()
-		return nil, fmt.Errorf("failed to chmod unix socket %s to %0o: %w", cleanSockPath, perms, err)
-	}
-	return unixLn, nil
-}
-
-func (s *Server) cleanupSocket() {
-	if s.cfg.UnixPath != "" {
-		cleanSockPath := util.CleanPath(s.cfg.UnixPath)
-		if err := os.Remove(cleanSockPath); err != nil && !os.IsNotExist(err) {
-			s.log.Warn().Err(err).Str("path", cleanSockPath).Msg("Failed to remove unix socket file during shutdown.")
-		} else {
-			s.log.Info().Str("path", cleanSockPath).Msg("Unix socket file removed.")
-		}
+	clean := util.CleanPath(s.cfg.UnixPath)
+	if err := os.Remove(clean); err != nil && !os.IsNotExist(err) {
+		s.log.Warn().Err(err).Str("path", clean).Msg("remove unix socket failed")
 	}
 }
