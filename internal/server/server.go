@@ -28,8 +28,7 @@ func New(cfg config.ServerConfig, lg *log.Logger, h http.Handler) *Server {
 			Handler:           h,
 			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 			IdleTimeout:       cfg.IdleTimeout,
-			ReadTimeout:       cfg.ReqTimeout,
-			WriteTimeout:      cfg.ReqTimeout,
+			// ReadTimeout/WriteTimeout left at zero to avoid cutting long downloads
 		},
 		cfg: cfg,
 		log: lg.WithComponent("server"),

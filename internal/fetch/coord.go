@@ -28,6 +28,7 @@ type Options struct {
 	IfModSince  time.Time
 	IfNoneMatch string
 	UseHEAD     bool
+	Range       string
 }
 
 type Coordinator struct {
@@ -97,6 +98,9 @@ func (c *Coordinator) do(ctx context.Context, url string, o *Options) (*Result, 
 		if o.IfNoneMatch != "" {
 			req.Header.Set("If-None-Match", o.IfNoneMatch)
 		}
+		if o.Range != "" {
+			req.Header.Set("Range", o.Range)
+		}
 	}
 
 	resp, err := c.client.Do(req)
@@ -130,8 +134,13 @@ func (c *Coordinator) do(ctx context.Context, url string, o *Options) (*Result, 
 		}
 		return res, nil
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		resp.Body.Close()
-		return res, fmt.Errorf("upstream 4xx: %d", resp.StatusCode)
+		// forward 4xx to caller (except 404 already handled)
+		if m == http.MethodGet {
+			res.Body = resp.Body
+		} else {
+			resp.Body.Close()
+		}
+		return res, nil
 	default:
 		resp.Body.Close()
 		return res, fmt.Errorf("upstream 5xx: %d", resp.StatusCode)
@@ -151,5 +160,6 @@ func NewOptions(r *http.Request, etag, lastMod string) *Options {
 			o.IfModSince = t
 		}
 	}
+	o.Range = r.Header.Get("Range")
 	return o
 }

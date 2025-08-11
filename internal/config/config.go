@@ -154,7 +154,12 @@ func validate(c *Config) error {
 			return errors.New("cache.negativeCacheTTL must be >= 0")
 		}
 	}
+	seen := map[string]struct{}{}
 	for _, r := range c.Repositories {
+		if _, dup := seen[r.Name]; dup {
+			return fmt.Errorf("duplicate repo name: %q", r.Name)
+		}
+		seen[r.Name] = struct{}{}
 		if !util.IsRepoNameSafe(r.Name) {
 			return fmt.Errorf("invalid repo name: %q", r.Name)
 		}

@@ -127,6 +127,7 @@ func (l *LRU) scan() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, m := range metas {
+		// store pointer to loaded meta
 		el := l.order.PushFront(&entry{key: m.Key, meta: m})
 		l.index[m.Key] = el
 		l.curBytes += m.Size
@@ -159,33 +160,40 @@ func (l *LRU) writeMeta(m *ItemMeta) error {
 
 func (l *LRU) Get(ctx context.Context, key string) (*ItemMeta, bool) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	el, ok := l.index[key]
 	if !ok {
+		l.mu.Unlock()
 		return nil, false
 	}
 	l.order.MoveToFront(el)
 	m := el.Value.(*entry).meta
 	m.LastUsedAt = time.Now()
-	_ = l.writeMeta(m) // best effort
+	// make copy to return and to write meta outside lock
 	cp := *m
 	cp.Headers = util.CopyHeader(m.Headers)
+	l.mu.Unlock()
+
+	// best-effort write updated meta without holding lock
+	go func(mm ItemMeta) { _ = l.writeMeta(&mm) }(cp)
 	return &cp, true
 }
 
 func (l *LRU) Put(ctx context.Context, m *ItemMeta) error {
-	if err := l.writeMeta(m); err != nil {
+	// store a copy to avoid external mutations affecting accounting
+	mm := *m
+	mm.Headers = util.CopyHeader(m.Headers)
+	if err := l.writeMeta(&mm); err != nil {
 		return err
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if el, ok := l.index[m.Key]; ok {
+	if el, ok := l.index[mm.Key]; ok {
 		l.curBytes -= el.Value.(*entry).meta.Size
 		l.order.Remove(el)
 	}
-	el := l.order.PushFront(&entry{key: m.Key, meta: m})
-	l.index[m.Key] = el
-	l.curBytes += m.Size
+	el := l.order.PushFront(&entry{key: mm.Key, meta: &mm})
+	l.index[mm.Key] = el
+	l.curBytes += mm.Size
 	go l.trim()
 	return nil
 }

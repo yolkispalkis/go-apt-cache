@@ -76,6 +76,7 @@ var headerProxyWhitelist = map[string]struct{}{
 	"Cache-Control":       {},
 	"Content-Length":      {},
 	"Content-Type":        {},
+	"Content-Range":       {}, // allow forwarding for 206
 	"Date":                {},
 	"ETag":                {},
 	"Last-Modified":       {},
@@ -146,6 +147,7 @@ func WeakMatchETag(list, etag string) bool {
 	return false
 }
 
+// Backward-compat: old helper that immediately writes 304
 func CheckConditionalHIT(w http.ResponseWriter, r *http.Request, hdr http.Header) bool {
 	if WeakMatchETag(r.Header.Get("If-None-Match"), hdr.Get("ETag")) {
 		w.WriteHeader(http.StatusNotModified)
@@ -155,6 +157,21 @@ func CheckConditionalHIT(w http.ResponseWriter, r *http.Request, hdr http.Header
 		if lmt, err := http.ParseTime(lm); err == nil {
 			if ims, err2 := http.ParseTime(r.Header.Get("If-Modified-Since")); err2 == nil && !lmt.After(ims) {
 				w.WriteHeader(http.StatusNotModified)
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// New: only check the condition without writing the response
+func IsNotModified(r *http.Request, hdr http.Header) bool {
+	if WeakMatchETag(r.Header.Get("If-None-Match"), hdr.Get("ETag")) {
+		return true
+	}
+	if lm := hdr.Get("Last-Modified"); lm != "" && r.Header.Get("If-Modified-Since") != "" {
+		if lmt, err := http.ParseTime(lm); err == nil {
+			if ims, err2 := http.ParseTime(r.Header.Get("If-Modified-Since")); err2 == nil && !lmt.After(ims) {
 				return true
 			}
 		}

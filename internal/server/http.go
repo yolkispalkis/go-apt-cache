@@ -41,12 +41,12 @@ func (a *Application) Routes() http.Handler {
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Add("Via", "1.1 go-apt-cache")
-		w.Write([]byte("go-apt-cache async RFC-compliant\n"))
+		_, _ = w.Write([]byte("go-apt-cache async RFC-compliant\n"))
 	})
 	r.Get("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Add("Via", "1.1 go-apt-cache")
-		w.Write([]byte("OK\n"))
+		_, _ = w.Write([]byte("OK\n"))
 	})
 
 	r.Route("/{repo}", func(r chi.Router) {
@@ -131,6 +131,8 @@ func (a *Application) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
+	// remove leading slash for overrides matching
+	rel = strings.TrimPrefix(rel, "/")
 
 	key := repo.Name + "/" + rel
 	up := repo.URL + rel
@@ -162,17 +164,25 @@ func (a *Application) isStale(m *cache.ItemMeta) bool {
 }
 
 func (a *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key string, m *cache.ItemMeta) {
-	if util.ClientHasValidators(r) && util.CheckConditionalHIT(w, r, m.Headers) {
-		w.Header().Add("Via", "1.1 go-apt-cache")
-		return
-	}
-
+	// prepare headers upfront for HIT/304
 	h := util.CopyHeader(m.Headers)
 	h.Set("Age", a.mergeAgeFor(m))
 	h.Add("Via", "1.1 go-apt-cache")
 	util.CopyWhitelisted(w.Header(), h)
 	w.Header().Set("X-Cache-Status", "HIT")
-	w.Header().Set("Content-Length", strconv.FormatInt(m.Size, 10))
+
+	// Conditional HIT -> 304 with validators
+	if util.ClientHasValidators(r) && util.IsNotModified(r, m.Headers) {
+		w.Header().Del("Content-Length") // avoid length on 304
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	// Non-2xx cached responses (e.g., negative cache 404) — no body
+	if m.StatusCode < 200 || m.StatusCode >= 300 {
+		w.WriteHeader(m.StatusCode)
+		return
+	}
 
 	if r.Method == http.MethodHead {
 		w.WriteHeader(m.StatusCode)
@@ -183,7 +193,7 @@ func (a *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			_ = a.cache.Delete(r.Context(), key)
-			a.fetchAndMaybeStore(w, r, key, "", "", nil)
+			a.fetchAndMaybeStore(w, r, key, m.UpstreamURL, relFromKey(key), nil)
 			return
 		}
 		http.Error(w, "cache read failed", http.StatusInternalServerError)
@@ -191,22 +201,38 @@ func (a *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key
 	}
 	defer rc.Close()
 
-	// If-Range (ETag)
+	// If-Range: only strong ETag or HTTP-date; drop Range otherwise
 	if ir := r.Header.Get("If-Range"); ir != "" {
-		if strings.HasPrefix(ir, "W/") || (len(ir) > 0 && ir[0] == '"') {
-			if et := m.Headers.Get("ETag"); et != "" && ir != et {
-				r2 := r.Clone(r.Context())
-				r2.Header.Del("Range")
-				r = r2
+		drop := true
+		if len(ir) > 0 && ir[0] == '"' {
+			et := m.Headers.Get("ETag")
+			if et != "" && !strings.HasPrefix(et, "W/") && et == ir {
+				drop = false
+			}
+		} else if t, err := http.ParseTime(ir); err == nil {
+			if lm := m.Headers.Get("Last-Modified"); lm != "" {
+				if lmt, err2 := http.ParseTime(lm); err2 == nil && !lmt.After(t) {
+					drop = false
+				}
 			}
 		}
+		if drop {
+			r2 := r.Clone(r.Context())
+			r2.Header.Del("Range")
+			r = r2
+		}
 	}
+
 	if f, ok := rc.(*os.File); ok {
+		// Let ServeContent handle Content-Length/Range
+		w.Header().Del("Content-Length")
 		mod, _ := http.ParseTime(m.Headers.Get("Last-Modified"))
 		http.ServeContent(w, r, "", mod, f)
 		return
 	}
 
+	// Stream content with known length
+	w.Header().Set("Content-Length", strconv.FormatInt(m.Size, 10))
 	w.WriteHeader(m.StatusCode)
 	buf := util.GetBuffer()
 	defer util.PutBuffer(buf)
@@ -243,10 +269,15 @@ func (a *Application) revalidateOrServeStale(w http.ResponseWriter, r *http.Requ
 }
 
 func (a *Application) backgroundRevalidate(key, up, rel string, stale *cache.ItemMeta) {
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.Server.ReqTimeout)
+	defer cancel()
 	opts := fetch.NewOptions(&http.Request{}, stale.Headers.Get("ETag"), stale.Headers.Get("Last-Modified"))
-	res, err, _ := a.fetcher.Fetch(context.Background(), "GET:"+key, up, opts)
+	res, err, _ := a.fetcher.Fetch(ctx, "GET:"+key, up, opts)
 	if err != nil || res == nil {
 		return
+	}
+	if res.Body != nil {
+		defer res.Body.Close()
 	}
 
 	if res.Status == http.StatusNotModified {
@@ -270,14 +301,21 @@ func (a *Application) backgroundRevalidate(key, up, rel string, stale *cache.Ite
 			Size:        res.Size,
 			ExpiresAt:   a.computeExpiry(res.Header, now, rel),
 		}
-		_ = a.cache.Put(context.Background(), meta)
+		if err := a.cache.Put(context.Background(), meta); err != nil {
+			return
+		}
 		pr, pw := io.Pipe()
 		go func() { defer pw.Close(); _, _ = io.Copy(pw, res.Body) }()
-		_, _ = a.cache.PutContent(context.Background(), key, pr)
+		n, err := a.cache.PutContent(context.Background(), key, pr)
+		if err == nil && n != meta.Size {
+			meta.Size = n
+			_ = a.cache.Put(context.Background(), meta)
+		}
 	}
 }
 
 func (a *Application) fetchAndMaybeStore(w http.ResponseWriter, r *http.Request, key, up, rel string, stale *cache.ItemMeta) {
+	// Build upstream conditional options: client + stale validators
 	opts := fetch.NewOptions(r, "", "")
 	if r.Method == http.MethodHead {
 		if opts == nil {
@@ -285,7 +323,28 @@ func (a *Application) fetchAndMaybeStore(w http.ResponseWriter, r *http.Request,
 		}
 		opts.UseHEAD = true
 	}
-	sfKey := r.Method + ":" + key
+	if stale != nil {
+		opts = fetch.NewOptions(r, stale.Headers.Get("ETag"), stale.Headers.Get("Last-Modified"))
+		if r.Method == http.MethodHead {
+			opts.UseHEAD = true
+		}
+	}
+
+	// If client requested Range — forward it and bypass caching
+	rangeReq := r.Header.Get("Range") != ""
+	if rangeReq {
+		if opts == nil {
+			opts = &fetch.Options{}
+		}
+		opts.Range = r.Header.Get("Range")
+	}
+
+	// include Range and validators in singleflight key
+	sfKey := r.Method + ":" + key +
+		"|rng=" + r.Header.Get("Range") +
+		"|inm=" + r.Header.Get("If-None-Match") +
+		"|ims=" + r.Header.Get("If-Modified-Since")
+
 	res, err, shared := a.fetcher.Fetch(r.Context(), sfKey, up, opts)
 	if err != nil && shared {
 		if m, ok := a.cache.Get(r.Context(), key); ok {
@@ -309,7 +368,24 @@ func (a *Application) fetchAndMaybeStore(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
+	if res.Body != nil {
+		defer res.Body.Close()
+	}
+
 	w.Header().Add("Via", "1.1 go-apt-cache")
+
+	// Always bypass cache for Range requests or upstream 206
+	if rangeReq || res.Status == http.StatusPartialContent {
+		util.CopyWhitelisted(w.Header(), res.Header)
+		w.Header().Set("X-Cache-Status", "BYPASS")
+		w.WriteHeader(res.Status)
+		if r.Method == http.MethodGet && res.Body != nil {
+			buf := util.GetBuffer()
+			defer util.PutBuffer(buf)
+			_, _ = io.CopyBuffer(w, res.Body, buf)
+		}
+		return
+	}
 
 	switch res.Status {
 	case http.StatusNotModified:
@@ -342,10 +418,24 @@ func (a *Application) fetchAndMaybeStore(w http.ResponseWriter, r *http.Request,
 			_ = a.cache.Put(r.Context(), meta)
 		}
 		util.CopyWhitelisted(w.Header(), res.Header)
-		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		w.Header().Set("X-Cache-Status", "MISS")
+		w.WriteHeader(http.StatusNotFound)
 		return
 
 	default:
+		// Forward other upstream 4xx as-is (no cache)
+		if res.Status >= 400 && res.Status < 500 {
+			util.CopyWhitelisted(w.Header(), res.Header)
+			w.Header().Set("X-Cache-Status", "BYPASS")
+			w.WriteHeader(res.Status)
+			if r.Method == http.MethodGet && res.Body != nil {
+				buf := util.GetBuffer()
+				defer util.PutBuffer(buf)
+				_, _ = io.CopyBuffer(w, res.Body, buf)
+			}
+			return
+		}
+
 		// 2xx/HEAD success
 		cc := util.ParseCacheControl(res.Header.Get("Cache-Control"))
 		if _, ok := cc["no-store"]; ok || res.Header.Get("Vary") == "*" || a.requestProhibitsStore(r, cc) {
@@ -388,9 +478,9 @@ func (a *Application) fetchAndMaybeStore(w http.ResponseWriter, r *http.Request,
 		util.CopyWhitelisted(w.Header(), meta.Headers)
 		w.Header().Set("X-Cache-Status", "MISS")
 
+		// Не кэшируем HEAD — чтобы не создавать мету без тела
 		if r.Method == http.MethodHead {
 			w.WriteHeader(meta.StatusCode)
-			_ = a.cache.Put(r.Context(), meta)
 			return
 		}
 
@@ -527,4 +617,12 @@ func (a *Application) requestProhibitsStore(req *http.Request, cc map[string]str
 		}
 	}
 	return false
+}
+
+// derive relative path from cache key "<repo>/<rel>"
+func relFromKey(key string) string {
+	if i := strings.IndexByte(key, '/'); i >= 0 && i+1 < len(key) {
+		return key[i+1:]
+	}
+	return ""
 }
