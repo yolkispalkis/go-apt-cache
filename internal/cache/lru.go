@@ -127,7 +127,6 @@ func (l *LRU) scan() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, m := range metas {
-		// store pointer to loaded meta
 		el := l.order.PushFront(&entry{key: m.Key, meta: m})
 		l.index[m.Key] = el
 		l.curBytes += m.Size
@@ -168,18 +167,15 @@ func (l *LRU) Get(ctx context.Context, key string) (*ItemMeta, bool) {
 	l.order.MoveToFront(el)
 	m := el.Value.(*entry).meta
 	m.LastUsedAt = time.Now()
-	// make copy to return and to write meta outside lock
 	cp := *m
 	cp.Headers = util.CopyHeader(m.Headers)
 	l.mu.Unlock()
-
-	// best-effort write updated meta without holding lock
+	// best-effort update meta without holding lock
 	go func(mm ItemMeta) { _ = l.writeMeta(&mm) }(cp)
 	return &cp, true
 }
 
 func (l *LRU) Put(ctx context.Context, m *ItemMeta) error {
-	// store a copy to avoid external mutations affecting accounting
 	mm := *m
 	mm.Headers = util.CopyHeader(m.Headers)
 	if err := l.writeMeta(&mm); err != nil {

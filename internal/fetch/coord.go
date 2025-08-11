@@ -41,19 +41,21 @@ type Coordinator struct {
 
 func New(cfg config.ServerConfig, lg *log.Logger) *Coordinator {
 	tr := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		DialContext:         (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
-		MaxIdleConns:        cfg.MaxConcurrent * 2,
-		MaxIdleConnsPerHost: cfg.MaxConcurrent,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-		DisableCompression:  true,
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
+		MaxIdleConns:          cfg.MaxConcurrent * 2,
+		MaxIdleConnsPerHost:   cfg.MaxConcurrent,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: cfg.ReadHeaderTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		DisableCompression:    true,
 	}
 	if cfg.MaxConcurrent < 1 {
 		cfg.MaxConcurrent = 1
 	}
 	return &Coordinator{
-		client: &http.Client{Transport: tr, Timeout: cfg.ReqTimeout},
+		client: &http.Client{Transport: tr}, // no global Timeout; use ctx
 		ua:     cfg.UserAgent,
 		log:    lg.WithComponent("fetch"),
 		sem:    make(chan struct{}, cfg.MaxConcurrent),
@@ -126,6 +128,7 @@ func (c *Coordinator) do(ctx context.Context, url string, o *Options) (*Result, 
 	case resp.StatusCode == http.StatusNotModified, resp.StatusCode == http.StatusNotFound:
 		resp.Body.Close()
 		return res, nil
+
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		if m == http.MethodGet {
 			res.Body = resp.Body
@@ -133,14 +136,21 @@ func (c *Coordinator) do(ctx context.Context, url string, o *Options) (*Result, 
 			resp.Body.Close()
 		}
 		return res, nil
+
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		// redirects: forward as-is, no caching decision here
+		resp.Body.Close()
+		return res, nil
+
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		// forward 4xx to caller (except 404 already handled)
+		// forward 4xx as-is (except 404 already handled)
 		if m == http.MethodGet {
 			res.Body = resp.Body
 		} else {
 			resp.Body.Close()
 		}
 		return res, nil
+
 	default:
 		resp.Body.Close()
 		return res, fmt.Errorf("upstream 5xx: %d", resp.StatusCode)

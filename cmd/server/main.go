@@ -36,7 +36,13 @@ func main() {
 func run(ctx context.Context) error {
 	cfgPath := flag.String("config", "/etc/go-apt-cache/config.yaml", "Path to config file (.yaml, .yml)")
 	createCfg := flag.Bool("create-config", false, "Create default config and exit")
+	showVer := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
+
+	if *showVer {
+		fmt.Printf("%s %s\n", AppName, AppVersion)
+		return nil
+	}
 
 	def := config.Default(AppName, AppVersion)
 	if *createCfg {
@@ -54,6 +60,11 @@ func run(ctx context.Context) error {
 	logger.Info().Str("config", *cfgPath).Msg("configuration loaded")
 
 	util.InitBufferPool(cfg.Cache.BufferSize, logger)
+	logger.Info().
+		Str("bufferSize", cfg.Cache.BufferSize).
+		Str("cacheDir", cfg.Cache.Dir).
+		Str("cacheMax", cfg.Cache.MaxSize).
+		Msg("buffers and cache configured")
 
 	cm, err := cache.NewLRU(cfg.Cache, logger)
 	if err != nil {

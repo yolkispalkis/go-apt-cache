@@ -84,6 +84,8 @@ var headerProxyWhitelist = map[string]struct{}{
 	"Expires":             {},
 	"Vary":                {},
 	"Age":                 {},
+	"Location":            {}, // for 3xx
+	"Retry-After":         {}, // for 429/503
 }
 
 func CopyHeader(h http.Header) http.Header {
@@ -265,4 +267,5 @@ func (w *RespLogWriter) Status() int {
 	}
 	return w.status
 }
-func (w *RespLogWriter) Bytes() int64 { return w.bytes }
+func (w *RespLogWriter) Bytes() int64        { return w.bytes }
+func (w *RespLogWriter) Header() http.Header { return w.ResponseWriter.Header() }

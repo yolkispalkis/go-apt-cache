@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -24,14 +26,30 @@ import (
 )
 
 type Application struct {
-	cfg     *config.Config
-	log     *log.Logger
-	cache   cache.Manager
-	fetcher *fetch.Coordinator
+	cfg       *config.Config
+	log       *log.Logger
+	cache     cache.Manager
+	fetcher   *fetch.Coordinator
+	startedAt time.Time
+	metrics   struct {
+		Hits         uint64
+		Misses       uint64
+		Bypass       uint64
+		RangeBypass  uint64
+		StaleServed  uint64
+		Revalidated  uint64
+		UpstreamErrs uint64
+	}
 }
 
 func NewApplication(cfg *config.Config, lg *log.Logger, cm cache.Manager, fc *fetch.Coordinator) *Application {
-	return &Application{cfg: cfg, log: lg, cache: cm, fetcher: fc}
+	return &Application{
+		cfg:       cfg,
+		log:       lg,
+		cache:     cm,
+		fetcher:   fc,
+		startedAt: time.Now(),
+	}
 }
 
 func (a *Application) Routes() http.Handler {
@@ -40,13 +58,41 @@ func (a *Application) Routes() http.Handler {
 
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Add("Via", "1.1 go-apt-cache")
 		_, _ = w.Write([]byte("go-apt-cache async RFC-compliant\n"))
 	})
 	r.Get("/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		type status struct {
+			UptimeSec int64             `json:"uptimeSec"`
+			Metrics   map[string]uint64 `json:"metrics"`
+			Config    map[string]string `json:"config"`
+		}
+		m := map[string]uint64{
+			"hits":         atomic.LoadUint64(&a.metrics.Hits),
+			"misses":       atomic.LoadUint64(&a.metrics.Misses),
+			"bypass":       atomic.LoadUint64(&a.metrics.Bypass),
+			"rangeBypass":  atomic.LoadUint64(&a.metrics.RangeBypass),
+			"staleServed":  atomic.LoadUint64(&a.metrics.StaleServed),
+			"revalidated":  atomic.LoadUint64(&a.metrics.Revalidated),
+			"upstreamErrs": atomic.LoadUint64(&a.metrics.UpstreamErrs),
+		}
+		c := map[string]string{
+			"listen":     a.cfg.Server.ListenAddr,
+			"unixSocket": a.cfg.Server.UnixPath,
+			"cacheDir":   a.cfg.Cache.Dir,
+			"cacheMax":   a.cfg.Cache.MaxSize,
+			"userAgent":  a.cfg.Server.UserAgent,
+		}
+		resp := status{
+			UptimeSec: int64(time.Since(a.startedAt).Seconds()),
+			Metrics:   m,
+			Config:    c,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Add("Via", "1.1 go-apt-cache")
-		_, _ = w.Write([]byte("OK\n"))
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 
 	r.Route("/{repo}", func(r chi.Router) {
@@ -82,8 +128,10 @@ func (a *Application) accessLog() func(http.Handler) http.Handler {
 			start := time.Now()
 			ww := util.NewRespLogWriter(w)
 			next.ServeHTTP(ww, r)
+			cache := ww.Header().Get("X-Cache-Status")
 			lg.Info().Str("method", r.Method).Str("path", r.URL.Path).
-				Int("status", ww.Status()).Int64("bytes", ww.Bytes()).Dur("dur", time.Since(start)).
+				Int("status", ww.Status()).Int64("bytes", ww.Bytes()).
+				Str("cache", cache).Dur("dur", time.Since(start)).
 				Str("remote", r.RemoteAddr).Msg("req")
 		})
 	}
@@ -107,6 +155,8 @@ func (a *Application) recover() func(http.Handler) http.Handler {
 
 func (a *Application) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -168,6 +218,11 @@ func (a *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key
 	h := util.CopyHeader(m.Headers)
 	h.Set("Age", a.mergeAgeFor(m))
 	h.Add("Via", "1.1 go-apt-cache")
+	// Heuristic expiration warning (approximate detection)
+	cc := util.ParseCacheControl(m.Headers.Get("Cache-Control"))
+	if a.cfg.Cache.HeuristicTTL10 && cc["s-maxage"] == "" && cc["max-age"] == "" && m.Headers.Get("Expires") == "" && m.Headers.Get("Last-Modified") != "" && m.ExpiresAt.After(m.FetchedAt) {
+		w.Header().Add("Warning", `112 - "Heuristic expiration"`)
+	}
 	util.CopyWhitelisted(w.Header(), h)
 	w.Header().Set("X-Cache-Status", "HIT")
 
@@ -175,17 +230,20 @@ func (a *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key
 	if util.ClientHasValidators(r) && util.IsNotModified(r, m.Headers) {
 		w.Header().Del("Content-Length") // avoid length on 304
 		w.WriteHeader(http.StatusNotModified)
+		atomic.AddUint64(&a.metrics.Hits, 1)
 		return
 	}
 
 	// Non-2xx cached responses (e.g., negative cache 404) — no body
 	if m.StatusCode < 200 || m.StatusCode >= 300 {
 		w.WriteHeader(m.StatusCode)
+		atomic.AddUint64(&a.metrics.Hits, 1)
 		return
 	}
 
 	if r.Method == http.MethodHead {
 		w.WriteHeader(m.StatusCode)
+		atomic.AddUint64(&a.metrics.Hits, 1)
 		return
 	}
 
@@ -228,6 +286,7 @@ func (a *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key
 		w.Header().Del("Content-Length")
 		mod, _ := http.ParseTime(m.Headers.Get("Last-Modified"))
 		http.ServeContent(w, r, "", mod, f)
+		atomic.AddUint64(&a.metrics.Hits, 1)
 		return
 	}
 
@@ -237,6 +296,7 @@ func (a *Application) serveFromCache(w http.ResponseWriter, r *http.Request, key
 	buf := util.GetBuffer()
 	defer util.PutBuffer(buf)
 	_, _ = io.CopyBuffer(w, rc, buf)
+	atomic.AddUint64(&a.metrics.Hits, 1)
 }
 
 func (a *Application) mergeAgeFor(m *cache.ItemMeta) string {
@@ -260,6 +320,8 @@ func (a *Application) revalidateOrServeStale(w http.ResponseWriter, r *http.Requ
 	// stale-while-revalidate
 	if s, ok := util.ParseUint(cc["stale-while-revalidate"]); ok {
 		if now.Before(stale.ExpiresAt.Add(time.Duration(s) * time.Second)) {
+			w.Header().Add("Warning", `110 - "Response is stale"`)
+			atomic.AddUint64(&a.metrics.StaleServed, 1)
 			go a.backgroundRevalidate(key, up, rel, stale)
 			a.serveFromCache(w, r, key, stale)
 			return
@@ -287,6 +349,7 @@ func (a *Application) backgroundRevalidate(key, up, rel string, stale *cache.Ite
 		upd.LastUsedAt = time.Now()
 		upd.ExpiresAt = a.computeExpiry(upd.Headers, time.Now(), rel)
 		_ = a.cache.Put(context.Background(), &upd)
+		atomic.AddUint64(&a.metrics.Revalidated, 1)
 		return
 	}
 	if res.Status >= 200 && res.Status < 300 && res.Body != nil {
@@ -359,12 +422,19 @@ func (a *Application) fetchAndMaybeStore(w http.ResponseWriter, r *http.Request,
 			cc := util.ParseCacheControl(stale.Headers.Get("Cache-Control"))
 			if s, ok := util.ParseUint(cc["stale-if-error"]); ok {
 				if time.Now().Before(stale.ExpiresAt.Add(time.Duration(s) * time.Second)) {
+					w.Header().Add("Warning", `111 - "Revalidation failed"`)
+					atomic.AddUint64(&a.metrics.StaleServed, 1)
 					a.serveFromCache(w, r, key, stale)
 					return
 				}
 			}
 		}
-		http.Error(w, "upstream error", http.StatusBadGateway)
+		atomic.AddUint64(&a.metrics.UpstreamErrs, 1)
+		status := http.StatusBadGateway
+		if errors.Is(err, context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+		}
+		http.Error(w, "upstream error", status)
 		return
 	}
 
@@ -384,6 +454,17 @@ func (a *Application) fetchAndMaybeStore(w http.ResponseWriter, r *http.Request,
 			defer util.PutBuffer(buf)
 			_, _ = io.CopyBuffer(w, res.Body, buf)
 		}
+		atomic.AddUint64(&a.metrics.RangeBypass, 1)
+		atomic.AddUint64(&a.metrics.Bypass, 1)
+		return
+	}
+
+	// Bypass redirects (3xx)
+	if res.Status >= 300 && res.Status < 400 {
+		util.CopyWhitelisted(w.Header(), res.Header)
+		w.Header().Set("X-Cache-Status", "BYPASS")
+		w.WriteHeader(res.Status)
+		atomic.AddUint64(&a.metrics.Bypass, 1)
 		return
 	}
 
@@ -400,6 +481,7 @@ func (a *Application) fetchAndMaybeStore(w http.ResponseWriter, r *http.Request,
 		upd.ExpiresAt = a.computeExpiry(upd.Headers, time.Now(), rel)
 		_ = a.cache.Put(r.Context(), &upd)
 		a.serveFromCache(w, r, key, &upd)
+		atomic.AddUint64(&a.metrics.Revalidated, 1)
 		return
 
 	case http.StatusNotFound:
@@ -433,6 +515,7 @@ func (a *Application) fetchAndMaybeStore(w http.ResponseWriter, r *http.Request,
 				defer util.PutBuffer(buf)
 				_, _ = io.CopyBuffer(w, res.Body, buf)
 			}
+			atomic.AddUint64(&a.metrics.Bypass, 1)
 			return
 		}
 
@@ -516,6 +599,7 @@ func (a *Application) fetchAndMaybeStore(w http.ResponseWriter, r *http.Request,
 			_ = pw.Close()
 		}
 		wg.Wait()
+		atomic.AddUint64(&a.metrics.Misses, 1)
 	}
 }
 
@@ -546,6 +630,9 @@ func (a *Application) computeExpiry(h http.Header, now time.Time, rel string) ti
 	// запреты на хранение в shared cache
 	if _, ok := cc["no-store"]; ok {
 		return time.Time{}
+	}
+	if _, ok := cc["private"]; ok {
+		return now
 	}
 	if h.Get("Vary") == "*" {
 		return time.Time{}
